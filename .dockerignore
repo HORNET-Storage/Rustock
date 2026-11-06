@@ -1,4 +1,11 @@
+.git/
 target/
 **/target/
-.git/
 *.log
+data
+dist
+bin
+docs
+tools
+*.md
+!README.md

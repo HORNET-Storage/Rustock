@@ -1,0 +1,20 @@
+# Network, ports, advertised address and logging come from .env through
+# entrypoint.sh as flags, which override this file. node.example.toml documents
+# every setting.
+
+[node]
+data_dir = "/var/lib/rustock"
+
+[trie]
+# "single" aborts on an empty data directory; "epoch" keeps only recent state,
+# so historical queries below its retention window fail. An imported rskj
+# database needs "single" (see docs/docker.md).
+backend = "epoch"
+
+# Listen on 0.0.0.0: a published port cannot reach a loopback listener.
+[rpc]
+host = "0.0.0.0"
+
+[metrics]
+host = "0.0.0.0"
+port = 9898

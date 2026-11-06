@@ -36,3 +36,7 @@ tmp/
 *.env
 pegout-alerts.toml
 !pegout-alerts.example.toml
+
+# Built and installed node binaries (scripts/build-binary.sh)
+/dist/
+/bin/
