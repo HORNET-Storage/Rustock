@@ -1,6 +1,7 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
 
 mod config_file;
+mod public_ip;
 use rustock_core::config::ChainConfig;
 use rustock_core::validation::HeaderVerifier;
 use rustock_storage::BlockStore;
@@ -561,10 +562,19 @@ struct Args {
     #[arg(long)]
     peg_events_dir: Option<String>,
 
-    /// External IP address to advertise to peers (e.g., 203.0.113.42).
-    /// If not set, 127.0.0.1 is used.
-    #[arg(long)]
-    external_ip: Option<std::net::IpAddr>,
+    /// External IPv4 address to advertise to peers (e.g., 203.0.113.42).
+    /// If not set, the address is looked up with --ip-check-url on mainnet and
+    /// testnet; if that fails, or on any other network, 127.0.0.1 is used.
+    /// The listeners are IPv4-only, so an IPv6 address is rejected.
+    #[arg(long, value_name = "IPV4")]
+    external_ip: Option<std::net::Ipv4Addr>,
+
+    /// https:// URL of a service that returns the caller's public IPv4 address
+    /// as plain text, asked for the address to advertise when --external-ip is
+    /// unset. The certificate is verified. "off" disables the lookup. The
+    /// request goes out on every start.
+    #[arg(long, default_value = public_ip::DEFAULT_URL, value_name = "URL")]
+    ip_check_url: String,
 
     /// Path to a synced rskj `blocks` LevelDB (e.g. ~/.rsk/mainnet/database/blocks).
     /// When set, block bodies are read from it before requesting them from
@@ -1503,6 +1513,7 @@ fn apply_file_config(
     apply(matches, "network_id", f.node.network_id.as_ref(), &mut a.network_id);
     apply_opt(matches, "secret_key", f.node.secret_key.as_ref(), &mut a.secret_key);
     apply_opt(matches, "external_ip", f.node.external_ip.as_ref(), &mut a.external_ip);
+    apply(matches, "ip_check_url", f.node.ip_check_url.as_ref(), &mut a.ip_check_url);
     apply(matches, "supply_check", f.node.supply_check.as_ref(), &mut a.supply_check);
     apply(matches, "execution_threads", f.node.execution_threads.as_ref(),
         &mut a.execution_threads);
@@ -2223,7 +2234,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         .map(|f| f.number)
         .unwrap_or(0);
 
-    let node_config = NodeConfig {
+    let mut node_config = NodeConfig {
         client_id: "Rustock/0.1.0".to_string(),
         listen_port: args.port,
         id: node_id,
@@ -2253,7 +2264,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         secret_key: secret_key_bytes,
         discovery_port: args.port + 1,
         data_dir: args.data_dir.clone(),
-        external_ip: args.external_ip,
+        external_ip: args.external_ip.map(std::net::IpAddr::V4),
         max_outbound_peers: args.max_peers,
         max_inbound_peers: args.max_inbound_peers,
         max_inbound_per_ip: args.max_inbound_per_ip,
@@ -3298,6 +3309,13 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             .with_events(events.clone()),
     );
 
+    node_config.external_ip = public_ip::resolve(
+        args.external_ip.map(std::net::IpAddr::V4),
+        &args.ip_check_url,
+        args.network_id,
+        args.closed_network,
+    )
+    .await;
     let mut node =
         Node::with_peer_store(node_config, peer_store.clone()).with_scoring(scoring.clone());
     node.add_handler(sync_handler);
