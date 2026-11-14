@@ -69,6 +69,7 @@ const OP_CHECKMULTISIG: u8 = 0xae;
 const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
 const OP_CHECKSEQUENCEVERIFY: u8 = 0xb2;
 const OP_DUP: u8 = 0x76;
+const OP_EQUAL: u8 = 0x87;
 const OP_EQUALVERIFY: u8 = 0x88;
 const OP_HASH160: u8 = 0xa9;
 const OP_CHECKSIG: u8 = 0xac;
@@ -645,6 +646,26 @@ fn is_sent_to_raw_pub_key(chunks: &[JChunk]) -> bool {
         && chunks[0].data.as_ref().is_some_and(|d| d.len() > 1)
 }
 
+/// `Script.getPubKeyHash()` of an output's script, which
+/// `TransactionOutput.getScriptPubKey()` parses first: the hash a P2PKH script
+/// (`isSentToAddress`) pays, or the one a P2SH script (`isPayToScriptHash`,
+/// which reads the bytes, not the chunks) does. `Err` is what bitcoinj throws
+/// for every other script: the `ScriptException` for one it can't parse or
+/// that is neither, and the `NullPointerException` for an opcode in a
+/// P2PKH's hash's place, which [`is_sent_to_address`] answers as neither.
+pub fn pub_key_hash(program: &[u8]) -> Result<[u8; 20], &'static str> {
+    let chunks = parse_script_program(program).ok_or("ScriptException parsing an output's script")?;
+    if is_sent_to_address(&chunks) {
+        if let Some(Ok(hash)) = chunks[2].data.as_deref().map(<[u8; 20]>::try_from) {
+            return Ok(hash);
+        }
+    }
+    if program.len() == 23 && program[0] == OP_HASH160 && program[1] == 0x14 && program[22] == OP_EQUAL {
+        return Ok(program[2..22].try_into().expect("twenty bytes"));
+    }
+    Err("ScriptException: an output's script is not in the standard scriptPubKey form")
+}
+
 fn hex_decode(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)
@@ -704,6 +725,37 @@ mod tests {
         s.extend_from_slice(&erp_fed[..erp_fed.len() - 1]);
         s.extend_from_slice(&[OP_ENDIF, OP_CHECKMULTISIG]);
         s
+    }
+
+    /// `Script.getPubKeyHash()`: a P2PKH script's hash, however its push is
+    /// written, and a P2SH script's, by its exact bytes; for anything else
+    /// bitcoinj throws.
+    #[test]
+    fn pub_key_hash_reads_only_p2pkh_and_p2sh() {
+        let hash = [0x77u8; 20];
+        let p2pkh = [&[OP_DUP, OP_HASH160, 20][..], &hash, &[OP_EQUALVERIFY, OP_CHECKSIG]].concat();
+        assert_eq!(pub_key_hash(&p2pkh), Ok(hash));
+        // bitcoinj takes a hash pushed by OP_PUSHDATA1 as one pushed directly.
+        let pushdata = [&[OP_DUP, OP_HASH160, OP_PUSHDATA1, 20][..], &hash, &[OP_EQUALVERIFY, OP_CHECKSIG]].concat();
+        assert_eq!(pub_key_hash(&pushdata), Ok(hash));
+        let p2sh = [&[OP_HASH160, 20][..], &hash, &[OP_EQUAL]].concat();
+        assert_eq!(pub_key_hash(&p2sh), Ok(hash));
+        for other in [
+            // P2WPKH and P2WSH.
+            [&[0x00, 20][..], &hash].concat(),
+            [&[0x00, 32][..], &[0x77; 32]].concat(),
+            // OP_RETURN.
+            vec![0x6a, 0x02, 0xbe, 0xef],
+            // P2SH's template with its hash pushed by OP_PUSHDATA1.
+            [&[OP_HASH160, OP_PUSHDATA1, 20][..], &hash, &[OP_EQUAL]].concat(),
+            // An opcode where a P2PKH's hash goes: Java's NullPointerException.
+            vec![OP_DUP, OP_HASH160, OP_DUP, OP_EQUALVERIFY, OP_CHECKSIG],
+            // A push past the end, which bitcoinj can't parse.
+            vec![OP_HASH160, 20, 0x77],
+            vec![],
+        ] {
+            assert!(pub_key_hash(&other).is_err(), "{other:02x?}");
+        }
     }
 
     #[test]

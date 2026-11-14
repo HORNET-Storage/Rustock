@@ -841,3 +841,92 @@ returns, after the two endings' own costs, with and without a slot set and
 cleared first; without the fix it fails by 24,000). Verified: testnet
 #3,088,983 replays to the header's state and receipts roots.
 
+## §97 A peg-in rskj can't refund logs unrefundable_pegin, and before RSKIP379 one with no sender is marked processed (testnet #4,513,687)
+
+rskj turns down a peg-in it can't refund with two events from RSKIP181:
+`rejected_pegin`, then `unrefundable_pegin`. Before RSKIP379,
+`PeginInformation.parse` throws when it finds neither a sender (no
+`BtcLockSender`) nor peg-in instructions, as it does for an RSKT payload
+that doesn't parse. From RSKIP170 `legacyRegisterPegin`'s catch then logs
+rejected_pegin(PEGIN_V1_INVALID_PAYLOAD=4) and calls `refundTxSender`, which
+with no refund address logs unrefundable_pegin, PEGIN_V1_REFUND_ADDRESS_NOT_SET
+(2) for a version-1 peg-in and LEGACY_PEGIN_UNDETERMINED_SENDER (1)
+otherwise; and it marks the transaction processed. `processPegInVersion1`
+goes through `refundTxSender` the same way for a v1 peg-in over the locking
+cap. From RSKIP379 `PegUtils.evaluatePegin` makes NO_REFUND of a payload
+that didn't parse from no sender, and `handleNonRefundablePegin` logs the
+same two events and marks the transaction processed only between RSKIP459
+and RSKIP551. Before RSKIP170 none of this happens.
+
+**Trigger**: testnet #4,513,687 tx[1] (`0x6f925119…`), the
+`registerBtcTransaction` of Bitcoin transaction `0x4a826134…`: one native
+P2WPKH input, so no sender, no OP_RETURN, and 550,000 satoshis to the
+federation. rskj's receipt has rejected_pegin(…, 4) and
+unrefundable_pegin(…, 1), and it marked the transaction processed. rustock
+logged nothing and marked nothing, so the block's state and receipts roots
+were not the header's.
+
+**Ground truth**: RSKj's release VETIVER-9.0.4: `PeginInformation.parse`,
+`BridgeSupport.legacyRegisterPegin`, `refundTxSender`, `processPegInVersion1`
+and `handleNonRefundablePegin`, and `PegUtils.evaluatePegin`; and the header
+of testnet #4,513,687.
+
+**rustock**: `register_btc_transaction` (crates/execution/src/bridge/peg.rs).
+Its branch for a sender it can't name, before RSKIP379, logs both events from
+RSKIP181 and marks the transaction processed from RSKIP170. Its branch for a
+payload that doesn't parse logs unrefundable_pegin(1) when there's no sender,
+and from RSKIP379 marks only between RSKIP459 and RSKIP551. Its v1 branch
+over the cap logs unrefundable_pegin(2) when there's nowhere to refund.
+Tests `a_peg_in_with_no_sender_and_no_instructions_testnet_4513687`,
+`a_peg_in_whose_payload_does_not_parse_from_no_sender_is_not_refundable` and
+`a_v1_peg_in_over_the_locking_cap` in `bridge::peg::tests`, each failing
+without the fix. Verified: testnet #4,513,687 replays to the header's state
+and receipts roots.
+
+## §98 From RSKIP379 a peg-in is registered without the lock whitelist or the locking cap, and a multisig sender's outputs are read by bitcoinj
+
+From RSKIP379 rskj's `registerPegIn` asks `PegUtils.evaluatePegin` what to do
+and, to register, goes straight to `executePegIn`. The lock whitelist
+(`verifyLockSenderIsWhitelisted`) and the locking cap
+(`verifyLockDoesNotSurpassLockingCap`) are asked only on the paths before it,
+`processPegInVersionLegacy` and `processPegInVersion1`, and the cap by the
+flyover path. `evaluateLegacyPegin` refunds a multisig or P2SH-P2WSH
+sender's peg-in (REFUND, LEGACY_PEGIN_MULTISIG_SENDER) unless
+`hasOutputsToDifferentTypesOfFeds`: then it's NO_REFUND, and
+`handleNonRefundablePegin` logs rejected_pegin(2) and
+unrefundable_pegin(OUTPUTS_SENT_TO_DIFFERENT_TYPES_OF_FEDS=4), marking the
+transaction processed only between RSKIP459 and RSKIP551.
+`hasOutputsToDifferentTypesOfFeds` reads every output with bitcoinj's
+`Script.getPubKeyHash`, which throws for one that is neither P2PKH nor P2SH:
+a segwit output, an OP_RETURN, one it can't parse. Nothing catches that
+short of `Bridge.execute`, so the call fails. It matches each hash against
+each live federation's P2SH hash
+(`BridgeBtcWallet.getDestinationFederation`), so a P2PKH output to a
+federation's script hash counts as paying that federation.
+
+**Trigger**: none in the blocks re-run so far; found reading rskj for §97.
+A peg-in over the cap after RSKIP379 would have been refunded by rustock and
+credited by rskj, and so would every P2PKH peg-in on rskj's regtest, whose
+whitelist is empty and never disabled. A multisig sender's peg-in with a
+segwit change output would have been refunded by rustock where rskj's call
+fails.
+
+**Ground truth**: RSKj's release VETIVER-9.0.4: `BridgeSupport.registerPegIn`
+and `executePegIn`, and the only callers of `verifyLockDoesNotSurpassLockingCap`
+and `verifyLockSenderIsWhitelisted`; `PegUtils.evaluateLegacyPegin` and
+`hasOutputsToDifferentTypesOfFeds`; `BridgeBtcWallet.getDestinationFederation`;
+and bitcoinj-thin 0.14.4-rsk-18's `Script.getPubKeyHash`.
+
+**rustock**: `register_btc_transaction` asks the whitelist and the cap only
+before RSKIP379. From it a P2PKH or P2SH-P2WPKH sender's peg-in and a v1
+peg-in are registered, and a multisig or P2SH-P2WSH sender's goes through
+`outputs_to_different_types_of_feds` (peg.rs), which reads outputs with
+`rskj_sender_compat::pub_key_hash`; its `Err` fails the call. Tests
+`from_rskip379_a_legacy_peg_in_asks_neither_the_whitelist_nor_the_cap`,
+`a_v1_peg_in_over_the_locking_cap`,
+`from_rskip379_a_multisig_peg_in_fails_on_an_output_bitcoinj_cannot_hash` and
+`from_rskip379_a_multisig_peg_in_to_two_kinds_of_federation_is_not_refunded`,
+each failing without the fix, with
+`outputs_to_different_types_of_feds_reads_outputs_as_bitcoinj_does` and
+`rskj_sender_compat::tests::pub_key_hash_reads_only_p2pkh_and_p2sh`.
+

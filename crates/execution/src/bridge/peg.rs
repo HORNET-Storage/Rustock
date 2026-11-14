@@ -769,12 +769,21 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         match super::pegin_instructions::build_pegin_instructions(&btc_tx) {
             Ok(opt) => opt,
             Err(_) => {
-                // processPegIn: parse exception. RSKIP181 logs
-                // PEGIN_V1_INVALID_PAYLOAD(4); refund to the sender (the only
-                // refund address available — a malformed payload has no v1
-                // refund), then mark processed.
-                if hardfork_cfg.has_rskip181(rsk_height) {
-                    super::events::log_rejected_pegin(ctx, &btc_txid_event_bytes(&btc_tx), 4);
+                // rskj `PeginInformation.parse` threw: before RSKIP379 into
+                // `legacyRegisterPegin`'s catch, from it into `evaluatePegin`'s,
+                // which makes a (REFUND or NO_REFUND, PEGIN_V1_INVALID_PAYLOAD) of
+                // it. Both log rejected_pegin(PEGIN_V1_INVALID_PAYLOAD=4) (before
+                // RSKIP379 from RSKIP181), then refund to the sender, the only
+                // refund address a payload that did not parse leaves, or, with no
+                // sender, log unrefundable_pegin(LEGACY_PEGIN_UNDETERMINED_SENDER=1),
+                // the version being still 0 (`refundTxSender`,
+                // `handleNonRefundablePegin`). A refund marks the transaction
+                // processed; no refund does too before RSKIP379, and from it only
+                // between RSKIP459 and RSKIP551.
+                let hash = btc_txid_event_bytes(&btc_tx);
+                let logs = hardfork_cfg.has_rskip181(rsk_height);
+                if logs {
+                    super::events::log_rejected_pegin(ctx, &hash, 4);
                 }
                 match &sender {
                     Some(s) => {
@@ -811,14 +820,25 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                         ],
                     ),
                 }
-                if let Some(sender) = &sender {
-                    let (refund_hash160, refund_is_p2sh) = sender_refund_target(sender);
-                    emit_pegin_rejection_release(
-                        ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_value, &fed_redeem,
-                        &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
-                    )?;
+                let mark = match &sender {
+                    Some(sender) => {
+                        let (refund_hash160, refund_is_p2sh) = sender_refund_target(sender);
+                        emit_pegin_rejection_release(
+                            ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_value, &fed_redeem,
+                            &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
+                        )?;
+                        true
+                    }
+                    None => {
+                        if logs {
+                            super::events::log_unrefundable_pegin(ctx, &hash, 1);
+                        }
+                        !rskip379 || should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height)
+                    }
+                };
+                if mark {
+                    set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
                 }
-                set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
                 return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
             }
         }
@@ -834,14 +854,17 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
 
     // ---- Version 1 (RSKIP170 OP_RETURN) peg-in ----
     if let Some(instr) = instructions {
-        // processPegInVersion1: NO whitelist, only the locking cap.
-        if !cap_ok(ctx) {
+        // processPegInVersion1: NO whitelist, only the locking cap. From
+        // RSKIP379 `evaluatePegin` registers a v1 peg-in with `executePegIn`,
+        // and the cap isn't asked.
+        if !rskip379 && !cap_ok(ctx) {
             if hardfork_cfg.has_rskip181(rsk_height) {
                 super::events::log_rejected_pegin(ctx, &btc_txid_event_bytes(&btc_tx), 1); // PEGIN_CAP_SURPASSED
             }
             // refundTxSender: refund to the v1 refund address if present, else
-            // the BtcLockSender address; if neither, no refund (a non-refundable
-            // peg-in — unrefundable_pegin event not modeled, see TODO).
+            // the BtcLockSender address; if neither, no refund, and from RSKIP181
+            // unrefundable_pegin(PEGIN_V1_REFUND_ADDRESS_NOT_SET=2), the version
+            // being 1. The transaction is marked processed either way.
             match v1_refund_target(&instr, sender.as_ref()) {
                 Some((h, p2sh)) => {
                     let mut extra = refund_fields(&h, p2sh, config);
@@ -884,6 +907,8 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                     ctx, &btc_tx, &refund_hash160, refund_is_p2sh, total_value, &fed_redeem,
                     &retiring, &pays_live_federation, rsk_height, config, hardfork_cfg, tx_ctx,
                 )?;
+            } else if hardfork_cfg.has_rskip181(rsk_height) {
+                super::events::log_unrefundable_pegin(ctx, &btc_txid_event_bytes(&btc_tx), 2);
             }
             set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
@@ -934,8 +959,13 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         // (NO_REFUND, LEGACY_PEGIN_UNDETERMINED_SENDER). Post-RSKIP379
         // `handleNonRefundablePegin` logs rejected_pegin(LEGACY_PEGIN_UNDETERMINED_SENDER=3)
         // then unrefundable_pegin(NonRefundablePeginReason.LEGACY_PEGIN_UNDETERMINED_SENDER=1),
-        // and marks the tx processed only when RSKIP459 && !RSKIP551. Pre-379 the
-        // legacy path aborts silently (sender could not be determined).
+        // and marks the tx processed only when RSKIP459 && !RSKIP551. Before
+        // RSKIP379 `PeginInformation.parse` throws, finding neither a sender nor
+        // instructions, and from RSKIP170 `legacyRegisterPegin`'s catch logs
+        // rejected_pegin(PEGIN_V1_INVALID_PAYLOAD=4) (from RSKIP181), then
+        // `refundTxSender`, with no refund address, unrefundable_pegin(
+        // LEGACY_PEGIN_UNDETERMINED_SENDER=1) (from RSKIP181), and marks the tx
+        // processed (testnet #4,513,687). Before RSKIP170 it does none of that.
         record_pegin(
             SilentKind::PeginRejectedNoRefund,
             &btc_tx,
@@ -943,9 +973,9 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             total_value,
             "LEGACY_PEGIN_UNDETERMINED_SENDER",
             vec![
-                // Post-RSKIP379 this path logs rejected_pegin then
-                // unrefundable_pegin; pre-379 it aborts silently.
-                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip379(rsk_height))),
+                // From RSKIP181 this path logs rejected_pegin then
+                // unrefundable_pegin, before RSKIP379 and after it.
+                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip181(rsk_height))),
                 ("senderType", FieldValue::Text("UNDETERMINED".into())),
                 ("inputShape", FieldValue::Text(undetermined_input_shape(&btc_tx).into())),
                 (
@@ -965,7 +995,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
                     ),
                 ),
                 ("peginVersion", FieldValue::U64(0)),
-                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip379(rsk_height))),
+                ("logged", FieldValue::Flag(hardfork_cfg.has_rskip181(rsk_height))),
             ],
         );
         if hardfork_cfg.has_rskip379(rsk_height) {
@@ -975,6 +1005,13 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
                 set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
             }
+        } else if hardfork_cfg.has_rskip170(rsk_height) {
+            if hardfork_cfg.has_rskip181(rsk_height) {
+                let hash = btc_txid_event_bytes(&btc_tx);
+                super::events::log_rejected_pegin(ctx, &hash, 4);
+                super::events::log_unrefundable_pegin(ctx, &hash, 1);
+            }
+            set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
         }
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     };
@@ -1015,22 +1052,67 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
         }
     };
 
-    // Lock whitelist gate (rskj verifyLockSenderIsWhitelisted): the matching
-    // one-off entry is consumed on success; rejection generates a refund
-    // peg-out back to the sender (generateRejectionRelease).
+    // RSKIP379 (`registerPegIn`): `PegUtils.evaluateLegacyPegin` registers a
+    // P2PKH or P2SH-P2WPKH sender's peg-in with `executePegIn`, asking neither
+    // the lock whitelist nor the locking cap, and refunds a multisig or
+    // P2SH-P2WSH sender's, unless its outputs pay live federations of
+    // different types (`hasOutputsToDifferentTypesOfFeds`): that one is turned
+    // down with no refund, logging rejected_pegin(LEGACY_PEGIN_MULTISIG_SENDER=2)
+    // and unrefundable_pegin(OUTPUTS_SENT_TO_DIFFERENT_TYPES_OF_FEDS=4), and
+    // marked processed only between RSKIP459 and RSKIP551
+    // (`handleNonRefundablePegin`). Reading the outputs throws for one that is
+    // neither P2PKH nor P2SH, which rskj doesn't catch: the call fails.
+    if rskip379 && !lockable {
+        let different = outputs_to_different_types_of_feds(
+            &btc_tx,
+            (&fed_script, active_format),
+            retiring.as_ref().map(|(_, script)| (script, retiring_format)),
+        )
+        .map_err(|why| {
+            PrecompileError::other(format!(
+                "registerBtcTransaction: rskj aborts reading this transaction's outputs ({why})"
+            ))
+        })?;
+        if different {
+            record_pegin(
+                SilentKind::PeginRejectedNoRefund,
+                &btc_tx,
+                tx_ctx,
+                total_value,
+                "LEGACY_PEGIN_MULTISIG_SENDER",
+                vec![
+                    ("senderType", FieldValue::Text(sender_type_name(Some(&sender)).into())),
+                    ("peginVersion", FieldValue::U64(0)),
+                    ("logged", FieldValue::Flag(true)),
+                ],
+            );
+            let hash = btc_txid_event_bytes(&btc_tx);
+            super::events::log_rejected_pegin(ctx, &hash, 2);
+            super::events::log_unrefundable_pegin(ctx, &hash, 4);
+            if should_mark_rejected_pegin_as_processed(hardfork_cfg, rsk_height) {
+                set_btc_tx_processed(ctx, &legacy_txid, rsk_height, hardfork_cfg.has_rskip134(rsk_height));
+            }
+            return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
+        }
+    }
+
+    // Before RSKIP379, the lock whitelist gate (rskj
+    // verifyLockSenderIsWhitelisted): the matching one-off entry is consumed on
+    // success; rejection generates a refund peg-out back to the sender
+    // (generateRejectionRelease).
     // Locking cap gate (rskj verifyLockDoesNotSurpassLockingCap, RSKIP134):
     // evaluated only when the whitelist passed (rskj short-circuits the &&,
     // so a whitelist rejection never lazily initializes the cap). A cap
     // rejection produces the same refund release as a whitelist one.
     let allowed = lockable
-        && whitelist_allows_and_consume(
-            ctx,
-            &sender_hash160,
-            total_value,
-            btc_block_height,
-            hardfork_cfg.has_rskip87(rsk_height),
-        )
-        && cap_ok(ctx);
+        && (rskip379
+            || (whitelist_allows_and_consume(
+                ctx,
+                &sender_hash160,
+                total_value,
+                btc_block_height,
+                hardfork_cfg.has_rskip87(rsk_height),
+            ) && cap_ok(ctx)));
     tracing::debug!(
         "pegin lock check: sender {} amount {} btc_height {} -> {}",
         to_hex(&sender_hash160),
@@ -1328,6 +1410,42 @@ fn v1_refund_target(
         return Some((refund.hash160, refund.is_p2sh));
     }
     sender.map(sender_refund_target)
+}
+
+/// rskj `PegUtils.hasOutputsToDifferentTypesOfFeds`, which RSKIP379's
+/// `evaluateLegacyPegin` asks of a multisig or P2SH-P2WSH sender's peg-in:
+/// whether the live federations its outputs pay, each a federation's P2SH
+/// script and format version, are two of different format versions. Every
+/// output is read by bitcoinj's `Script.getPubKeyHash` and matched against
+/// each live federation's P2SH hash, the active one first
+/// (`BridgeBtcWallet.getDestinationFederation`), so a P2PKH output to a
+/// federation's hash counts as paying it. An output that is neither P2PKH nor
+/// P2SH throws, which rskj doesn't catch: `Err`, and the call fails.
+fn outputs_to_different_types_of_feds(
+    tx: &BtcTransaction,
+    active: (&bitcoin::ScriptBuf, u64),
+    retiring: Option<(&bitcoin::ScriptBuf, u64)>,
+) -> Result<bool, &'static str> {
+    let hash_of = |script: &bitcoin::ScriptBuf| -> [u8; 20] {
+        script.as_bytes()[2..22].try_into().expect("a federation's 23-byte P2SH script")
+    };
+    let (mut pays_active, mut pays_retiring) = (false, false);
+    for output in &tx.output {
+        let hash = super::rskj_sender_compat::pub_key_hash(output.script_pubkey.as_bytes())?;
+        if hash == hash_of(active.0) {
+            pays_active = true;
+        } else if retiring.is_some_and(|(script, _)| hash == hash_of(script)) {
+            pays_retiring = true;
+        }
+    }
+    match (pays_active, retiring) {
+        (true, Some((_, retiring_format))) if pays_retiring => Ok(active.1 != retiring_format),
+        _ if pays_active || pays_retiring => Ok(false),
+        // An empty set's `iterator.next()`. RSKIP379's minimum check, which
+        // comes first, wants an output to a live federation, so it isn't
+        // reached.
+        _ => Err("NoSuchElementException: the outputs pay no live federation"),
+    }
 }
 
 /// rskj `generateRejectionRelease`: build an empty-wallet refund of all the
@@ -9710,9 +9828,14 @@ mod tests {
 
     /// The same, with the transaction as the bytes its block's tree holds.
     fn regtest_bridge_with_bytes(raw: &[u8]) -> impl crate::RskContextTr {
+        regtest_bridge_at(raw, 10, &RskHardforkConfig::rskj_regtest())
+    }
+
+    /// The same at RSK block `number`, with the headers taken under `cfg`.
+    fn regtest_bridge_at(raw: &[u8], number: u64, cfg: &RskHardforkConfig) -> impl crate::RskContextTr {
         use revm::MainContext;
         let block = revm::context::BlockEnv {
-            number: U256::from(10u64),
+            number: U256::from(number),
             timestamp: U256::from(1_700_000_000u64),
             ..revm::context::BlockEnv::default()
         };
@@ -9758,7 +9881,7 @@ mod tests {
             0,
             &BridgeConstants::rskj_regtest(),
             true,
-            &RskHardforkConfig::rskj_regtest(),
+            cfg,
         )
         .unwrap();
         ctx
@@ -9878,13 +10001,15 @@ mod tests {
 
     /// RSKj's regtest federation's output script.
     fn regtest_federation_script() -> bitcoin::ScriptBuf {
-        let (config, cfg) = (
-            BridgeConstants::rskj_regtest(),
-            RskHardforkConfig::rskj_regtest(),
-        );
+        regtest_federation_script_for(&RskHardforkConfig::rskj_regtest())
+    }
+
+    /// The same under `cfg`.
+    fn regtest_federation_script_for(cfg: &RskHardforkConfig) -> bitcoin::ScriptBuf {
+        let config = BridgeConstants::rskj_regtest();
         let mut ctx = queue_ctx();
-        let (_, redeem) = active_federation_keys_and_redeem(&mut ctx, &config, &cfg, 10);
-        let format = active_federation_format(&mut ctx, &config, &cfg, 10);
+        let (_, redeem) = active_federation_keys_and_redeem(&mut ctx, &config, cfg, 10);
+        let format = active_federation_format(&mut ctx, &config, cfg, 10);
         p2sh_output_script(&federation_output_hash160(&redeem, format))
     }
 
@@ -9977,6 +10102,349 @@ mod tests {
         let mut twice = tx.clone();
         twice.input[1].previous_output = twice.input[0].previous_output;
         assert_eq!(registered(&twice, 350, None, None), (false, false, 0, 0));
+    }
+
+    /// RSKj's regtest with every network upgrade after `last` taken off its
+    /// ladder.
+    fn rskj_regtest_until(last: crate::hardfork::RskNetworkUpgrade) -> RskHardforkConfig {
+        use crate::hardfork::RskNetworkUpgrade::*;
+        [
+            Orchid, Wasabi100, TwoToThree, Papyrus200, Iris300, Hop400, Fingerroot500,
+            Arrowhead600, Arrowhead631, Lovell700, Reed800, Reed810, Vetiver900,
+        ]
+        .into_iter()
+        .filter(|upgrade| *upgrade > last)
+        .fold(RskHardforkConfig::rskj_regtest(), |cfg, upgrade| cfg.with_hardfork(upgrade, None))
+    }
+
+    /// A native P2WPKH input: nothing in its scriptSig, from which rskj can
+    /// name no sender.
+    fn native_segwit() -> (bitcoin::ScriptBuf, bitcoin::Witness) {
+        let mut witness = bitcoin::Witness::new();
+        witness.push([0x30u8; 71]);
+        witness.push(real_pubkey());
+        (bitcoin::ScriptBuf::new(), witness)
+    }
+
+    /// An OP_RETURN output's script pushing `data`.
+    fn op_return(data: &[u8]) -> bitcoin::ScriptBuf {
+        bitcoin::ScriptBuf::from_bytes([&[0x6a, data.len() as u8][..], data].concat())
+    }
+
+    /// An RSKT payload of `version` naming `destination`.
+    fn rskt(version: u8, destination: [u8; 20]) -> bitcoin::ScriptBuf {
+        op_return(&[&b"RSKT"[..], &[version], &destination].concat())
+    }
+
+    /// The events a registration logged, each as (topics, data).
+    type Logged = Vec<(Vec<alloy_primitives::B256>, Vec<u8>)>;
+
+    /// `registerBtcTransaction` of `tx` at Bitcoin height 350 in `ctx`, RSKj's
+    /// regtest Bridge at RSK block `block`, under `cfg`: whether the call
+    /// succeeded, whether it marked the transaction processed, the events it
+    /// logged, and how many UTXOs the active federation then holds.
+    fn registration_in<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        tx: &BtcTransaction,
+        block: u64,
+        cfg: &RskHardforkConfig,
+    ) -> (bool, bool, Logged, usize) {
+        let raw = btc_serialize(tx);
+        let tree = one_leaf_tree(&raw);
+        let args = encode::args(&[Arg::Bytes(&raw), Arg::Word(encode::int(350)), Arg::Bytes(&tree)]);
+        let ok = register_btc_transaction(
+            ctx,
+            &args,
+            0,
+            &BridgeConstants::rskj_regtest(),
+            cfg,
+            &BridgeTxContext::default(),
+        )
+        .is_ok();
+        let logs = ctx
+            .journal_mut()
+            .take_logs()
+            .into_iter()
+            .map(|log| (log.data.topics().to_vec(), log.data.data.to_vec()))
+            .collect();
+        let processed = is_btc_tx_processed(ctx, &legacy_btc_txid(tx));
+        let utxos = super::super::storage::load_federation_utxos(ctx, cfg, block).len();
+        (ok, processed, logs, utxos)
+    }
+
+    /// The same at RSK block 10, the Bridge holding nothing but the chain.
+    fn registration(tx: &BtcTransaction, cfg: &RskHardforkConfig) -> (bool, bool, Logged, usize) {
+        let mut ctx = regtest_bridge_at(&btc_serialize(tx), 10, cfg);
+        registration_in(&mut ctx, tx, 10, cfg)
+    }
+
+    fn rejected(tx: &BtcTransaction, reason: u64) -> (Vec<alloy_primitives::B256>, Vec<u8>) {
+        let event = super::super::legacy_events::rejected_pegin(&btc_txid_event_bytes(tx), reason);
+        (event.topics, event.data)
+    }
+
+    fn unrefundable(tx: &BtcTransaction, reason: u64) -> (Vec<alloy_primitives::B256>, Vec<u8>) {
+        let event = super::super::legacy_events::unrefundable_pegin(&btc_txid_event_bytes(tx), reason);
+        (event.topics, event.data)
+    }
+
+    fn pegin_btc(
+        to: RskAddress,
+        tx: &BtcTransaction,
+        amount: u64,
+        version: u64,
+    ) -> (Vec<alloy_primitives::B256>, Vec<u8>) {
+        let event = super::super::legacy_events::pegin_btc(to, &btc_txid_event_bytes(tx), amount, version);
+        (event.topics, event.data)
+    }
+
+    /// The peg-in of testnet #4,513,687: one native-segwit input, so no sender
+    /// rskj can name, and no OP_RETURN. Before RSKIP379
+    /// `PeginInformation.parse` throws for want of both, and from RSKIP170
+    /// `legacyRegisterPegin`'s catch logs rejected_pegin(PEGIN_V1_INVALID_PAYLOAD=4),
+    /// then, with nowhere to refund to and the version still 0,
+    /// unrefundable_pegin(LEGACY_PEGIN_UNDETERMINED_SENDER=1), and marks the
+    /// transaction processed. Before RSKIP170 it does none of that. From
+    /// RSKIP379 `evaluateLegacyPegin` turns it down as an undetermined
+    /// sender's, marking it processed only between RSKIP459 and RSKIP551.
+    #[test]
+    fn a_peg_in_with_no_sender_and_no_instructions_testnet_4513687() {
+        use crate::hardfork::RskNetworkUpgrade::*;
+        let paying = |cfg: &RskHardforkConfig| {
+            spend(vec![native_segwit()], &[(1_000_000_000, regtest_federation_script_for(cfg))])
+        };
+        let cfg = rskj_regtest_until(Fingerroot500);
+        let tx = paying(&cfg);
+        assert_eq!(
+            registration(&tx, &cfg),
+            (true, true, vec![rejected(&tx, 4), unrefundable(&tx, 1)], 0)
+        );
+        let cfg = rskj_regtest_until(Papyrus200);
+        let tx = paying(&cfg);
+        assert_eq!(registration(&tx, &cfg), (true, false, vec![], 0));
+        for (cfg, marked) in [
+            (rskj_regtest_until(Reed810), true),
+            (RskHardforkConfig::rskj_regtest(), false),
+        ] {
+            let tx = paying(&cfg);
+            assert_eq!(
+                registration(&tx, &cfg),
+                (true, marked, vec![rejected(&tx, 3), unrefundable(&tx, 1)], 0)
+            );
+        }
+    }
+
+    /// A peg-in whose RSKT payload doesn't parse, from no sender rskj can name:
+    /// `PeginInformation.parse` throws with the version still 0, so rskj logs
+    /// rejected_pegin(PEGIN_V1_INVALID_PAYLOAD=4) and, with nowhere to refund
+    /// to, unrefundable_pegin(LEGACY_PEGIN_UNDETERMINED_SENDER=1). Before
+    /// RSKIP379 (`legacyRegisterPegin`'s catch) it marks the transaction
+    /// processed; from it (`handleNonRefundablePegin`) only between RSKIP459
+    /// and RSKIP551.
+    #[test]
+    fn a_peg_in_whose_payload_does_not_parse_from_no_sender_is_not_refundable() {
+        use crate::hardfork::RskNetworkUpgrade::*;
+        for (cfg, marked) in [
+            (rskj_regtest_until(Fingerroot500), true),
+            (rskj_regtest_until(Reed810), true),
+            (RskHardforkConfig::rskj_regtest(), false),
+        ] {
+            // Version 2, which no rskj reads.
+            let tx = spend(
+                vec![native_segwit()],
+                &[(1_000_000_000, regtest_federation_script_for(&cfg)), (0, rskt(2, [0x42; 20]))],
+            );
+            assert_eq!(
+                registration(&tx, &cfg),
+                (true, marked, vec![rejected(&tx, 4), unrefundable(&tx, 1)], 0)
+            );
+        }
+    }
+
+    /// A v1 peg-in over the locking cap, from no sender, with no refund
+    /// address in its payload: before RSKIP379 `processPegInVersion1` logs
+    /// rejected_pegin(PEGIN_CAP_SURPASSED=1), then `refundTxSender`, with
+    /// nowhere to refund to and the version 1,
+    /// unrefundable_pegin(PEGIN_V1_REFUND_ADDRESS_NOT_SET=2), and marks the
+    /// transaction processed. From RSKIP379 `evaluatePegin` registers a v1
+    /// peg-in with `executePegIn`, which doesn't ask the cap.
+    #[test]
+    fn a_v1_peg_in_over_the_locking_cap() {
+        use crate::hardfork::RskNetworkUpgrade::*;
+        let destination = [0x42u8; 20];
+        // Twice regtest's locking cap of 1,000 BTC.
+        let amount = 200_000_000_000;
+        let paying = |cfg: &RskHardforkConfig| {
+            spend(
+                vec![native_segwit()],
+                &[(amount, regtest_federation_script_for(cfg)), (0, rskt(1, destination))],
+            )
+        };
+        let cfg = rskj_regtest_until(Fingerroot500);
+        let tx = paying(&cfg);
+        assert_eq!(
+            registration(&tx, &cfg),
+            (true, true, vec![rejected(&tx, 1), unrefundable(&tx, 2)], 0)
+        );
+        let cfg = RskHardforkConfig::rskj_regtest();
+        let tx = paying(&cfg);
+        assert_eq!(
+            registration(&tx, &cfg),
+            (true, true, vec![pegin_btc(RskAddress::from(destination), &tx, amount, 1)], 1)
+        );
+    }
+
+    /// From RSKIP379 a P2PKH sender's peg-in is registered as
+    /// `evaluateLegacyPegin` decides, asking neither the lock whitelist nor
+    /// the locking cap: on regtest, whose whitelist is empty and never
+    /// disabled, rskj credits one over the cap that the rules before RSKIP379
+    /// refund.
+    #[test]
+    fn from_rskip379_a_legacy_peg_in_asks_neither_the_whitelist_nor_the_cap() {
+        use crate::hardfork::RskNetworkUpgrade::*;
+        let key = real_pubkey();
+        let sender = (pushes(&[&[0x30; 71], &key]), bitcoin::Witness::new());
+        // Twice regtest's locking cap of 1,000 BTC.
+        let amount = 200_000_000_000;
+        let cfg = RskHardforkConfig::rskj_regtest();
+        let tx = spend(vec![sender.clone()], &[(amount, regtest_federation_script_for(&cfg))]);
+        let to = super::super::federation::rsk_address_from_public_key(&key).unwrap();
+        assert_eq!(registration(&tx, &cfg), (true, true, vec![pegin_btc(to, &tx, amount, 0)], 1));
+
+        let cfg = rskj_regtest_until(Fingerroot500);
+        let tx = spend(vec![sender], &[(amount, regtest_federation_script_for(&cfg))]);
+        let (ok, processed, logs, utxos) = registration(&tx, &cfg);
+        assert_eq!((ok, processed, utxos), (true, true, 0), "refunded");
+        let credited = pegin_btc(to, &tx, amount, 0);
+        assert!(logs.iter().all(|(topics, _)| topics[0] != credited.0[0]));
+    }
+
+    /// From RSKIP379 a multisig or P2SH-P2WSH sender's peg-in has its outputs
+    /// read by bitcoinj's `getPubKeyHash` (`hasOutputsToDifferentTypesOfFeds`),
+    /// which throws for one that is neither P2PKH nor P2SH; rskj doesn't catch
+    /// that, so the call fails. With outputs it can read, the peg-in is
+    /// refunded as before.
+    #[test]
+    fn from_rskip379_a_multisig_peg_in_fails_on_an_output_bitcoinj_cannot_hash() {
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let cfg = RskHardforkConfig::rskj_regtest();
+        let federation = (1_000_000_000, regtest_federation_script());
+        let p2wpkh = bitcoin::ScriptBuf::from_bytes([&[0x00, 0x14][..], &[0x77; 20]].concat());
+        for other in [p2wpkh, op_return(&[0xbe, 0xef])] {
+            let tx = spend(vec![signed_multisig(&redeem)], &[federation.clone(), (40_000, other)]);
+            assert!(!registration(&tx, &cfg).0, "the call fails");
+        }
+        for other in [p2pkh_output_script(&[0x77; 20]), p2sh_output_script(&[0x77; 20])] {
+            let tx = spend(vec![signed_multisig(&redeem)], &[federation.clone(), (40_000, other)]);
+            let (ok, processed, logs, _) = registration(&tx, &cfg);
+            assert!(ok && processed);
+            assert_eq!((logs.len(), &logs[0]), (3, &rejected(&tx, 2)), "refunded");
+        }
+    }
+
+    /// `test_keys(0x30)` in `active_format` as the new federation and
+    /// `test_keys(0x20)` in `retiring_format` as the old one, the new one
+    /// created at block 0: from regtest's activation age of 150 blocks the new
+    /// one is active and the old one retiring.
+    fn with_retiring_federation<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        active_format: u64,
+        retiring_format: u64,
+    ) {
+        use super::super::federation::{serialize_federation_multikey, StoredMember};
+        use super::super::serialization::rlp_encode_u64;
+        use super::super::storage::{
+            NEW_FEDERATION_FORMAT_VERSION_KEY, NEW_FEDERATION_KEY, OLD_FEDERATION_FORMAT_VERSION_KEY,
+            OLD_FEDERATION_KEY,
+        };
+        let federation = |first: u8| {
+            let members: Vec<StoredMember> =
+                test_keys(first).into_iter().map(StoredMember::from_btc).collect();
+            serialize_federation_multikey(&members, 0, 0)
+        };
+        bridge_store_bytes_named(ctx, OLD_FEDERATION_KEY, &federation(0x20));
+        bridge_store_bytes_named(ctx, OLD_FEDERATION_FORMAT_VERSION_KEY, &rlp_encode_u64(retiring_format));
+        bridge_store_bytes_named(ctx, NEW_FEDERATION_KEY, &federation(0x30));
+        bridge_store_bytes_named(ctx, NEW_FEDERATION_FORMAT_VERSION_KEY, &rlp_encode_u64(active_format));
+    }
+
+    /// The output scripts of the active and the retiring federation in `ctx`
+    /// at block `block`.
+    fn live_federation_scripts<CTX: crate::RskContextTr>(
+        ctx: &mut CTX,
+        cfg: &RskHardforkConfig,
+        block: u64,
+    ) -> (bitcoin::ScriptBuf, bitcoin::ScriptBuf) {
+        let config = BridgeConstants::rskj_regtest();
+        let (_, active) = active_federation_keys_and_redeem(ctx, &config, cfg, block);
+        let active_format = active_federation_format(ctx, &config, cfg, block);
+        let (_, retiring) = retiring_federation_keys_and_redeem(ctx, &config, cfg, block)
+            .expect("a retiring federation");
+        let retiring_format =
+            federation_format_version(ctx, super::super::storage::OLD_FEDERATION_FORMAT_VERSION_KEY);
+        (
+            p2sh_output_script(&federation_output_hash160(&active, active_format)),
+            p2sh_output_script(&federation_output_hash160(&retiring, retiring_format)),
+        )
+    }
+
+    /// From RSKIP379 a multisig sender's peg-in that pays both live
+    /// federations, of different format versions, is turned down with no
+    /// refund (`evaluateLegacyPegin`, `hasOutputsToDifferentTypesOfFeds`):
+    /// rejected_pegin(LEGACY_PEGIN_MULTISIG_SENDER=2) and
+    /// unrefundable_pegin(OUTPUTS_SENT_TO_DIFFERENT_TYPES_OF_FEDS=4), and not
+    /// marked processed after RSKIP551. Paying two of one format, it's
+    /// refunded as before.
+    #[test]
+    fn from_rskip379_a_multisig_peg_in_to_two_kinds_of_federation_is_not_refunded() {
+        let redeem = build_federation_redeem_script(&test_keys(0x10), 2);
+        let cfg = RskHardforkConfig::rskj_regtest();
+        for (active_format, retiring_format, refunded) in [(4000, 3000, false), (4000, 4000, true)] {
+            let (active, retiring) = {
+                let mut ctx = queue_ctx();
+                with_retiring_federation(&mut ctx, active_format, retiring_format);
+                live_federation_scripts(&mut ctx, &cfg, 200)
+            };
+            let tx = spend(
+                vec![signed_multisig(&redeem)],
+                &[(1_000_000_000, active), (1_000_000_000, retiring)],
+            );
+            let mut ctx = regtest_bridge_at(&btc_serialize(&tx), 200, &cfg);
+            with_retiring_federation(&mut ctx, active_format, retiring_format);
+            let (ok, processed, logs, _) = registration_in(&mut ctx, &tx, 200, &cfg);
+            assert!(ok);
+            if refunded {
+                assert!(processed);
+                assert_eq!(logs[0], rejected(&tx, 2));
+                assert!(!logs.contains(&unrefundable(&tx, 4)));
+            } else {
+                assert_eq!((processed, logs), (false, vec![rejected(&tx, 2), unrefundable(&tx, 4)]));
+            }
+        }
+    }
+
+    /// bitcoinj reads a P2PKH output's hash where it reads a P2SH output's, so
+    /// a P2PKH output to a federation's script hash counts as paying that
+    /// federation; and a set of outputs paying no live federation is the
+    /// empty set's `NoSuchElementException`.
+    #[test]
+    fn outputs_to_different_types_of_feds_reads_outputs_as_bitcoinj_does() {
+        let (active, retiring) = (p2sh_output_script(&[0x11; 20]), p2sh_output_script(&[0x22; 20]));
+        let ask = |outputs: &[bitcoin::ScriptBuf], active_format: u64, retiring_format: u64| {
+            let paid: Vec<(u64, bitcoin::ScriptBuf)> = outputs.iter().map(|s| (1_000, s.clone())).collect();
+            outputs_to_different_types_of_feds(
+                &spend(vec![native_segwit()], &paid),
+                (&active, active_format),
+                Some((&retiring, retiring_format)),
+            )
+        };
+        assert_eq!(ask(&[active.clone(), retiring.clone()], 4000, 3000), Ok(true));
+        assert_eq!(ask(&[active.clone(), p2pkh_output_script(&[0x22; 20])], 4000, 3000), Ok(true));
+        assert_eq!(ask(&[active.clone(), retiring.clone()], 3000, 3000), Ok(false));
+        assert_eq!(ask(&[active.clone(), active.clone()], 4000, 3000), Ok(false));
+        assert_eq!(ask(&[retiring.clone()], 4000, 3000), Ok(false));
+        assert!(ask(&[p2pkh_output_script(&[0x33; 20])], 4000, 3000).is_err());
+        assert!(ask(&[active.clone(), op_return(&[0x01])], 4000, 4000).is_err());
     }
 
     /// The flyover method reads its transaction the same way
