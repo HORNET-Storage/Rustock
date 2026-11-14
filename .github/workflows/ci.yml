@@ -5,7 +5,7 @@ name: CI
 # 189 warnings across 153 sites, and how `cargo fmt` drifted on 296 files.
 on:
   push:
-    branches: [main]
+    branches: [main, "ci/**"]
   pull_request:
   workflow_dispatch:
 
