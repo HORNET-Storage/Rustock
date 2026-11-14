@@ -10442,7 +10442,7 @@ mod tests {
         assert_eq!(ask(&[active.clone(), p2pkh_output_script(&[0x22; 20])], 4000, 3000), Ok(true));
         assert_eq!(ask(&[active.clone(), retiring.clone()], 3000, 3000), Ok(false));
         assert_eq!(ask(&[active.clone(), active.clone()], 4000, 3000), Ok(false));
-        assert_eq!(ask(&[retiring.clone()], 4000, 3000), Ok(false));
+        assert_eq!(ask(std::slice::from_ref(&retiring), 4000, 3000), Ok(false));
         assert!(ask(&[p2pkh_output_script(&[0x33; 20])], 4000, 3000).is_err());
         assert!(ask(&[active.clone(), op_return(&[0x01])], 4000, 4000).is_err());
     }
