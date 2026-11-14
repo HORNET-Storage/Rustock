@@ -811,3 +811,57 @@ at #7,338,024 = 21,712, isolating the 700 base). Verified: exec-head #7,515,159 
 replay #7,515,160 + #7,515,161/200, #7,516,000, #7,520,000 match state and receipts
 roots exactly; 558 tests pass.
 
+## §99 Two chains of equal total difficulty: rskj's selection rule, not the block held first
+
+rskj makes a block the best by `SelectionRule.shouldWeAddThisBlock`, which
+`BlockChainImpl.internalTryToConnect` asks of every block it connects, its
+own mined blocks included (VETIVER-9.0.4, `co/rsk/core/bc/SelectionRule.java`;
+`BlockChainImpl.java:290`). The greater total difficulty wins. On a tie the
+newcomer wins if its header's `paidFees` are more than twice the best block's,
+or else if the best block's are less than twice the newcomer's and the
+newcomer's hash is the lower, its bytes compared unsigned
+(`FastByteComparisons.compareTo`). Two blocks that paid nothing keep the one
+held first. It is RSK's design, not Ethereum's first-seen rule, and REMASC
+holds miners to it: when it pays a block whose siblings were included as
+uncles, `SelectionRule.isBrokenSelectionRule` tells whether the rule would
+have taken one of them instead (§12 is the cell that keeps the answer), and if
+so a `punishmentDivisor`th, a tenth, of the miners' share of the next block's
+reward is burned: the block built on the one chosen against the rule.
+
+rustock moved its head only on a strictly greater total difficulty
+(`BlockStore::store_headers_batch`, `StoreChainAccess::commit_mined_block`), so
+on a tie it kept the block it held first. That changes no block's validity or
+state, and a tie lasts only until one of the two chains grows, so a node
+following the tip named a different newest block than rskj's only for that
+long; but a miner on rustock built on a block rskj's miners don't, and it is
+the miner's own block that REMASC docks. Found on 14 November 2026, reading
+rskj after following mainnet's tip, where six times a block arrived that
+didn't build on the node's newest (four reorganizations, and two blocks at the
+newest's own height) and each time the node ended on rskj's chain.
+
+**rustock:** `rustock_core::selection_rule::should_we_add_this_block` states the
+rule, doubling exactly (rskj's `Coin` has no width, so a doubling past 256 bits
+is more than any fees). `store_headers_batch`, which every block from a peer
+passes through, and `commit_mined_block` weigh the head with it, by the hash
+the head is held under (`BlockStore::contender`). The totals weighed are those
+the node holds when a header arrives: exact for a whole block or a header sent
+with its uncles, a lower bound for a bare header until its body settles it
+(`sync::total_difficulty`).
+
+rskj weighs a block once, when it connects it, and answers `EXIST` when it
+comes round again; rustock weighs a header each time it stores it. While the
+head stays the same that comes to the same answer, since the rule never lets
+two blocks each take the head from the other. It can differ only when the head
+has meanwhile passed to a third block of the same weight: with fees of 2.5, 1
+and 1.5 the rule isn't transitive, and the block that paid 1 can lose to the
+first and beat the third. Weighing a held header only once would not fix it:
+a tie whose total `settle` raised, rather than a new weighing, would then
+never be put to the rule.
+
+Tests: `selection_rule::tests` (rskj's `SelectionRuleTest` cases, the bounds
+at twice the fees, no fees, and doubling past 256 bits), and
+`test_store_headers_batch_settles_a_tie_by_rskj_selection_rule`,
+`test_tie_via_headers_response_goes_to_the_lower_hash` and
+`a_mined_block_that_ties_the_head_goes_by_the_selection_rule`, each of which
+fails on the old comparison.
+

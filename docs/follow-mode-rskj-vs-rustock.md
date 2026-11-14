@@ -118,9 +118,10 @@ Three properties follow, and they are the whole difference:
 
 `SelectionRule.shouldWeAddThisBlock` compares total difficulty first, then — on
 a tie — paid fees (a challenger with more than 2× the incumbent's fees wins),
-and finally the lower block hash, provided fees are at least half the
-incumbent's. Note that this is a *selection* rule evaluated after execution, not
-a reason to defer execution.
+and finally the lower block hash, provided the incumbent's fees are less than
+2× the challenger's. Note that this is a *selection* rule evaluated after
+execution, not a reason to defer execution. rustock takes its head by the same
+rule (`rustock_core::selection_rule`; §99 of the compatibility catalogue).
 
 ## 3. rustock: one executed head, rolled back when it is wrong
 

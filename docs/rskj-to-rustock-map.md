@@ -117,6 +117,7 @@ as functions.
 | Connection point search | `ConnectionPointFinder`, `FindingConnectionPointSyncState` | `crates/sync/src/service.rs` |
 | Peer bookkeeping | `PeersInformation` | `crates/sync/src/service.rs`, `crates/networking/src/peers.rs` |
 | Header import | `BlockSyncService`, `NetBlockStore` | `crates/sync/src/manager.rs` |
+| Choosing the best block | `co.rsk.core.bc.SelectionRule.shouldWeAddThisBlock`, from `BlockChainImpl.internalTryToConnect` | `crates/core/src/selection_rule.rs`, used by `BlockStore::store_headers_batch` and the mining server's `commit_mined_block` |
 | Message handling | `NodeMessageHandler`, `MessageVisitor` | `crates/sync/src/handler.rs` |
 | Transaction pool | `org.ethereum.core.TransactionPoolImpl`, `PendingState` | `crates/sync/src/txpool.rs` |
 | Account rate limiting | `co.rsk.net.handler.quota.*` (`TxQuotaChecker`, `TxVirtualGasCalculator`) | `crates/sync/src/quota.rs` |

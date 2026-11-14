@@ -2845,6 +2845,77 @@ fn the_commit_hook_runs_once_the_block_is_the_head() {
     );
 }
 
+/// rskj connects a mined block as it does a peer's, through
+/// `SelectionRule.shouldWeAddThisBlock`: a mined block that ties the head in
+/// total difficulty, with fees like the head's and the lower hash, takes the
+/// head from the block held first, and one with the higher hash doesn't.
+#[test]
+fn a_mined_block_that_ties_the_head_goes_by_the_selection_rule() {
+    use rustock_core::selection_rule::is_this_block_hash_smaller;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+    let root = TrieNode::empty().compute_hash(trie_store.as_ref());
+    let parent = header_at(0, B256::ZERO, root);
+    let parent_hash = parent.hash();
+    store.put_header_with_hash(parent_hash, &parent).unwrap();
+    store.put_canonical_hash(0, parent_hash).unwrap();
+    store
+        .put_total_difficulty(parent_hash, U256::from(1))
+        .unwrap();
+
+    // Blocks at #1 on that parent, told apart by their extra data. Each has
+    // the total a block mined there gets: the parent's 1 and its own 2.
+    let sibling = |extra: u8| {
+        let mut header = header_at(1, parent_hash, root);
+        header.paid_fees = U256::from(1_000);
+        header.extra_data = Bytes::from(vec![extra]);
+        header
+    };
+    let held_first = sibling(0);
+    let held_first_hash = held_first.hash();
+    store
+        .put_header_with_hash(held_first_hash, &held_first)
+        .unwrap();
+    store.put_canonical_hash(1, held_first_hash).unwrap();
+    store
+        .put_total_difficulty(held_first_hash, U256::from(3))
+        .unwrap();
+    store.set_head(held_first_hash).unwrap();
+    store.set_exec_head(held_first_hash, root).unwrap();
+
+    let chain = StoreChainAccess::new(store.clone(), trie_store, None);
+    let mined = |header: Header| rustock_core::Block {
+        header,
+        transactions: Vec::new(),
+        ommers: Vec::new(),
+    };
+    let lower = (1..=u8::MAX)
+        .map(sibling)
+        .find(|header| is_this_block_hash_smaller(&header.hash(), &held_first_hash))
+        .expect("an extra data that hashes below the head");
+    let lower = mined(lower);
+    let outcome = chain
+        .commit_mined_block(&lower, root, &mut crate::breakdown::Laps::new(false))
+        .unwrap();
+    assert_eq!(outcome.result, ImportResult::ImportedBest);
+    assert_eq!(store.head().unwrap(), Some(lower.hash()));
+    assert_eq!(store.canonical_hash(1).unwrap(), Some(lower.hash()));
+
+    let higher = (1..=u8::MAX)
+        .map(sibling)
+        .find(|header| is_this_block_hash_smaller(&lower.hash(), &header.hash()))
+        .expect("an extra data that hashes above the new head");
+    let higher = mined(higher);
+    let outcome = chain
+        .commit_mined_block(&higher, root, &mut crate::breakdown::Laps::new(false))
+        .unwrap();
+    assert_eq!(outcome.result, ImportResult::ImportedNotBest);
+    assert_eq!(store.head().unwrap(), Some(lower.hash()), "the head stays");
+    assert_eq!(store.canonical_hash(1).unwrap(), Some(lower.hash()));
+}
+
 /// The thread mines on its clock: at a 100 ms median (the floor), it yields
 /// several blocks, and stopping ends it.
 #[test]

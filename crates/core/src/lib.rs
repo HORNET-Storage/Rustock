@@ -10,6 +10,7 @@ pub mod rskj_genesis;
 pub mod rskj_rlp;
 pub mod partial_merkle_tree;
 pub mod btc_block;
+pub mod selection_rule;
 
 #[cfg(test)]
 mod mutate;

@@ -26,6 +26,7 @@ pub use epoch_backend::TrieEngine;
 use rocksdb::{DB, Options, ColumnFamilyDescriptor, WriteBatch};
 use rustock_core::config::ActivationHeights;
 use rustock_core::{Block, Header, Receipt, Transaction};
+use rustock_core::selection_rule::{should_we_add_this_block, Contender};
 use alloy_primitives::{B256, U256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 use anyhow::{Result, Context, anyhow, bail};
@@ -843,6 +844,17 @@ impl BlockStore {
         Ok(())
     }
 
+    /// `hash`, held with total difficulty `total_difficulty`, as rskj's
+    /// selection rule weighs it (`rustock_core::selection_rule`): with the
+    /// fees its header says it paid. `None` when its header isn't held.
+    pub fn contender(&self, hash: B256, total_difficulty: U256) -> Result<Option<Contender>> {
+        Ok(self.header(hash)?.map(|header| Contender {
+            total_difficulty,
+            paid_fees: header.paid_fees,
+            hash,
+        }))
+    }
+
     /// Atomically stores a batch of validated headers along with their total
     /// difficulties, then updates the canonical chain if the head changed.
     ///
@@ -850,6 +862,11 @@ impl BlockStore {
     /// Canonical `number → hash` mappings are only updated for blocks on the
     /// winning chain, preventing fork headers from corrupting the canonical
     /// pointers.
+    ///
+    /// A header takes the head as rskj's `BlockChainImpl.internalTryToConnect`
+    /// lets a block take it, by `SelectionRule.shouldWeAddThisBlock`: a greater
+    /// total difficulty wins, and a tie goes by the two blocks' fees and then
+    /// their hashes, not to whichever arrived first.
     ///
     /// Returns the hash of the new head (if it changed) or the existing head.
     pub fn store_headers_batch(
@@ -869,7 +886,12 @@ impl BlockStore {
 
         let mut batch = WriteBatch::default();
         let mut best_hash = current_head_hash;
-        let mut best_td = current_td;
+        // The block each header is weighed against: the head, by the hash it
+        // is held under, not one recomputed from its stored form.
+        let mut best = match current_head_hash {
+            Some(hash) => self.contender(hash, current_td)?,
+            None => None,
+        };
 
         for &(header, td) in entries {
             let hash = header.hash();
@@ -881,9 +903,20 @@ impl BlockStore {
             // ones uncle selection is looking for.
             batch.put_cf(cf_index, height_index_key(header.number, hash), []);
 
-            if td > best_td {
-                best_td = td;
+            let contender = Contender {
+                total_difficulty: td,
+                paid_fees: header.paid_fees,
+                hash,
+            };
+            let takes_head = match &best {
+                Some(best) => should_we_add_this_block(&contender, best),
+                // No head, or none held under its hash: nothing to weigh but
+                // the total difficulty.
+                None => td > current_td,
+            };
+            if takes_head {
                 best_hash = Some(hash);
+                best = Some(contender);
             }
         }
 
@@ -2497,6 +2530,76 @@ mod tests {
         // But the header should still be stored
         assert!(store.header(h.hash()).unwrap().is_some());
         assert_eq!(store.total_difficulty(h.hash()).unwrap(), Some(U256::from(5)));
+    }
+
+    /// A sibling of the head with the same total difficulty takes the head as
+    /// rskj's `SelectionRule.shouldWeAddThisBlock` lets it, not by having
+    /// arrived second: with fees alike, the lower hash takes it; more than
+    /// twice the head's fees take it whatever the hashes; and a head that paid
+    /// twice the sibling's fees or more, or two blocks that paid nothing, stay.
+    #[test]
+    fn test_store_headers_batch_settles_a_tie_by_rskj_selection_rule() {
+        use rustock_core::selection_rule::is_this_block_hash_smaller;
+
+        // Whether a sibling paying `fees`, whose hash is below the head's if
+        // `lower`, takes the head from one at #2 paying `head_fees`.
+        fn takes(head_fees: u64, fees: u64, lower: bool) -> bool {
+            let dir = tempdir().unwrap();
+            let store = BlockStore::open(dir.path()).unwrap();
+            let chain = build_and_store_chain(&store, 2, 10, 0xAA);
+            let (parent, parent_td) = (chain[1].0.hash(), chain[1].1);
+            let td = parent_td + U256::from(10u64);
+            let sibling = |fees: u64, tag: u8| {
+                let mut h = make_chain_header(2, parent, 10, tag);
+                h.paid_fees = U256::from(fees);
+                h
+            };
+
+            let head = sibling(head_fees, 0);
+            store
+                .store_headers_batch(&[(&head, td)], Some(parent), parent_td)
+                .unwrap();
+            assert_eq!(store.head().unwrap(), Some(head.hash()));
+
+            let newcomer = (1..=u8::MAX)
+                .map(|tag| sibling(fees, tag))
+                .find(|h| is_this_block_hash_smaller(&h.hash(), &head.hash()) == lower)
+                .expect("a tag that hashes to the side wanted");
+            let new_head = store
+                .store_headers_batch(&[(&newcomer, td)], Some(head.hash()), td)
+                .unwrap();
+            assert_eq!(store.head().unwrap(), new_head);
+            let took = new_head == Some(newcomer.hash());
+            let canonical = if took { newcomer.hash() } else { head.hash() };
+            assert_eq!(store.canonical_hash(2).unwrap(), Some(canonical));
+            assert!(
+                store.header(newcomer.hash()).unwrap().is_some(),
+                "the loser is kept too"
+            );
+            took
+        }
+
+        assert!(
+            takes(100, 100, true),
+            "fees alike: the lower hash takes the head"
+        );
+        assert!(!takes(100, 100, false), "fees alike: a higher hash doesn't");
+        assert!(
+            takes(100, 201, false),
+            "more than twice the head's fees, whatever the hashes"
+        );
+        assert!(
+            !takes(100, 200, false),
+            "twice is not more than twice: the hashes decide"
+        );
+        assert!(
+            !takes(200, 100, true),
+            "a head that paid twice the newcomer's fees stays"
+        );
+        assert!(
+            !takes(0, 0, true),
+            "two blocks that paid nothing: the one held first stays"
+        );
     }
 
     // --- Reorg / canonical chain tests ---

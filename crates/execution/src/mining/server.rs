@@ -14,6 +14,7 @@ use rustock_core::validation::merged_mining::{
     BLOCK_HEADER_HASH_SIZE, CoinbaseCompressionError, RSK_TAG, compress_coinbase,
     compute_coinbase_hash, find_last_subsequence,
 };
+use rustock_core::selection_rule::{should_we_add_this_block, Contender};
 use rustock_core::{Block, Header};
 use rustock_storage::BlockStore;
 use rustock_trie::TrieStore;
@@ -325,28 +326,43 @@ impl ChainAccess for StoreChainAccess {
 
         // Deliberately not `put_block`: that writes the canonical
         // `number -> hash` pointer unconditionally, which would hand the
-        // height to a block that lost the total-difficulty comparison two
-        // lines below and leave the canonical chain naming a block that is
-        // not on it. Header and body are safe to store either way, being
-        // keyed by hash.
+        // height to a block that lost to the head below and leave the
+        // canonical chain naming a block that is not on it. Header and body
+        // are safe to store either way, being keyed by hash.
         self.store.put_header_with_hash(hash, &block.header).map_err(|e| e.to_string())?;
         self.store
             .put_body(hash, &block.transactions, &block.ommers)
             .map_err(|e| e.to_string())?;
         self.store.put_total_difficulty(hash, td).map_err(|e| e.to_string())?;
 
-        let current_td = match self.store.head().map_err(|e| e.to_string())? {
-            Some(head) => self
-                .store
-                .total_difficulty(head)
-                .map_err(|e| e.to_string())?
-                .unwrap_or(U256::ZERO),
-            None => U256::ZERO,
+        let (current_td, current) = match self.store.head().map_err(|e| e.to_string())? {
+            Some(head) => {
+                let td = self
+                    .store
+                    .total_difficulty(head)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(U256::ZERO);
+                let current = self.store.contender(head, td).map_err(|e| e.to_string())?;
+                (td, current)
+            }
+            None => (U256::ZERO, None),
         };
 
         switch_chain += laps.lap();
 
-        let result = if td > current_td {
+        // rskj connects a mined block through `blockchain.tryToConnect`, as it
+        // does a peer's: it takes the head by `SelectionRule.shouldWeAddThisBlock`,
+        // which settles a tie in total difficulty by fees and then hashes.
+        let mined = Contender {
+            total_difficulty: td,
+            paid_fees: block.header.paid_fees,
+            hash,
+        };
+        let takes_head = match &current {
+            Some(current) => should_we_add_this_block(&mined, current),
+            None => td > current_td,
+        };
+        let result = if takes_head {
             self.store.update_canonical_chain(hash).map_err(|e| e.to_string())?;
             self.store.set_exec_head(hash, state_root).map_err(|e| e.to_string())?;
             switch_chain += laps.lap();

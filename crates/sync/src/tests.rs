@@ -4475,6 +4475,59 @@ async fn test_no_reorg_via_headers_response_lower_td() {
     assert!(store.header(b2.hash()).unwrap().is_some());
 }
 
+/// A tie at the tip, settled as rskj's `SelectionRule.shouldWeAddThisBlock`
+/// settles it: a sibling of the head with the same total difficulty, fees
+/// like the head's and the lower hash takes the head, though the head was
+/// held first.
+#[tokio::test]
+async fn test_tie_via_headers_response_goes_to_the_lower_hash() {
+    use rustock_core::selection_rule::is_this_block_hash_smaller;
+
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+
+    let genesis = dummy_header(0, B256::ZERO, U256::from(10));
+    let genesis_hash = genesis.hash();
+    store.update_head(&genesis, U256::from(10)).unwrap();
+
+    // Blocks at #1 on genesis, alike but for their extra data.
+    let at_one = |branch: u8| {
+        let mut h = fork_header(1, genesis_hash, U256::from(10), branch);
+        h.paid_fees = U256::from(1_000);
+        h
+    };
+    let a1 = at_one(0xAA);
+    store.update_head(&a1, U256::from(20)).unwrap();
+    let b1 = (0..=u8::MAX)
+        .filter(|branch| *branch != 0xAA)
+        .map(at_one)
+        .find(|h| is_this_block_hash_smaller(&h.hash(), &a1.hash()))
+        .expect("a branch that hashes below the head");
+
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(
+        store.clone(),
+        verifier,
+        peer_store.clone(),
+    ));
+
+    let (_event_tx, event_rx) = mpsc::unbounded_channel();
+    let mut service = SyncService::new(manager, peer_store, event_rx);
+    service.state = SyncState::Following;
+
+    let peer = B512::repeat_byte(0x01);
+    service.on_headers_response(peer, vec![b1.clone()]).await;
+
+    // B1 weighs genesis's 10 and its own 10, as A1 does.
+    assert_eq!(
+        store.total_difficulty(b1.hash()).unwrap(),
+        Some(U256::from(20))
+    );
+    assert_eq!(store.head().unwrap(), Some(b1.hash()));
+    assert_eq!(store.canonical_hash(1).unwrap(), Some(b1.hash()));
+}
+
 // ========== Body download tests ==========
 
 #[tokio::test]
