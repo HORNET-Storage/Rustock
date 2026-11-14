@@ -2355,6 +2355,36 @@ impl BlockStore {
     pub fn db(&self) -> &Arc<DB> {
         &self.db
     }
+
+    /// Writes every column family's memtables out to its tables, so nothing
+    /// the database holds is left only in its write-ahead log, which RocksDB
+    /// then drops. For the end of a bulk load: `--import` otherwise leaves
+    /// the next start well over a gigabyte of log to replay.
+    pub fn flush_all(&self) -> Result<()> {
+        let names = [
+            CF_HEADERS,
+            CF_NUMBERS,
+            CF_TD,
+            CF_BODIES,
+            CF_RECEIPTS,
+            CF_TX_INDEX,
+            CF_BRIDGE_EVENTS,
+            CF_HEIGHT_INDEX,
+            CF_HEADER_NUMBERS,
+            CF_SNAP_CHUNKS,
+            CF_TRIE_NODES,
+        ];
+        for name in names {
+            if let Some(cf) = self.db.cf_handle(name) {
+                self.db
+                    .flush_cf(cf)
+                    .with_context(|| format!("flushing {name}"))?;
+            }
+        }
+        self.db
+            .flush()
+            .context("flushing the default column family")
+    }
 }
 
 #[cfg(test)]

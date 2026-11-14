@@ -175,6 +175,7 @@ shape looks unusual next to a conventional reference-counted pruner, and the
 reason it is that shape is that rskj chose it first.
 | Block pruning | (none — rskj keeps all blocks) | `crates/storage/src/pruner.rs` |
 | Position markers | `KEY_HEAD`-equivalents scattered across `BlockChainImpl` | `crates/storage/src/position.rs` (`Transition`, `Validated`) |
+| Starting from a signed state copy (`--import`) | `co.rsk.db.importer.BootstrapImporter`, `provider/*` (`BootstrapIndexCandidateSelector`, `BootstrapDataVerifier`, `BootstrapFileHandler`) | `crates/cli/src/bootstrap_import.rs`, over `https.rs` |
 
 ### JSON-RPC
 

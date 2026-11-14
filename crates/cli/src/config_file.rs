@@ -452,6 +452,12 @@ pub const ONE_SHOT: &[&str] = &[
     "verify_state",
     "trie_shape",
     "measure_block_reads",
+    // --import loads a copy into an empty data directory and refuses one
+    // that holds a chain, so a file that turned it on would stop every start
+    // after the first.
+    "import",
+    "import_url",
+    "import_trusted_key",
 ];
 
 /// Every runtime setting the file can supply. Kept beside the merge so the two

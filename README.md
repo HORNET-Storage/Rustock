@@ -127,6 +127,25 @@ cargo test --workspace
 
 786 tests covering consensus validation, RLP encoding, P2P handshakes, sync state machines, storage, the Unitrie, EVM execution, every RSK precompile (including the full Bridge surface and REMASC), the transaction pool, RPC methods, transaction relay, and chain reorganizations.
 
+### Starting from Rootstock's published state
+
+Rootstock publishes signed copies of the mainnet and testnet state for rskj's
+`--import`, and `--import` here does what rskj's does: it reads each trusted
+signer's index, takes the newest copy that more than half of them sign, checks
+those signatures and the copy's SHA-256, loads its blocks and state, and starts
+the node from there.
+
+```bash
+rustock --import --data-dir ./data
+```
+
+The data directory must not hold a chain: where rskj deletes one, rustock
+refuses. Mainnet's copy at #9,405,000 downloaded in about two minutes and
+loaded in 18 seconds, and the node then caught up with the network in about one.
+`--import-url` and `--import-trusted-key` point it at another network's copies;
+[`crates/cli/src/bootstrap_import.rs`](crates/cli/src/bootstrap_import.rs) says
+what it checks.
+
 ### Importing from rskj
 
 A synced rskj database can be imported instead of syncing from peers — about an

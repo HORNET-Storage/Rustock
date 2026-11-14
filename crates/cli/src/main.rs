@@ -1,6 +1,8 @@
 use clap::{CommandFactory, FromArgMatches, Parser};
 
+mod bootstrap_import;
 mod config_file;
+mod https;
 use rustock_core::config::ChainConfig;
 use rustock_core::validation::HeaderVerifier;
 use rustock_storage::BlockStore;
@@ -1479,6 +1481,31 @@ struct Args {
     /// connects. Off by default, and then no clock is read.
     #[arg(long, value_name = "FILE")]
     breakdown_log: Option<std::path::PathBuf>,
+
+    /// Start from the newest state copy Rootstock publishes, as rskj's
+    /// `--import` does: read each trusted signer's index, take the highest
+    /// height at which more than half of them (and at least two) sign the
+    /// same copy, check those signatures, download the copy, check its
+    /// SHA-256 against the signed hash, and load its blocks and state. The
+    /// node then starts from there and syncs on as usual.
+    ///
+    /// Mainnet and testnet use rskj's publishing URL and keys. Unlike rskj's,
+    /// this does not delete a database that holds a chain: it refuses to
+    /// start instead.
+    #[arg(long, default_value_t = false)]
+    import: bool,
+
+    /// With --import: where the copies are published, in place of the
+    /// network's (rskj's `database.import.url`). Each signer's index is read
+    /// from `<url><key>/index.json`.
+    #[arg(long, value_name = "URL")]
+    import_url: Option<String>,
+
+    /// With --import: a public key whose signatures count, in uncompressed
+    /// hex. Repeat it for each key; together they replace the network's
+    /// (rskj's `database.import.trusted-keys`).
+    #[arg(long, value_name = "HEX")]
+    import_trusted_key: Vec<String>,
 }
 
 /// Apply the file underneath the command line, one setting per line so the
@@ -2158,6 +2185,44 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         BlockStore::open(&args.data_dir)?
     });
 
+    // Where the trie lives, as the flags choose it: `--import` writes into it,
+    // and the node opens it further down.
+    let layout = trie_layout(&args)?;
+
+    // `--import`: Rootstock's newest signed copy goes in before anything reads
+    // the chain, as rskj's `--import` runs before its node starts.
+    if args.import {
+        anyhow::ensure!(
+            !read_only,
+            "--import loads a chain into the store, and this store is opened read-only"
+        );
+        let signers = bootstrap_import::Signers::for_network(
+            args.network_id,
+            args.import_url.as_deref(),
+            &args.import_trusted_key,
+        )?;
+        let data_dir = std::path::Path::new(&args.data_dir);
+        bootstrap_import::refuse_held_chain(&store, data_dir)?;
+        let trie = bootstrap_import::TrieTarget::open(
+            &layout.backend,
+            layout.engine,
+            layout.expected_keys,
+            &layout.trie_dir,
+            &store,
+        )?;
+        bootstrap_import::import(
+            &bootstrap_import::Web,
+            &signers,
+            data_dir,
+            &store,
+            &trie,
+            &config,
+        )
+        .await?;
+    } else {
+        bootstrap_import::refuse_unfinished(std::path::Path::new(&args.data_dir))?;
+    }
+
     let genesis_hash = setup_genesis(&store, &config)?;
     info!("Genesis Hash: {:?}", genesis_hash);
 
@@ -2310,37 +2375,12 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         args.network_id,
         &args.banned_miners,
     )?);
-    let gc_config = rustock_storage::epoch_store::EpochConfig {
-        epochs: args.gc_epochs,
-        burial_depth: args.gc_burial,
-        rotate_bytes: args.gc_rotate_mb * (1 << 20),
-    };
-    let rotate_bytes = gc_config.rotate_bytes;
-    let backend = rustock_storage::epoch_store::TrieBackend::parse(&args.trie_backend, gc_config)?;
-    let engine = rustock_storage::TrieEngine::parse(&args.trie_engine)?;
-    // An epoch's key count is bounded by when it rotates, so the default
-    // is computed rather than configured.
-    let expected_keys = if args.trie_expected_keys > 0 {
-        args.trie_expected_keys
-    } else {
-        rustock_storage::epoch_backend::keys_for_rotation(rotate_bytes)
-    };
-    if matches!(backend, rustock_storage::epoch_store::TrieBackend::Single)
-        && engine == rustock_storage::TrieEngine::FlatDb
-    {
-        anyhow::bail!(
-            "--trie-backend single keeps nodes in a column family of the node's main \
-             database, which only rocksdb can provide; use --trie-backend external or \
-             epoch to run flatdb"
-        );
-    }
-
-    // The node only ever holds an `Arc<dyn TrieStore>`, so this is the entire
-    // extent of the choice: nothing downstream knows which store it got.
-    let trie_dir = args.trie_dir.clone().unwrap_or_else(|| {
-        let suffix = if backend.is_collecting() { "trie-epochs" } else { "trie" };
-        std::path::Path::new(&args.data_dir).join(suffix).to_string_lossy().into_owned()
-    });
+    let TrieLayout {
+        backend,
+        engine,
+        expected_keys,
+        trie_dir,
+    } = layout;
     // Always say where the trie is. With three backends and a migration in the
     // field, "which trie is this node actually reading?" is the first question
     // worth answering in any log, and the answer should not depend on which
@@ -4271,6 +4311,62 @@ fn build_genesis_state(config: &ChainConfig, trie_store: &dyn TrieStore) -> Resu
 
     root.save(trie_store, true);
     Ok(root)
+}
+
+/// Where the node keeps its trie, as the flags choose it: what `--import`
+/// writes into, and what the node then opens.
+struct TrieLayout {
+    backend: rustock_storage::epoch_store::TrieBackend,
+    engine: rustock_storage::TrieEngine,
+    expected_keys: u64,
+    trie_dir: String,
+}
+
+fn trie_layout(args: &Args) -> Result<TrieLayout> {
+    let gc_config = rustock_storage::epoch_store::EpochConfig {
+        epochs: args.gc_epochs,
+        burial_depth: args.gc_burial,
+        rotate_bytes: args.gc_rotate_mb * (1 << 20),
+    };
+    let rotate_bytes = gc_config.rotate_bytes;
+    let backend = rustock_storage::epoch_store::TrieBackend::parse(&args.trie_backend, gc_config)?;
+    let engine = rustock_storage::TrieEngine::parse(&args.trie_engine)?;
+    // An epoch's key count is bounded by when it rotates, so the default
+    // is computed rather than configured.
+    let expected_keys = if args.trie_expected_keys > 0 {
+        args.trie_expected_keys
+    } else {
+        rustock_storage::epoch_backend::keys_for_rotation(rotate_bytes)
+    };
+    if matches!(backend, rustock_storage::epoch_store::TrieBackend::Single)
+        && engine == rustock_storage::TrieEngine::FlatDb
+    {
+        anyhow::bail!(
+            "--trie-backend single keeps nodes in a column family of the node's main \
+             database, which only rocksdb can provide; use --trie-backend external or \
+             epoch to run flatdb"
+        );
+    }
+
+    // The node only ever holds an `Arc<dyn TrieStore>`, so this is the entire
+    // extent of the choice: nothing downstream knows which store it got.
+    let trie_dir = args.trie_dir.clone().unwrap_or_else(|| {
+        let suffix = if backend.is_collecting() {
+            "trie-epochs"
+        } else {
+            "trie"
+        };
+        std::path::Path::new(&args.data_dir)
+            .join(suffix)
+            .to_string_lossy()
+            .into_owned()
+    });
+    Ok(TrieLayout {
+        backend,
+        engine,
+        expected_keys,
+        trie_dir,
+    })
 }
 
 fn setup_genesis(store: &BlockStore, config: &ChainConfig) -> Result<alloy_primitives::B256> {

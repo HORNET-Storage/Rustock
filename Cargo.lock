@@ -3310,14 +3310,17 @@ dependencies = [
  "rustock-trie",
  "serde",
  "serde_json",
+ "sha2",
  "sha3",
  "tempfile",
  "time",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber 0.3.22",
+ "webpki-roots",
 ]
 
 [[package]]
