@@ -93,7 +93,7 @@ fn path_messages(root: &TrieNode, key: &[u8], store: &dyn TrieStore) -> Vec<Stri
     }
 }
 
-pub fn eth_get_proof(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
+pub async fn eth_get_proof(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse {
     let Some(addr) = params
         .get(0)
         .and_then(|v| v.as_str())
@@ -127,8 +127,20 @@ pub fn eth_get_proof(id: Value, params: &Value, state: &RpcState) -> JsonRpcResp
         slots.push((raw.to_string(), slot));
     }
 
-    // The block as the state queries read it: a tag, a number, or an
-    // EIP-1898 object.
+    // A node with no trie of its own -- a light client -- asks a peer and
+    // checks the answer against a header it validated itself. The local trie
+    // wins whenever there is one: no round trip, nothing to verify. Either
+    // way the block is read as the state queries read it: a tag, a number,
+    // or an EIP-1898 object.
+    if state.trie_store.is_none() {
+        let named = crate::helpers::block_ref(params.get(2), &state.store)
+            .and_then(|(identifier, _)| crate::helpers::information_block(&identifier));
+        return match named {
+            Ok(block) => light_proof(id, addr, &slots, &block, state).await,
+            Err((code, message)) => JsonRpcResponse::error(id, code, message),
+        };
+    }
+
     let (root, _header) = match crate::state::queried_state(&id, params.get(2), state) {
         Ok(found) => found,
         Err(refused) => return refused,
@@ -409,4 +421,109 @@ fn parse_state_key(text: &str) -> Option<Vec<u8>> {
         return None;
     }
     hex::decode(digits).ok()
+}
+
+/// Answer `eth_getProof` on a node that holds no state.
+///
+/// The peer's answer is checked before any of it is used: every path has to
+/// hash up to the state root of a header this node validated itself. A peer
+/// that lies costs a round trip; it cannot produce a wrong balance.
+///
+/// The three outcomes are kept distinct, because conflating them is how a
+/// light client gets fooled:
+///
+/// - a verified value, which is the answer;
+/// - a verified **absence**, which is also an answer -- the account is not
+///   there, and the proof shows it;
+/// - an incomplete proof, which is **not** an answer. The peer withheld, or
+///   sent a path for a different key. Reporting that as a zero balance would
+///   let any peer deny any account by staying quiet, so it is an error.
+async fn light_proof(
+    id: Value,
+    addr: Address,
+    slots: &[(String, B256)],
+    block_param: &str,
+    state: &RpcState,
+) -> JsonRpcResponse {
+    use rustock_trie::proof::{verify_path, Outcome};
+
+    let Some(fetcher) = state.proof_fetcher.clone() else {
+        return JsonRpcResponse::error(
+            id,
+            INTERNAL_ERROR,
+            "State not available: this node holds no trie and has no peer to ask",
+        );
+    };
+    let Some(header) = crate::state::resolve_header(block_param, &state.store) else {
+        return JsonRpcResponse::error(id, INTERNAL_ERROR, "Cannot resolve block");
+    };
+    let state_root = header.state_root;
+
+    let keys: Vec<B256> = slots.iter().map(|(_, s)| *s).collect();
+    let (account_proof, storage_proofs) =
+        match fetcher.fetch_proof(header.number, addr, keys).await {
+            Ok(v) => v,
+            Err(e) => return JsonRpcResponse::error(id, INTERNAL_ERROR, e),
+        };
+
+    let account = match verify_path(&account_proof, &account_key(&addr), state_root) {
+        Ok(Outcome::Value(bytes)) => AccountState::decode(&bytes).ok(),
+        Ok(Outcome::Absent) => None,
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                format!("the peer's account proof does not check out: {e}"),
+            )
+        }
+    };
+    let (nonce, balance) = match &account {
+        Some(a) => (a.nonce, a.balance),
+        None => (U256::ZERO, U256::ZERO),
+    };
+
+    let mut storage_proof: Vec<Value> = Vec::with_capacity(slots.len());
+    for (i, (raw, slot)) in slots.iter().enumerate() {
+        let path = storage_proofs.get(i).cloned().unwrap_or_default();
+        let value = match verify_path(&path, &storage_key(&addr, slot), state_root) {
+            Ok(Outcome::Value(bytes)) => {
+                let mut padded = [0u8; 32];
+                let start = 32usize.saturating_sub(bytes.len());
+                padded[start..].copy_from_slice(&bytes[bytes.len().saturating_sub(32)..]);
+                U256::from_be_bytes(padded)
+            }
+            Ok(Outcome::Absent) => U256::ZERO,
+            Err(e) => {
+                return JsonRpcResponse::error(
+                    id,
+                    INTERNAL_ERROR,
+                    format!("the peer's proof for slot {raw} does not check out: {e}"),
+                )
+            }
+        };
+        storage_proof.push(json!({
+            "key": raw,
+            "value": format!("{value:#x}"),
+            "proof": path.iter().map(|n| format!("0x{}", hex::encode(n))).collect::<Vec<_>>(),
+        }));
+    }
+
+    // Two fields a light client cannot honestly fill. `codeHash` would need
+    // the code itself, and `storageHash` the storage-prefix node; neither was
+    // asked for, and inventing a plausible constant for either would be worse
+    // than saying nothing, because a caller cannot tell an invented value
+    // from a proved one.
+    JsonRpcResponse::success(
+        id,
+        json!({
+            "address": format!("{addr:#x}"),
+            "balance": format!("{balance:#x}"),
+            "nonce": format!("{nonce:#x}"),
+            "accountProof": account_proof
+                .iter()
+                .map(|n| format!("0x{}", hex::encode(n)))
+                .collect::<Vec<_>>(),
+            "storageProof": storage_proof,
+        }),
+    )
 }

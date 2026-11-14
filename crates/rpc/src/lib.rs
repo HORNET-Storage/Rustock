@@ -14,6 +14,7 @@ pub mod params;
 pub mod proof;
 pub mod raw_tx;
 pub mod revert;
+pub mod witness_search;
 pub mod rsk;
 pub mod sco;
 pub mod server;

@@ -50,11 +50,8 @@ pub fn trace_transaction(id: Value, params: &Value, state: &RpcState) -> JsonRpc
     };
     // On the main chain only, as rskj's `traceTransaction` looks it up
     // (`receiptStore.getInMainChain`): a block that lost a reorg is no answer.
-    let Some((block_hash, index)) = state
-        .store
-        .tx_location_in_main_chain(tx_hash)
-        .ok()
-        .flatten()
+    let Some((block_hash, index)) =
+        crate::helpers::canonical_tx_location(&state.store, tx_hash)
     else {
         return JsonRpcResponse::success(id, Value::Null);
     };
@@ -121,11 +118,8 @@ pub fn trace_get(id: Value, params: &Value, state: &RpcState) -> JsonRpcResponse
 
     // On the main chain only, as rskj's `traceGet` looks it up
     // (`receiptStore.getInMainChain`).
-    let Some((block_hash, _)) = state
-        .store
-        .tx_location_in_main_chain(tx_hash)
-        .ok()
-        .flatten()
+    let Some((block_hash, _)) =
+        crate::helpers::canonical_tx_location(&state.store, tx_hash)
     else {
         return JsonRpcResponse::success(id, Value::Null);
     };

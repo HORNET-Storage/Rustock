@@ -226,7 +226,7 @@ pub(crate) fn state_at(block_param: &str, state: &RpcState) -> Result<(TrieNode,
     Ok((root_node, header))
 }
 
-fn resolve_header(block_param: &str, store: &BlockStore) -> Option<Header> {
+pub fn resolve_header(block_param: &str, store: &BlockStore) -> Option<Header> {
     let head_num = store.head().ok()?
         .and_then(|h| store.header(h).ok().flatten())
         .map(|h| h.number)?;

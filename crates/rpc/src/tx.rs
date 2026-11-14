@@ -14,11 +14,8 @@ pub fn eth_get_transaction_by_hash(id: Value, params: &Value, state: &RpcState) 
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid tx hash");
     };
 
-    let Some((block_hash, tx_index)) = state
-        .store
-        .tx_location_in_main_chain(tx_hash)
-        .ok()
-        .flatten()
+    let Some((block_hash, tx_index)) =
+        crate::helpers::canonical_tx_location(&state.store, tx_hash)
     else {
         if let Some((tx, sender, hash)) = state
             .tx_pool
@@ -85,11 +82,8 @@ pub fn eth_get_transaction_receipt(id: Value, params: &Value, state: &RpcState) 
         return JsonRpcResponse::error(id, INVALID_PARAMS, "Missing or invalid tx hash");
     };
 
-    let Some((block_hash, tx_index)) = state
-        .store
-        .tx_location_in_main_chain(tx_hash)
-        .ok()
-        .flatten()
+    let Some((block_hash, tx_index)) =
+        crate::helpers::canonical_tx_location(&state.store, tx_hash)
     else {
         return JsonRpcResponse::success(id, Value::Null);
     };

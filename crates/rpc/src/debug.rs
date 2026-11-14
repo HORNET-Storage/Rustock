@@ -98,11 +98,8 @@ pub fn debug_trace_transaction(id: Value, params: &Value, state: &RpcState) -> J
     };
     // On the main chain only, as rskj's tracer looks it up
     // (`receiptStore.getInMainChain`): a block that lost a reorg is no answer.
-    let Some((block_hash, index)) = state
-        .store
-        .tx_location_in_main_chain(tx_hash)
-        .ok()
-        .flatten()
+    let Some((block_hash, index)) =
+        crate::helpers::canonical_tx_location(&state.store, tx_hash)
     else {
         return JsonRpcResponse::success(id, Value::Null);
     };

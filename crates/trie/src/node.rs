@@ -731,6 +731,33 @@ impl TrieNode {
         Ok(nodes)
     }
 
+    /// Every node the search for `key` visits, whether or not the key is
+    /// there.
+    ///
+    /// [`nodes_on_path`](Self::nodes_on_path) answers `None` for a key the
+    /// trie does not hold, which is right for an inclusion proof and useless
+    /// for proving the opposite. A client that is told "absent" and given
+    /// nothing has learned only that the peer said so; any peer could deny
+    /// any account by returning an empty array.
+    ///
+    /// This returns the nodes down to the point where the search stops --
+    /// the divergence -- which is exactly what a verifier needs to confirm
+    /// the trie really does end there. Deepest first, like `nodes_on_path`,
+    /// and identical to it whenever the key *is* present.
+    ///
+    /// `None` only when the store could not produce a node the walk needed,
+    /// which is incompleteness rather than absence and must not be reported
+    /// as a proof of either.
+    pub fn nodes_to_divergence(
+        &self,
+        key: &TrieKeySlice,
+        store: &dyn TrieStore,
+    ) -> Option<Vec<TrieNode>> {
+        // The walk is `try_nodes_toward`'s, which also says which node the
+        // store could not produce.
+        self.try_nodes_toward(key, store).ok()
+    }
+
     /// Like [`get`](Self::get), but says which node was missing instead of
     /// answering "no value" when the trie is incomplete.
     ///

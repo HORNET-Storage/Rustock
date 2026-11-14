@@ -334,8 +334,9 @@ pub fn rsk_get_raw_transaction_receipt_by_hash(
 
     // rskj's `receiptStore.getInMainChain`: the canonical block holding the
     // transaction, though a block that lost a reorg holds it too and may be
-    // the one the index wrote last.
-    let Ok(Some((block_hash, index))) = store.tx_location_in_main_chain(tx_hash) else {
+    // the one the index wrote last. `canonical_tx_location` is the one place
+    // every method reads the index through (#343).
+    let Some((block_hash, index)) = crate::helpers::canonical_tx_location(store, tx_hash) else {
         return JsonRpcResponse::success(id, Value::Null);
     };
 
