@@ -865,3 +865,53 @@ at twice the fees, no fees, and doubling past 256 bits), and
 `a_mined_block_that_ties_the_head_goes_by_the_selection_rule`, each of which
 fails on the old comparison.
 
+## §100 A block is the best only once it is executed, and a reorg runs nothing again
+
+rskj connects every block it is given: `BlockChainImpl.internalTryToConnect`
+executes it against its own parent's state (`blockExecutor.execute(…, block,
+parent.getHeader(), …)`) and files the result (`stateRootHandler.register`),
+best or not, and only then asks the selection rule (§99) whether it is the new
+best (VETIVER-9.0.4, `co/rsk/core/bc/BlockChainImpl.java`). A block it has not
+connected cannot be the best, so a heavier chain known by its headers alone
+leaves rskj where it is; and a reorg (`blockStore.reBranch`) re-points the
+index over blocks already executed, so it executes nothing.
+
+rustock executed only the block canonical at each height, and moved its head
+on headers. A heavier chain known by its headers took the head, pulled
+execution back to the fork point, and was executed there on a later tick (5 s),
+after a grace period for an executed head off the chain (10 s), once its bodies
+had been fetched. Meanwhile the miner built on the fork point and every query
+was answered from there; and a miner able to produce the heavier chain could
+keep the node there by withholding its bodies. Found on 14 November 2026,
+comparing how the two clients meet a fork.
+
+**rustock:** the store holds a heavier branch back until this node has
+executed it past its executed head (`BlockStore::move_head_to`,
+`adoption_waits_for_execution`), and then takes execution straight to the
+branch's highest executed block (`stage_execution_after_reorg`,
+`executed_climb`). The sync service executes every block whose body it holds
+as it arrives, against its own parent's state -- beside the chain when it is
+not canonical (`service::beside`, `BlockProcessor::process_beside`) -- fetches
+the bodies and missing headers of a branch held back, gives one up after 60 s
+without progress, and takes a switch up in the call that makes it: the
+in-memory root, the miner's best block, subscribers, the transaction pool, the
+gas price and the Bridge index. Whether this node executed a block is the
+block's own receipts hashed against its header, with its state root resolving
+in the trie, so nothing durable names a losing branch's state and the epoch
+collector is unchanged ([`follow-mode-rskj-vs-rustock.md`](./follow-mode-rskj-vs-rustock.md)
+§5, §8).
+
+What stays different: rskj keeps what it computed for a block for as long as
+its stores keep it; rustock keeps the state of a branch beside the chain for as
+long as the collector does, and would run such a branch again if the chain
+turned to it after that, tens of thousands of blocks later, past any reorg this
+node follows.
+
+Tests: `service::beside::tests`, eight, each failing with the new behaviour
+switched off; and the store's half in `crates/storage/src/position.rs`:
+`a_heavier_branch_waits_until_it_is_executed_past_the_executed_head`,
+`a_switch_takes_execution_to_the_executed_tip_of_the_new_branch`,
+`a_node_without_the_check_adopts_on_headers_as_before`,
+`a_waiting_branch_the_chain_outgrows_is_forgotten` and
+`a_block_weighed_again_takes_the_head_once_it_outweighs_it`.
+

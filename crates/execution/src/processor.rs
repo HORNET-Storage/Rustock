@@ -618,11 +618,14 @@ impl BlockProcessor {
     ///
     /// # Why the receipt index is the right witness
     ///
-    /// `put_receipts` is called from exactly one place in this crate -- the end
-    /// of `process_and_commit` -- so a receipt entry keyed by a block hash is a
-    /// record that *this* node executed *that* block. It is persisted, so it
-    /// survives a restart, and the pruner deletes it in the same batch as the
-    /// block and its state, so it cannot outlive what it vouches for.
+    /// `put_receipts` is called in this crate only right after a block has
+    /// run -- by `commit_by_hash`, which `process_and_commit` and
+    /// `process_beside` reach once execution has succeeded, and by
+    /// `execute_and_commit` -- so a receipt entry keyed by a block hash is a
+    /// record that *this* node executed *that* block, on the chain or beside
+    /// it. It is persisted, so it survives a restart, and the pruner deletes
+    /// it in the same batch as the block and its state, so it cannot outlive
+    /// what it vouches for.
     /// `executed_locally_is_only_written_by_execution` pins that invariant.
     ///
     /// # Why it does not have to be trusted
@@ -1100,6 +1103,24 @@ impl BlockProcessor {
         Ok(result)
     }
 
+    /// Validate and execute a block that is not on the chain, against its own
+    /// parent's state, and commit what it keys by hash: its receipts and its
+    /// transactions. What it keys by height waits for the chain to take it up
+    /// ([`Self::commit_by_height`]), since the chain gives that height to
+    /// another block meanwhile. rskj executes every block it connects so
+    /// (`BlockChainImpl.internalTryToConnect`), best or not, and a switch to
+    /// it later runs nothing again.
+    pub fn process_beside(
+        &self,
+        block: &Block,
+        parent_state: &TrieNode,
+        trie_store: Arc<dyn TrieStore>,
+    ) -> Result<ProcessedBlock, ProcessError> {
+        let result = self.process_block(block, parent_state, trie_store)?;
+        self.commit_by_hash(block, &result.receipts)?;
+        Ok(result)
+    }
+
     /// Records this block's peg events that the Bridge did not emit: the
     /// decisions `decisions` holds, which are the block's own
     /// ([`ProcessedBlock::unlogged_peg_events`]).
@@ -1169,9 +1190,23 @@ impl BlockProcessor {
         block: &Block,
         result: &ProcessedBlock,
     ) -> Result<(), ProcessError> {
+        self.commit_by_hash(block, &result.receipts)?;
+        self.commit_by_height(block, &result.receipts, &result.unlogged_peg_events)
+    }
+
+    /// What a processed block commits under its own hash: its receipts, and
+    /// its transactions in the index that finds them. A block beside the
+    /// chain holds both as well as one on it, as rskj's receipt store holds
+    /// every block it connects, so a block executed as it arrived is ready
+    /// the moment the chain switches to it.
+    ///
+    /// Private, and reached only from right after a block has run: the receipts
+    /// it writes are this node's witness that it executed the block (see
+    /// [`Self::was_executed_locally`]).
+    fn commit_by_hash(&self, block: &Block, receipts: &[Receipt]) -> Result<(), ProcessError> {
         let hash = block.hash();
         self.block_store
-            .put_receipts(hash, &result.receipts)
+            .put_receipts(hash, receipts)
             .map_err(ProcessError::Storage)?;
         // Receipts are stored by block hash, so without this the only way to
         // reach one is to already know which block it is in:
@@ -1181,6 +1216,20 @@ impl BlockProcessor {
         self.block_store
             .index_block_transactions(hash, &block.transactions)
             .map_err(ProcessError::Storage)?;
+        Ok(())
+    }
+
+    /// What a processed block commits under its height: its Bridge events, and
+    /// the peg events it made that the Bridge did not log. Indexed by height,
+    /// so written once the block is on the chain, and not for a block beside
+    /// it, which would leave its events at a height the chain gives another
+    /// block.
+    pub fn commit_by_height(
+        &self,
+        block: &Block,
+        receipts: &[Receipt],
+        unlogged: &[crate::silent::SilentRecord],
+    ) -> Result<(), ProcessError> {
         // Keep the Bridge event index current as blocks arrive. Rebuilding it
         // from receipts is possible (--build-bridge-index) but an index that is
         // only ever rebuilt is stale the moment the node advances, which is
@@ -1190,12 +1239,26 @@ impl BlockProcessor {
         self.block_store
             .index_bridge_events(
                 block.header.number,
-                &result.receipts,
+                receipts,
                 &block.transactions,
                 crate::precompiles::BRIDGE_ADDR,
             )
             .map_err(ProcessError::Storage)?;
-        self.record_unlogged_peg_events(block, &result.unlogged_peg_events)?;
+        self.record_unlogged_peg_events(block, unlogged)
+    }
+
+    /// Take a block the chain has left out of the Bridge event index: the
+    /// events [`Self::commit_by_height`] wrote at its height from these
+    /// receipts. The peg events the Bridge did not log stay, since nothing
+    /// says which of them a block made once it has run.
+    pub fn uncommit_by_height(
+        &self,
+        number: u64,
+        receipts: &[Receipt],
+    ) -> Result<(), ProcessError> {
+        self.block_store
+            .remove_bridge_events(number, receipts, crate::precompiles::BRIDGE_ADDR)
+            .map_err(ProcessError::Storage)?;
         Ok(())
     }
 
@@ -2713,9 +2776,16 @@ mod tests {
         assert_eq!(
             writes, 2,
             "put_receipts is called {writes} times in this crate's production code, not 2 \
-             (the unitrie and Orchid arms of process_and_commit). A new writer means the \
-             receipt index no longer proves this node executed the block -- see \
-             was_executed_locally."
+             (commit_by_hash and execute_and_commit). A new writer means the receipt index no \
+             longer proves this node executed the block -- see was_executed_locally."
+        );
+        // The receipts of a block executed beside the chain are written by
+        // `process_beside`, through `commit_by_hash`, which must not be
+        // reachable from outside without a block having run.
+        assert!(
+            !production.contains("pub fn commit_by_hash"),
+            "commit_by_hash writes the receipt index and must stay private: only \
+             process_and_commit and process_beside reach it, after the block has run"
         );
     }
 

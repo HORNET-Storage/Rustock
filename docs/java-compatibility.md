@@ -102,6 +102,7 @@ implementation quirk, it is cross-referenced below.
 | 97 | A peg-in rskj can't refund logs unrefundable_pegin, and before RSKIP379 one with no sender is marked processed | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
 | 98 | From RSKIP379 a peg-in is registered without the lock whitelist or the locking cap, and a multisig sender's outputs are read by bitcoinj | [`quirks-frozen-bugs.md`](./quirks-frozen-bugs.md) |
 | 99 | Two chains of equal total difficulty: rskj's selection rule, not the block held first | [`design-divergences.md`](./design-divergences.md) |
+| 100 | A block is the best only once it is executed, and a reorg runs nothing again | [`design-divergences.md`](./design-divergences.md) |
 | — | Discovery NodeTable eviction (liveness, non-consensus) | [`wire-protocol.md`](./wire-protocol.md) |
 
 ## Quirks logged with their feature (cross-reference to `consensus-port-log.md`)

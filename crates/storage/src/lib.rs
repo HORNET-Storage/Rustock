@@ -148,6 +148,18 @@ fn height_index_key(number: u64, hash: B256) -> [u8; 40] {
     key
 }
 
+/// `topic0 (32) || block (8 BE) || tx_index (4 BE) || log_index (4 BE)`: a
+/// Bridge event's key in `CF_BRIDGE_EVENTS`, so that one event type's
+/// occurrences sort by block and scanning them is a prefix walk.
+fn bridge_event_key(topic0: B256, block: u64, tx_index: u32, log_index: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(48);
+    key.extend_from_slice(topic0.as_slice());
+    key.extend_from_slice(&block.to_be_bytes());
+    key.extend_from_slice(&tx_index.to_be_bytes());
+    key.extend_from_slice(&log_index.to_be_bytes());
+    key
+}
+
 /// Safety limit: refuse to reorg deeper than this many blocks.
 const MAX_REORG_DEPTH: u64 = 1000;
 
@@ -169,6 +181,36 @@ pub struct BlockStore {
     freezer: std::sync::RwLock<Option<Arc<crate::freezer::Freezer>>>,
     /// The heights headers are read under: see [`BlockStore::with_activations`].
     activations: Option<ActivationHeights>,
+    /// Whether this node executed a block and still holds the state it
+    /// produced: installed by whatever executes blocks, absent on a node
+    /// that executes nothing. See [`BlockStore::set_executed_check`].
+    executed_check: std::sync::RwLock<Option<ExecutedCheck>>,
+    /// The tip of a heavier branch that is not adopted yet, because this
+    /// node has not executed it past its executed head. See
+    /// [`BlockStore::deferred_head`].
+    deferred_head: std::sync::Mutex<Option<B256>>,
+}
+
+/// Says whether this node executed the block `hash` (whose header is the
+/// second argument) and still holds the state it produced.
+///
+/// The store cannot answer that itself: the evidence is the block's receipts
+/// hashed against its header's `receiptsRoot`, which needs the execution
+/// crate's hardfork configuration, and its state root resolving in the trie
+/// store, which is another store. So whoever executes blocks installs it.
+pub type ExecutedCheck = Arc<dyn Fn(B256, &Header) -> bool + Send + Sync>;
+
+/// What [`BlockStore::retry_deferred_head`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredHead {
+    /// No branch was waiting.
+    None,
+    /// The branch is executed past the executed head and is now the chain.
+    Adopted,
+    /// The branch still waits for more of it to be executed.
+    Waiting,
+    /// The head has overtaken the branch, which is forgotten.
+    Dropped,
 }
 
 /// RocksDB settings for a bulk import.
@@ -334,6 +376,8 @@ impl BlockStore {
             db: Arc::new(db),
             freezer: std::sync::RwLock::new(None),
             activations: None,
+            executed_check: std::sync::RwLock::new(None),
+            deferred_head: std::sync::Mutex::new(None),
         })
     }
 
@@ -378,6 +422,8 @@ impl BlockStore {
             db: Arc::new(db),
             freezer: std::sync::RwLock::new(None),
             activations: None,
+            executed_check: std::sync::RwLock::new(None),
+            deferred_head: std::sync::Mutex::new(None),
         })
     }
 
@@ -970,6 +1016,26 @@ impl BlockStore {
             }
         };
 
+        // rskj makes a block its best only once it has connected it, which
+        // means executed it against its parent's state
+        // (`BlockChainImpl.internalTryToConnect`), so a heavier chain whose
+        // blocks it has not executed leaves its best block where it is. Taken
+        // on its headers alone, such a chain pulls execution back to the fork
+        // point and puts the miner and every query there until its blocks
+        // arrive and run, and for good if they never do: headers heavy with
+        // work and their bodies withheld would hold the node at the fork. So
+        // a move that would leave the executed head off the chain waits until
+        // this node has executed the new branch past it.
+        if self.adoption_waits_for_execution(&proved)? {
+            debug!(
+                target: "rustock::storage",
+                "head {new_head} is heavier, but its branch is not executed past the executed \
+                 head; holding it until it is"
+            );
+            *self.deferred_head.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_head);
+            return Ok(());
+        }
+
         // Identical work either way -- the distinction is what the logs say
         // happened, and a retreat is worth being able to see.
         let descending = previous
@@ -982,7 +1048,108 @@ impl BlockStore {
         };
 
         self.apply(&transition)?;
+        let mut deferred = self.deferred_head.lock().unwrap_or_else(|e| e.into_inner());
+        if *deferred == Some(new_head) {
+            *deferred = None;
+        }
         Ok(())
+    }
+
+    /// Install the test for "this node executed that block and still holds
+    /// the state it produced": see [`ExecutedCheck`]. With one installed, a
+    /// reorg waits for its branch to be executed (see [`Self::deferred_head`])
+    /// and execution follows a reorg to the highest block of the new branch
+    /// executed already, rather than back to the fork point.
+    pub fn set_executed_check(&self, check: ExecutedCheck) {
+        *self
+            .executed_check
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(check);
+    }
+
+    /// Whether this node executes blocks: whether a check is installed.
+    fn executes(&self) -> bool {
+        self.executed_check
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Whether this node executed `hash`, whose header is `header`, and still
+    /// holds its state. `false` on a node that executes nothing.
+    pub fn executed_here(&self, hash: B256, header: &Header) -> bool {
+        let check = self
+            .executed_check
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        check.is_some_and(|check| check(hash, header))
+    }
+
+    /// The tip of a heavier branch whose adoption waits for this node to
+    /// execute it past the executed head, if there is one.
+    ///
+    /// The head, the canonical index and the executed head all stay on the
+    /// chain execution is on meanwhile, as rskj's best block stays on the
+    /// best chain it has connected. Whoever executes blocks executes this
+    /// branch's beside the chain and calls [`Self::retry_deferred_head`].
+    pub fn deferred_head(&self) -> Option<B256> {
+        *self.deferred_head.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Forget the deferred branch: one of its blocks failed to execute, so it
+    /// can never be adopted, as rskj never connects a block that fails.
+    pub fn clear_deferred_head(&self) {
+        *self.deferred_head.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Weigh the deferred branch again, after more of it was executed: adopt
+    /// it if its executed part now beats the executed head, and forget it if
+    /// the head has since overtaken it.
+    pub fn retry_deferred_head(&self) -> Result<DeferredHead> {
+        let Some(deferred) = self.deferred_head() else {
+            return Ok(DeferredHead::None);
+        };
+        let head = self.head()?;
+        if !self.takes_head_from(deferred, head)? {
+            self.clear_deferred_head();
+            return Ok(DeferredHead::Dropped);
+        }
+        self.move_head_to(deferred, head)?;
+        Ok(if self.head()? == Some(deferred) {
+            DeferredHead::Adopted
+        } else {
+            DeferredHead::Waiting
+        })
+    }
+
+    /// Weigh `hash` against the head again: for a block whose total
+    /// difficulty rose once its body showed its uncles, which its header
+    /// alone could not. Returns whether it took the head.
+    pub fn reconsider_head(&self, hash: B256) -> Result<bool> {
+        let head = self.head()?;
+        if head == Some(hash) || !self.takes_head_from(hash, head)? {
+            return Ok(false);
+        }
+        self.move_head_to(hash, head)?;
+        Ok(self.head()? == Some(hash))
+    }
+
+    /// Whether `hash` takes the head from `head` by rskj's selection rule,
+    /// each weighed with the total difficulty stored for it.
+    fn takes_head_from(&self, hash: B256, head: Option<B256>) -> Result<bool> {
+        let td = self.total_difficulty(hash)?.unwrap_or_default();
+        let Some(candidate) = self.contender(hash, td)? else {
+            return Ok(false);
+        };
+        let Some(head) = head else {
+            return Ok(true);
+        };
+        let head_td = self.total_difficulty(head)?.unwrap_or_default();
+        Ok(match self.contender(head, head_td)? {
+            Some(current) => should_we_add_this_block(&candidate, &current),
+            None => td > head_td,
+        })
     }
 
     /// Walks backward from `new_head` using `parent_hash` links, updating
@@ -1840,11 +2007,7 @@ impl BlockStore {
         topics: &[B256],
         data: &[u8],
     ) -> Result<()> {
-        let mut key = Vec::with_capacity(48);
-        key.extend_from_slice(topic0.as_slice());
-        key.extend_from_slice(&block.to_be_bytes());
-        key.extend_from_slice(&tx_index.to_be_bytes());
-        key.extend_from_slice(&log_index.to_be_bytes());
+        let key = bridge_event_key(topic0, block, tx_index, log_index);
 
         let mut val = Vec::with_capacity(64 + data.len());
         val.extend_from_slice(tx_hash.as_slice());
@@ -1893,6 +2056,40 @@ impl BlockStore {
             }
         }
         Ok(written)
+    }
+
+    /// Remove what [`Self::index_bridge_events`] wrote for a block at height
+    /// `block` with these receipts: for a block the chain has left, whose
+    /// events would otherwise stay indexed at a height the chain now gives
+    /// another block. Returns how many were removed.
+    pub fn remove_bridge_events(
+        &self,
+        block: u64,
+        receipts: &[Receipt],
+        bridge: alloy_primitives::Address,
+    ) -> Result<u64> {
+        let cf = self.cf(CF_BRIDGE_EVENTS)?;
+        let mut batch = WriteBatch::default();
+        let mut removed = 0u64;
+        for (tx_index, receipt) in receipts.iter().enumerate() {
+            for (log_index, log) in receipt.logs.iter().enumerate() {
+                if log.address != bridge {
+                    continue;
+                }
+                let Some(topic0) = log.topics.first().copied() else {
+                    continue;
+                };
+                batch.delete_cf(
+                    cf,
+                    bridge_event_key(topic0, block, tx_index as u32, log_index as u32),
+                );
+                removed += 1;
+            }
+        }
+        self.db
+            .write(batch)
+            .context("Failed to remove bridge events")?;
+        Ok(removed)
     }
 
     /// Every occurrence of one event type, in block order, optionally bounded.
@@ -3485,6 +3682,58 @@ mod tests {
         assert_eq!(found[0].0, 7);
         assert_eq!(found[0].5, b"mine");
         assert_eq!(found[0].2, 1, "log index within the receipt is preserved");
+    }
+
+    /// A block the chain left takes its Bridge events out of the index with
+    /// it, and only its own: the block that has its height now, and blocks at
+    /// other heights, keep theirs.
+    #[test]
+    fn remove_bridge_events_takes_out_only_the_block_left() {
+        use rustock_core::Log;
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path()).unwrap();
+        let bridge = Address::repeat_byte(0x06);
+        let topic = B256::repeat_byte(0xA1);
+        let receipt = |data: &[u8]| Receipt {
+            post_tx_state: vec![1],
+            cumulative_gas_used: 0,
+            gas_used: 0,
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+            status: true,
+            logs: vec![
+                Log {
+                    address: Address::repeat_byte(0x99),
+                    topics: vec![topic],
+                    data: vec![].into(),
+                },
+                Log {
+                    address: bridge,
+                    topics: vec![topic],
+                    data: data.to_vec().into(),
+                },
+            ],
+        };
+        let left = vec![receipt(b"left")];
+        store.index_bridge_events(7, &left, &[], bridge).unwrap();
+        store
+            .index_bridge_events(8, &[receipt(b"above")], &[], bridge)
+            .unwrap();
+
+        assert_eq!(store.remove_bridge_events(7, &left, bridge).unwrap(), 1);
+        let found = store.scan_bridge_events(topic, 0, u64::MAX).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            (found[0].0, found[0].5.as_slice()),
+            (8, b"above".as_slice())
+        );
+
+        // The block taken up at #7 in its place indexes its own.
+        store
+            .index_bridge_events(7, &[receipt(b"taken up")], &[], bridge)
+            .unwrap();
+        let found = store.scan_bridge_events(topic, 7, 7).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].5, b"taken up");
     }
 
     #[test]

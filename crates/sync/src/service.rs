@@ -1,3 +1,5 @@
+mod beside;
+
 use crate::events::SyncEvent;
 use crate::manager::{SyncManager, MAX_SKELETON_CHUNKS};
 use crate::progress::SyncProgress;
@@ -734,6 +736,24 @@ pub struct SyncService {
     last_prefetch_start: Option<u64>,
     /// Optional local block source (e.g. rskj's LevelDB) tried before peers.
     block_source: Option<Arc<dyn ExternalBlockSource>>,
+    /// Executes a block beside the chain, against its own parent's state. See
+    /// `beside`.
+    beside_fn: Option<beside::BesideFn>,
+    /// The peg decisions the Bridge logs nothing for, made by blocks executed
+    /// beside the chain. See `beside::Unlogged`.
+    beside_unlogged: beside::Unlogged,
+    /// Blocks beside the chain that broke a rule of consensus: not tried
+    /// again, and no branch through one is adopted.
+    invalid_beside: std::collections::HashSet<B256>,
+    /// Body requests for blocks beside the chain, apart from the follow
+    /// path's: that map being empty is how its checks see nothing in flight.
+    pending_branch_bodies: HashMap<u64, (B256, Header, Instant, B512)>,
+    /// Headers asked for below a block beside the chain whose ancestry is not
+    /// held, by the hash they end at, with when they were asked.
+    branch_headers_asked: HashMap<B256, Instant>,
+    /// The branch the store holds back and when it last made progress, so
+    /// that one whose bodies never come is given up. See `beside`.
+    deferred_watch: Option<(B256, Instant)>,
 }
 
 impl SyncService {
@@ -798,6 +818,12 @@ impl SyncService {
             scoring: None,
             last_prefetch_start: None,
             block_source: None,
+            beside_fn: None,
+            beside_unlogged: Default::default(),
+            invalid_beside: std::collections::HashSet::new(),
+            pending_branch_bodies: HashMap::new(),
+            branch_headers_asked: HashMap::new(),
+            deferred_watch: None,
         }
     }
 
@@ -913,6 +939,7 @@ impl SyncService {
         self.block_processor = Some(processor.clone());
         self.trie_store = Some(trie_store.clone());
         self.current_state_root = Some(initial_state_root);
+        self.wire_beside(processor.clone(), trie_store.clone());
 
         // Wire the execution step to the real block processor. Cloned handles
         // (Arc<BlockProcessor>, Arc<dyn TrieStore>, Arc<BlockStore>, Arc<pool>)
@@ -922,6 +949,7 @@ impl SyncService {
         let activity = self.chain_activity.clone();
         let gas_price = self.gas_price.clone();
         let flush_every = self.trie_flush_every;
+        let unlogged = self.beside_unlogged.clone();
         self.exec_fn = Some(Arc::new(move |state_root, blocks_since_flush, pending| {
             process_downloaded_blocks(
                 &processor,
@@ -934,6 +962,7 @@ impl SyncService {
                 &pending,
                 &activity,
                 &gas_price,
+                &unlogged,
             )
         }));
         self
@@ -1700,10 +1729,15 @@ impl SyncService {
         }
 
         self.expire_stale_follow_bodies();
+        self.expire_stale_branch_bodies();
         self.check_execution_progress();
         self.resync_state_root_with_exec_head();
         self.verify_coherence();
         self.check_phi_progress().await;
+        // A heavier branch the store holds back until this node has executed
+        // it: fetch and execute it beside the chain, whatever the sync is
+        // doing. See `beside`.
+        self.advance_deferred_branch().await;
 
         match &self.state {
             SyncState::Idle => {
@@ -1736,6 +1770,10 @@ impl SyncService {
                 if before != after {
                     self.state = SyncState::Idle;
                 } else {
+                    // Blocks stored above the executed head that do not build on
+                    // it: weighed by executing them beside the chain. See
+                    // `beside`.
+                    self.take_up_stored_successors().await;
                     self.fill_follow_body_gap().await;
                     // Canonical blocks whose bodies we already hold but never
                     // executed. See `refill_follow_buffer_from_store`.
@@ -1885,97 +1923,17 @@ impl SyncService {
                     _ => {}
                 }
 
-                // Neither signal above can describe a fork this node never
-                // adopted. Both read the canonical index, and a branch we did
-                // not follow never got a pointer -- so `canonical_hash(N+1)`
-                // is None *and* the head never rose above N+1, because the head
-                // tracks the canonical chain too. That is not an edge case: it
-                // wedged mainnet for three days at #9,251,058, with the network
-                // 7,000 blocks ahead on a sibling branch whose headers this
-                // node had already downloaded.
-                //
-                // The height index does describe it -- that is what it is for.
-                // If blocks are stored at N+1 and *none* of them builds on our
-                // executed head, then nothing extends us and we are on a branch
-                // the network left behind. Adopting the stored lineage gives
-                // N+1 a canonical pointer; when it cannot be adopted the
-                // retreat goes straight to the fork point rather than one
-                // block per round (see `orphan_retreat_target` -- one block per
-                // round does not converge, because after the first step a
-                // stored child of the losing head satisfies `extends_us` and
-                // the condition stops being detected at all).
-                let stored_next = store.hashes_at_height(header.number + 1).unwrap_or_default();
-                if stored_next.is_empty() {
-                    return; // genuinely at the tip: nothing to reconcile
-                }
-                let extends_us = stored_next.iter().any(|h| {
-                    store
-                        .header(*h)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|c| c.parent_hash == exec_hash)
-                });
-                if extends_us {
-                    return; // a successor builds on us; the index just lacks a pointer
-                }
-                // Prefer a successor that is itself extended: with several
-                // siblings the one carrying descendants is the branch that kept
-                // going. Ties break on the hash so two nodes reach the same
-                // answer. Picking wrong is survivable -- the next round
-                // re-evaluates -- but picking arbitrarily is not reproducible.
-                let mut candidates = stored_next.clone();
-                candidates.sort();
-                let successor = candidates
-                    .iter()
-                    .find(|h| {
-                        store
-                            .header(**h)
-                            .ok()
-                            .flatten()
-                            .and_then(|c| store.hashes_at_height(c.number + 1).ok())
-                            .is_some_and(|next| !next.is_empty())
-                    })
-                    .copied()
-                    .unwrap_or(candidates[0]);
-                warn!(
-                    target: "rustock::sync",
-                    "Executed head #{} ({:?}) has no descendant among the {} block(s) stored \
-                     at #{}; treating it as orphaned and adopting {:?}",
-                    header.number, exec_hash, stored_next.len(), header.number + 1, successor
-                );
-                // One transition: the lineage and the head move together, or
-                // neither does. Writing canonical entries and leaving KEY_HEAD
-                // behind is what wedged mainnet for three hours on
-                // 2026-09-22, and `Transition` has no way to express it.
-                match Validated::prove(store, successor) {
-                    Ok(head) => {
-                        if let Err(e) = store.apply(&Transition::Adopt { head }) {
-                            warn!(
-                                target: "rustock::sync",
-                                "Orphan recovery: adopting {:?} failed: {:?}", successor, e
-                            );
-                        }
-                    }
-                    Err(broken) => {
-                        // The only successor we know of hangs off a block we
-                        // never downloaded, so there is nothing to adopt.
-                        //
-                        // Retreat *here*, rather than doing nothing. The code
-                        // this replaced wrote the unprovable pointer anyway and
-                        // relied on a later round to notice it was broken and
-                        // recover -- a deliberate detour through an incoherent
-                        // store. Refusing to write it is right; refusing and
-                        // then standing still is a wedge, so the retreat that
-                        // the later round used to perform happens now.
-                        warn!(
-                            target: "rustock::sync",
-                            "Orphan recovery: cannot adopt {:?} ({}); retreating below the fork \
-                             so the range is downloaded again",
-                            successor, broken
-                        );
-                        self.retreat_below_orphaned_head(&header, successor);
-                    }
-                }
+                // Nor is it a fork this node never adopted: blocks stored at N+1
+                // that do not build on the executed head, the shape that wedged
+                // mainnet for three days at #9,251,058 with the network 7,000
+                // blocks ahead on a sibling branch whose headers this node held.
+                // That used to adopt the stored lineage for being there, pulling
+                // execution back to the fork point, or retreat below the fork
+                // when the lineage could not be proved. Now the branch is
+                // weighed as rskj weighs one: its bodies and any headers it lacks
+                // are fetched, it is executed beside the chain, and the store
+                // adopts it once it outweighs the executed head
+                // (`beside::take_up_stored_successors`, on the tick).
                 return;
             }
         };
@@ -2025,9 +1983,7 @@ impl SyncService {
                      the fork so the range is downloaded again",
                     child.parent_hash, header.number, broken
                 );
-                // The fork point, not our parent -- same rule, and same
-                // reason, as the other orphan path. See
-                // `orphan_retreat_target`.
+                // The fork point, not our parent. See `orphan_retreat_target`.
                 let target = self.orphan_retreat_target(&header, child_hash);
                 match Validated::prove(store, target.hash) {
                     Ok(to) => {
@@ -3006,53 +2962,6 @@ impl SyncService {
         blind
     }
 
-    /// Retreat the head below an orphaned executed head, and roll execution
-    /// back with it.
-    ///
-    /// Both orphan paths use this, so they cannot drift apart: one finds a
-    /// canonical child that does not build on us, the other finds no canonical
-    /// child at all, and the recovery is the same in both cases.
-    ///
-    /// Execution comes back with the head. Retreating one without the other is
-    /// how I4 gets broken by the act of recovering -- which is what the
-    /// watchdog's first deployment did to mainnet within fifteen seconds.
-    fn retreat_below_orphaned_head(&mut self, header: &Header, replaced_by: B256) {
-        let target = self.orphan_retreat_target(header, replaced_by);
-        let store = &self.manager.store;
-
-        let to = match Validated::prove(store, target.hash) {
-            Ok(v) => v,
-            Err(broken) => {
-                warn!(
-                    target: "rustock::sync",
-                    "Orphan recovery: cannot retreat to {} ({}); the chain below is broken",
-                    target, broken
-                );
-                return;
-            }
-        };
-        let dest = to.block();
-        if let Err(e) = store.apply(&Transition::Retreat { to }) {
-            warn!(target: "rustock::sync", "Orphan recovery: retreat failed: {:?}", e);
-            return;
-        }
-
-        // Execution follows the head onto the canonical chain. Targeting the
-        // orphan's own parent here was the 2026-09-23 bug: that parent is on
-        // the branch being abandoned, so recording execution at it is refused
-        // and execution stays stranded. See `roll_execution_back`.
-        let executed = match store.cursor() {
-            Ok(Some(c)) => c.executed,
-            _ => return,
-        };
-        if self.roll_execution_back(executed) {
-            warn!(
-                target: "rustock::sync",
-                "Orphan recovery: head and execution retreated to {}", dest
-            );
-        }
-    }
-
     /// Re-establish that the head is the top of the contiguous canonical chain
     /// we actually hold.
     ///
@@ -3399,6 +3308,14 @@ impl SyncService {
                 downloaded - head.number, head.number, downloaded
             );
             self.start_body_downloads(metadata.best_number).await;
+            return;
+        }
+
+        // A heavier branch waits for this node to execute it, and is fetched
+        // and executed beside the chain on every tick. A skeleton round toward
+        // it would only download its headers again. See `beside`.
+        if self.beside_fn.is_some() && self.manager.store.deferred_head().is_some() {
+            self.state = SyncState::Following;
             return;
         }
 
@@ -4078,6 +3995,7 @@ impl SyncService {
 
                 // Process all consecutive ready chunks
                 let ready = tracker.drain_ready();
+                let executed_before = self.manager.store.exec_head().ok().flatten();
                 for (_idx, chunk_peer, chunk_headers) in &ready {
                     // A chunk that does not connect is a failure, not
                     // something to carry on past. Chunks are released in
@@ -4132,6 +4050,7 @@ impl SyncService {
                                     rustock_networking::scoring::EventType::UnexpectedMessage,
                                 );
                             }
+                            self.take_up_moved_execution(executed_before);
                             self.state = SyncState::Idle;
                             return;
                         }
@@ -4167,10 +4086,15 @@ impl SyncService {
                                 rustock_networking::scoring::EventType::InvalidHeader,
                             );
                         }
+                        self.take_up_moved_execution(executed_before);
                         self.state = SyncState::Idle;
                         return;
                     }
                 }
+
+                // A chunk can take the chain to a branch this node executed
+                // beside it, and execution with it.
+                self.take_up_moved_execution(executed_before);
 
                 if tracker.is_complete() {
                     self.start_body_downloads(peer_best).await;
@@ -4189,7 +4113,9 @@ impl SyncService {
                 self.state = other;
                 let before_height = self.our_head_number();
                 let before_hash = self.manager.store.head().ok().flatten();
+                let executed_before = self.manager.store.exec_head().ok().flatten();
                 let _ = self.manager.handle_headers_response(headers.clone(), peer);
+                self.take_up_moved_execution(executed_before);
                 if is_following {
                     let after_height = self.our_head_number();
                     let after_hash = self.manager.store.head().ok().flatten();
@@ -4209,6 +4135,12 @@ impl SyncService {
                         }
                         self.request_follow_bodies(&headers).await;
                     }
+                    // Blocks beside the chain near the tip, known by their
+                    // headers alone: their bodies show the uncles that may make
+                    // their branch the heavier, and executing them makes a
+                    // switch to it a pointer's move. See `beside`.
+                    self.take_up_competing(headers.iter().map(|h| h.hash()).collect(), Some(peer))
+                        .await;
                 }
 
                 // Headers we could not link are evidence that this peer has a
@@ -4398,11 +4330,12 @@ impl SyncService {
     /// or not. Here the body is held to its header's commitments, the header is
     /// verified and stored as any header at the tip is (the same rules, the
     /// extra data's size among them), the block is relayed, and it is executed
-    /// once it is the canonical block at its height. Its uncles are in hand, so
-    /// it is weighed with them, as rskj weighs a block it connects. A block
-    /// whose parent this node lacks is taken as an announcement of it: the
-    /// headers up to it are asked of the sender, where rskj asks it for the
-    /// missing block.
+    /// on its own parent's state, best or not: on the chain as the canonical
+    /// block at its height, or beside it (see `beside`). Its uncles are in
+    /// hand, so it is weighed with them, as rskj weighs a block it connects. A
+    /// block whose parent this node lacks is taken as an announcement of it:
+    /// the headers up to it are asked of the sender, where rskj asks it for
+    /// the missing block.
     pub(crate) async fn on_new_block(&mut self, peer: B512, block: Block) {
         // rskj processes it while syncing too, but relays nothing then
         // (`hasBetterBlockToSync`); this node takes nothing unasked at the tip
@@ -4446,6 +4379,7 @@ impl SyncService {
         self.manager.note_whole_block_difficulty(&header, &ommers);
         let before_height = self.our_head_number();
         let before_hash = self.manager.store.head().ok().flatten();
+        let executed_before = self.manager.store.exec_head().ok().flatten();
         match self
             .manager
             .handle_headers_response(vec![header.clone()], peer)
@@ -4477,9 +4411,16 @@ impl SyncService {
         }
         self.relay_block(hash, number).await;
 
-        // A block beside the chain is kept, and relayed, for a miner to name
-        // as an uncle; only the canonical one is executed.
+        // The header may have taken the chain to a branch this node executed
+        // beside it already, and execution with it: take that up now.
+        self.take_up_moved_execution(executed_before);
+
+        // rskj connects every block it is given against its own parent's
+        // state, best or not, so that a switch to it later moves a pointer and
+        // runs nothing again. A block beside the chain is executed as it
+        // arrives, and kept for a miner to name as an uncle besides.
         if self.manager.store.canonical_hash(number).ok().flatten() != Some(hash) {
+            self.execute_beside_chain(hash).await;
             return;
         }
         let after_height = self.our_head_number();
@@ -4518,6 +4459,12 @@ impl SyncService {
         }
 
         if metadata.best_number > our_height + LONG_SYNC_LIMIT {
+            // The gap can be a heavier branch waiting for this node to execute
+            // it, which the tick does beside the chain; a skeleton round toward
+            // it would only download its headers again. See `beside`.
+            if self.beside_fn.is_some() && self.manager.store.deferred_head().is_some() {
+                return;
+            }
             // Don't open a fresh round while a batch is parked waiting to
             // execute (that would put a batch beyond the one-ahead cap in
             // flight). A batch merely executing is fine — that's the point of
@@ -4880,6 +4827,18 @@ impl SyncService {
     /// continue syncing headers or enter follow mode.
     async fn continue_after_bodies(&mut self, peer_best: u64) {
         let our_height = self.our_head_number();
+        // A heavier branch waits for this node to execute it beside the chain,
+        // which the tick does from follow mode; a skeleton round toward it
+        // would only download its headers again. See `beside`.
+        if self.beside_fn.is_some() && self.manager.store.deferred_head().is_some() {
+            info!(
+                target: "rustock::sync",
+                "A heavier branch is being executed beside the chain before it is adopted; \
+                 following meanwhile"
+            );
+            self.state = SyncState::Following;
+            return;
+        }
         if our_height < peer_best {
             debug!(
                 target: "rustock::sync",
@@ -5352,6 +5311,13 @@ impl SyncService {
         extension: Option<rustock_core::types::header_extension::BlockHeaderExtension>,
     ) {
         rustock_core::metrics::BODIES_RECEIVED.inc();
+        // A body asked for a block beside the chain, in whatever state the
+        // sync is in by the time it comes. See `beside`.
+        if self.pending_branch_bodies.contains_key(&request_id) {
+            self.on_branch_body(peer, request_id, transactions, uncles, extension)
+                .await;
+            return;
+        }
         let old = std::mem::take(&mut self.state);
         match old {
             SyncState::DownloadingBodies {
@@ -5588,6 +5554,18 @@ impl SyncService {
                         "Stored body for block #{} ({} txs) in follow mode",
                         header.number, transactions.len()
                     );
+                    // A reorg can have put the block beside the chain since it
+                    // was asked for -- the chain holds another block at its
+                    // height now -- and then it is executed there, as any block
+                    // beside it is.
+                    let beside = matches!(
+                        self.manager.store.canonical_hash(header.number),
+                        Ok(Some(other)) if other != hash
+                    );
+                    if beside {
+                        self.execute_beside_chain(hash).await;
+                        return;
+                    }
                     // Buffer by number and execute only consecutive,
                     // parent-linked blocks: bodies for a multi-block gap can
                     // arrive out of order, and running one against the wrong
@@ -5843,9 +5821,32 @@ impl SyncService {
 
         // Already executed by this node? Adopt the result instead of redoing it.
         if let Some(node) = fast_forward_state(processor, &trie_store, header, hash) {
-            record_execution(&self.manager.store, hash, header.state_root);
+            // Refused when a reorg moved the chain under it: the same contract
+            // as executing it below, `true` only when the executed head moved.
+            if !record_execution(&self.manager.store, hash, header.state_root) {
+                return false;
+            }
+            // What executing it would have done, now that it is on the chain:
+            // its records kept by height, which a block executed beside the
+            // chain waits for, and the announcements -- subscribers, the gas
+            // price, the miner's next work.
+            let receipts = self
+                .manager
+                .store
+                .receipts(hash)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let unlogged = beside::take_unlogged(&self.beside_unlogged, hash);
+            if let Err(e) = processor.commit_by_height(&block, &receipts, &unlogged) {
+                warn!(target: "rustock::sync", "Indexing #{} failed: {e}", header.number);
+            }
             self.credit_executed_bodies(header.number);
             self.current_state_root = Some(node);
+            self.gas_price.on_block(header, &block.transactions);
+            self.gas_price.on_best_block(header);
+            self.best_block_listeners.notify(header);
+            self.publish_block(hash, header, &block.transactions, false);
             info!(
                 target: "rustock::sync",
                 "Re-adopted block #{} without re-executing it (already executed locally, \
@@ -5977,6 +5978,7 @@ pub(crate) fn process_downloaded_blocks(
     pending_headers: &[(B256, Header)],
     activity: &crate::chain_activity::ChainActivity,
     gas_price: &crate::gas_price::GasPriceTracker,
+    unlogged: &beside::Unlogged,
 ) -> ExecOutcome {
     // Executed state becomes durable here and the head advances only
     // through this, which is what keeps "flush before you claim it" from
@@ -6064,6 +6066,16 @@ pub(crate) fn process_downloaded_blocks(
 
         // Already executed by this node? Adopt the result instead of redoing it.
         if let Some(node) = fast_forward_state(processor, &trie_store, header, *hash) {
+            // Its Bridge events are kept by height, and a block executed beside
+            // the chain has none indexed until it is on it: its stored receipts
+            // carry them, and the peg decisions the Bridge did not log wait in
+            // `unlogged`.
+            if let Ok(Some(receipts)) = store.receipts(*hash) {
+                let unlogged = beside::take_unlogged(unlogged, *hash);
+                if let Err(e) = processor.commit_by_height(&block, &receipts, &unlogged) {
+                    warn!(target: "rustock::sync", "Indexing #{} failed: {e}", header.number);
+                }
+            }
             current_root = node;
             last_executed = Some((*hash, header.state_root));
             processed += 1;

@@ -46,6 +46,7 @@ use crate::{BlockStore, CF_NUMBERS, KEY_EXEC_HEAD, KEY_HEAD};
 use alloy_primitives::B256;
 use anyhow::{Context, Result};
 use rocksdb::WriteBatch;
+use rustock_core::selection_rule::should_we_add_this_block;
 use rustock_core::Header;
 
 /// A block, by height and hash.
@@ -374,9 +375,15 @@ impl BlockStore {
     /// conservative: a block common to both branches. Re-executing a few
     /// blocks costs seconds; executing from the wrong branch costs a fork.
     ///
-    /// It only ever goes down, and only from execution that happened. Moving
-    /// the executed head anywhere else records as computed a state that was
-    /// not, and the node cannot resume from it.
+    /// Unless this node has executed the new branch above the fork already,
+    /// as it does every block beside the chain on arrival, the way rskj
+    /// connects every block: then execution goes to the highest of those
+    /// blocks the lineage reaches without a gap, and a switch to a branch
+    /// already executed is a change of pointer, with nothing run again.
+    ///
+    /// It only ever goes to execution that happened. Moving the executed head
+    /// anywhere else records as computed a state that was not, and the node
+    /// cannot resume from it.
     ///
     /// The state root comes from the target header, which post-RSKIP126 is the
     /// committed unitrie root -- the same source the reorg path has always
@@ -455,12 +462,107 @@ impl BlockStore {
                  at #{target_number} is not in the header store"
             );
         };
+        let (target_hash, target) =
+            match self.executed_climb(&new_head.lineage, target_number, new_head.number())? {
+                Some(climbed) => climbed,
+                None => (target_hash, target),
+            };
 
         let mut buf = Vec::with_capacity(64);
         buf.extend_from_slice(target_hash.as_slice());
         buf.extend_from_slice(target.state_root.as_slice());
         batch.put(KEY_EXEC_HEAD, &buf);
         Ok(())
+    }
+
+    /// The highest block of `lineage` above height `above`, and not above
+    /// `top`, that this node executed and still holds the state of: climbing
+    /// from `above + 1` and stopping at the first block it did not execute,
+    /// so that every block below the one returned was executed too.
+    fn executed_climb(
+        &self,
+        lineage: &[(u64, B256)],
+        above: u64,
+        top: u64,
+    ) -> Result<Option<(B256, Header)>> {
+        let mut climbed = None;
+        let mut next = above.saturating_add(1);
+        for &(number, hash) in lineage {
+            if number < next {
+                continue;
+            }
+            if number != next || number > top {
+                break;
+            }
+            let Some(header) = self.header(hash)? else {
+                break;
+            };
+            if !self.executed_here(hash, &header) {
+                break;
+            }
+            climbed = Some((hash, header));
+            next += 1;
+        }
+        Ok(climbed)
+    }
+
+    /// Whether adopting `new_head` has to wait until this node has executed
+    /// more of its branch: rskj's rule that a block becomes the best one only
+    /// once it has been connected, that is executed
+    /// (`BlockChainImpl.internalTryToConnect`).
+    ///
+    /// It waits when the move would leave the executed head off the chain --
+    /// the new branch rewrites the executed height, or ends below it -- and
+    /// the highest block of the new branch this node has executed, climbing
+    /// from the fork point without a gap, does not take the place of the
+    /// executed head by rskj's selection rule. A node that executes nothing
+    /// never waits: it has no executed head to strand, and nothing to execute
+    /// the branch with.
+    pub(crate) fn adoption_waits_for_execution(&self, new_head: &Validated) -> Result<bool> {
+        if !self.executes() {
+            return Ok(false);
+        }
+        let Some((exec_hash, _)) = self.exec_head()? else {
+            return Ok(false);
+        };
+        let Some(executed) = self.header(exec_hash)? else {
+            return Ok(false);
+        };
+        // Nothing rewritten at or below the executed height: the new head
+        // extends the chain execution is on.
+        let Some(&(lowest, _)) = new_head.lineage.first() else {
+            return Ok(false);
+        };
+        if lowest > executed.number {
+            return Ok(false);
+        }
+        // The lineage runs without a gap from `lowest` to the new head, so
+        // when it holds no entry at the executed height the new head is below
+        // it, and the executed block is dropped with everything above.
+        let stranded = new_head
+            .lineage
+            .iter()
+            .find(|(n, _)| *n == executed.number)
+            .is_none_or(|(_, hash)| *hash != exec_hash);
+        if !stranded {
+            return Ok(false);
+        }
+        let fork = lowest.saturating_sub(1);
+        let Some((tip, _)) = self.executed_climb(&new_head.lineage, fork, new_head.number())?
+        else {
+            return Ok(true);
+        };
+        let tip_td = self.total_difficulty(tip)?.unwrap_or_default();
+        let exec_td = self.total_difficulty(exec_hash)?.unwrap_or_default();
+        Ok(
+            match (
+                self.contender(tip, tip_td)?,
+                self.contender(exec_hash, exec_td)?,
+            ) {
+                (Some(tip), Some(current)) => !should_we_add_this_block(&tip, &current),
+                _ => true,
+            },
+        )
     }
 
     /// Stage deletion of every canonical entry above `top`.
@@ -544,6 +646,7 @@ pub fn verify_local_coherence(store: &BlockStore, cursor: &Cursor) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DeferredHead;
     use alloy_primitives::{Address, Bytes, U256};
     use tempfile::tempdir;
 
@@ -917,6 +1020,189 @@ mod tests {
             store.exec_head().unwrap(),
             Some((sibling.hash(), root)),
             "execution was moved off the block it ran at, to one it never ran"
+        );
+    }
+
+    // -- A heavier branch is adopted once it is executed ---------------------
+
+    /// The blocks this node executed, as the check the sync service installs
+    /// reads them from receipts and the trie store: here a set, starting with
+    /// `chain`.
+    fn executed_set(
+        store: &BlockStore,
+        chain: &[Header],
+    ) -> std::sync::Arc<std::sync::Mutex<std::collections::HashSet<B256>>> {
+        let set = std::sync::Arc::new(std::sync::Mutex::new(
+            chain
+                .iter()
+                .map(|h| h.hash())
+                .collect::<std::collections::HashSet<_>>(),
+        ));
+        let seen = set.clone();
+        store.set_executed_check(std::sync::Arc::new(move |hash, _| {
+            seen.lock().unwrap().contains(&hash)
+        }));
+        set
+    }
+
+    /// A branch off `hs[7]`, #8' to #12', with total difficulties 9 to 13: #10'
+    /// is level with the chain's #10 (11), and #11' outweighs it.
+    fn branch_from_seven(hs: &[Header]) -> Vec<(Header, U256)> {
+        let mut branch = Vec::new();
+        let mut parent = hs[7].hash();
+        for n in 8..=12u64 {
+            let h = header(n, parent, 99);
+            parent = h.hash();
+            branch.push((h, U256::from(n + 1)));
+        }
+        branch
+    }
+
+    /// Headers arriving as the sync manager stores them, weighed against the
+    /// head.
+    fn ingest(store: &BlockStore, entries: &[(Header, U256)]) {
+        let head = store.head().unwrap();
+        let td = head
+            .and_then(|h| store.total_difficulty(h).unwrap())
+            .unwrap_or_default();
+        let refs: Vec<(&Header, U256)> = entries.iter().map(|(h, td)| (h, *td)).collect();
+        store.store_headers_batch(&refs, head, td).unwrap();
+    }
+
+    /// rskj makes a block its best only once it has executed it, so a heavier
+    /// branch known by its headers alone leaves the node where it is. Taken on
+    /// its headers, it pulled execution back to the fork point, and with its
+    /// bodies withheld it would have held the node there.
+    #[test]
+    fn a_heavier_branch_waits_until_it_is_executed_past_the_executed_head() {
+        let (store, _d, hs) = chain(10);
+        let executed = executed_set(&store, &hs);
+        let branch = branch_from_seven(&hs);
+
+        ingest(&store, &branch[..4]);
+        assert_eq!(
+            store.head().unwrap(),
+            Some(hs[10].hash()),
+            "the head moved to a branch this node has not executed"
+        );
+        assert_eq!(store.canonical_hash(10).unwrap(), Some(hs[10].hash()));
+        assert_eq!(
+            store.exec_head().unwrap().map(|(h, _)| h),
+            Some(hs[10].hash()),
+            "execution was pulled back to the fork point"
+        );
+        assert_eq!(store.deferred_head(), Some(branch[3].0.hash()));
+
+        // Executed through #10': level with #10, and with no fees on either
+        // side a tie keeps the block held first.
+        executed
+            .lock()
+            .unwrap()
+            .extend(branch[..3].iter().map(|(h, _)| h.hash()));
+        assert_eq!(store.retry_deferred_head().unwrap(), DeferredHead::Waiting);
+        assert_eq!(store.head().unwrap(), Some(hs[10].hash()));
+
+        // #11' executed: it outweighs #10, so the branch is the chain now, with
+        // execution at its tip and nothing to run again.
+        executed.lock().unwrap().insert(branch[3].0.hash());
+        assert_eq!(store.retry_deferred_head().unwrap(), DeferredHead::Adopted);
+        assert_eq!(store.head().unwrap(), Some(branch[3].0.hash()));
+        assert_eq!(store.canonical_hash(10).unwrap(), Some(branch[2].0.hash()));
+        assert_eq!(
+            store.exec_head().unwrap(),
+            Some((branch[3].0.hash(), branch[3].0.state_root))
+        );
+        assert_eq!(store.deferred_head(), None);
+    }
+
+    /// A switch to a branch executed beside the chain as it arrived takes
+    /// execution to that branch's executed tip, not back to the fork point to
+    /// run its blocks a second time.
+    #[test]
+    fn a_switch_takes_execution_to_the_executed_tip_of_the_new_branch() {
+        let (store, _d, hs) = chain(10);
+        let executed = executed_set(&store, &hs);
+        let branch = branch_from_seven(&hs);
+        // #8' to #11' were executed as they arrived; #12' not yet.
+        executed
+            .lock()
+            .unwrap()
+            .extend(branch[..4].iter().map(|(h, _)| h.hash()));
+
+        ingest(&store, &branch);
+
+        assert_eq!(store.head().unwrap(), Some(branch[4].0.hash()));
+        assert_eq!(
+            store.exec_head().unwrap().map(|(h, _)| h),
+            Some(branch[3].0.hash()),
+            "execution went back to the fork point, to run again blocks it ran already"
+        );
+    }
+
+    /// A node with no check installed executes nothing it could run a branch
+    /// with, and adopts on headers as it always has.
+    #[test]
+    fn a_node_without_the_check_adopts_on_headers_as_before() {
+        let (store, _d, hs) = chain(10);
+        let branch = branch_from_seven(&hs);
+
+        ingest(&store, &branch[..4]);
+
+        assert_eq!(store.head().unwrap(), Some(branch[3].0.hash()));
+        assert_eq!(
+            store.exec_head().unwrap().map(|(h, _)| h),
+            Some(hs[7].hash())
+        );
+        assert_eq!(store.deferred_head(), None);
+    }
+
+    /// A branch that waits is forgotten once the chain the node is on
+    /// outgrows it.
+    #[test]
+    fn a_waiting_branch_the_chain_outgrows_is_forgotten() {
+        let (store, _d, hs) = chain(10);
+        let _executed = executed_set(&store, &hs);
+        let branch = branch_from_seven(&hs);
+        ingest(&store, &branch[..4]);
+        assert_eq!(store.deferred_head(), Some(branch[3].0.hash()));
+
+        // The chain grows to #12, total difficulty 13 against #11''s 12.
+        let mut ours = Vec::new();
+        let mut parent = hs[10].hash();
+        for n in 11..=12u64 {
+            let h = header(n, parent, 0);
+            parent = h.hash();
+            ours.push((h, U256::from(n + 1)));
+        }
+        ingest(&store, &ours);
+
+        assert_eq!(store.head().unwrap(), Some(ours[1].0.hash()));
+        assert_eq!(store.retry_deferred_head().unwrap(), DeferredHead::Dropped);
+        assert_eq!(store.deferred_head(), None);
+    }
+
+    /// A block whose total rose once its body showed its uncles, which its
+    /// header alone could not, takes the head when weighed again.
+    #[test]
+    fn a_block_weighed_again_takes_the_head_once_it_outweighs_it() {
+        let (store, _d, hs) = chain(10);
+        let executed = executed_set(&store, &hs);
+        // A sibling of #10, level with it on its header alone.
+        let sibling = header(10, hs[9].hash(), 99);
+        ingest(&store, &[(sibling.clone(), U256::from(11))]);
+        assert_eq!(store.head().unwrap(), Some(hs[10].hash()));
+
+        // Executed, and its uncle counted: 12 now.
+        store
+            .put_total_difficulty(sibling.hash(), U256::from(12))
+            .unwrap();
+        executed.lock().unwrap().insert(sibling.hash());
+
+        assert!(store.reconsider_head(sibling.hash()).unwrap());
+        assert_eq!(store.head().unwrap(), Some(sibling.hash()));
+        assert_eq!(
+            store.exec_head().unwrap().map(|(h, _)| h),
+            Some(sibling.hash())
         );
     }
 }
