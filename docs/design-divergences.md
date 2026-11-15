@@ -911,10 +911,13 @@ turned to it after that, tens of thousands of blocks later, past any reorg this
 node follows.
 
 Tests: `service::beside::tests`: eight, each failing with the new behaviour
-switched off, and two failing on its first version, which took any move of the
-executed head for a switch
+switched off, and three failing on its first version: two where it took any
+move of the executed head for a switch
 (`execution_recording_its_progress_is_not_taken_for_a_switch`,
-`a_switch_made_while_a_batch_runs_is_taken_up_from_where_the_batch_had_got`);
+`a_switch_made_while_a_batch_runs_is_taken_up_from_where_the_batch_had_got`),
+and one where it checked a block whose header was held without its RSKIP-351
+extension, and refused it
+(`a_block_held_without_its_extension_is_fetched_again_not_run_or_refused`);
 and the store's half in `crates/storage/src/position.rs`:
 `a_heavier_branch_waits_until_it_is_executed_past_the_executed_head`,
 `a_switch_takes_execution_to_the_executed_tip_of_the_new_branch`,

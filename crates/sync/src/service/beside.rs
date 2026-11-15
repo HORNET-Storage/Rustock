@@ -238,6 +238,17 @@ impl SyncService {
         if store.executed_here(hash, &header) {
             return Beside::Executed;
         }
+        // A header that holds only the commitment to its RSKIP-351 extension
+        // can't be checked or run: its bloom and execution edges come beside
+        // its body. A body held beside such a header came without them, so it
+        // is dropped and fetched again with them, as a block of the chain's is.
+        // Checked without its edges, a block is refused that rskj takes:
+        // testnet's #8,295,561 and #8,295,940, both of rskj's chain, were
+        // remembered as invalid on 14 November 2026.
+        if header.extension_data.is_some() {
+            self.drop_body_without_extension(hash, &header);
+            return Beside::NotYet;
+        }
         let Ok(Some((transactions, ommers))) = store.body(hash) else {
             return Beside::NotYet;
         };
@@ -460,6 +471,9 @@ impl SyncService {
                         continue;
                     }
                     Beside::Invalid => return None,
+                    // Its body was dropped, held beside a header without its
+                    // extension: fetched again below, with it.
+                    Beside::NotYet if !matches!(store.body(*hash), Ok(Some(_))) => {}
                     Beside::NotYet => break,
                 }
             }

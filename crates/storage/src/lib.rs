@@ -953,7 +953,16 @@ impl BlockStore {
         for &(header, td) in entries {
             let hash = header.hash();
 
-            batch.put_cf(cf_headers, hash.as_slice(), encode_header(header));
+            // A header that came compressed, as rskj sends a chain's headers,
+            // holds only the commitment to its RSKIP-351 extension, and the one
+            // held may have been completed with the extension that came beside
+            // its body. Written over it, the copy lost the bloom and the
+            // execution edges, its body still held beside a header that can't
+            // be run: testnet's #8,295,561 and #8,295,940 were then refused
+            // beside the chain for want of their edges.
+            if header.extension_data.is_none() || !self.holds_completed_header(hash) {
+                batch.put_cf(cf_headers, hash.as_slice(), encode_header(header));
+            }
 
             batch.put_cf(cf_td, hash.as_slice(), encode_td(td));
             // Fork headers arrive through here too, and they are precisely the
@@ -988,6 +997,13 @@ impl BlockStore {
         }
 
         Ok(best_hash)
+    }
+
+    /// Whether the header held for `hash` holds the fields of its RSKIP-351
+    /// extension, rather than only the commitment to them. `false` when none
+    /// is held, or the one held can't be read: it is written over, as before.
+    fn holds_completed_header(&self, hash: B256) -> bool {
+        matches!(self.header(hash), Ok(Some(held)) if held.extension_data.is_none())
     }
 
     /// Move the head to `new_head` through [`Transition`], so the canonical
@@ -2584,6 +2600,65 @@ mod tests {
             };
             assert_eq!(&uncached, uncle);
         }
+    }
+
+    /// A header held completed, with the RSKIP-351 extension that came beside
+    /// its body, is kept when it comes again compressed, as a peer's headers
+    /// response sends it, holding only the commitment to that extension. The
+    /// copy written over it lost the bloom and the execution edges while the
+    /// body stayed beside it: testnet's #8,295,561 and #8,295,940, blocks of
+    /// rskj's chain, were then refused beside the chain for want of their
+    /// edges, on 14 November 2026.
+    #[test]
+    fn a_completed_header_is_kept_when_it_comes_again_compressed() {
+        use rustock_core::config::ActivationHeights;
+        use rustock_core::types::header_extension::BlockHeaderExtension;
+        let regtest = ActivationHeights::regtest();
+        let extension = BlockHeaderExtension::V2 {
+            logs_bloom: vec![0x11; 256],
+            edges: Some(vec![1]),
+            base_event: Some(Vec::new()),
+        };
+        let mut slot = Vec::new();
+        extension
+            .create_extension_data()
+            .as_slice()
+            .encode(&mut slot);
+        let compressed = Header {
+            umm_root: Some(Bytes::new()),
+            extension_data: Some(Bytes::from(slot)),
+            ..dummy_header(6)
+        }
+        .with_activations(&regtest);
+        let completed = compressed
+            .with_extension(&extension)
+            .expect("the extension its commitment names");
+        let hash = compressed.hash();
+        assert_eq!(completed.hash(), hash);
+
+        let dir = tempdir().unwrap();
+        let store = BlockStore::open(dir.path())
+            .unwrap()
+            .with_activations(regtest);
+        // A total difficulty no entry passes, so the head stays where it is.
+        for header in [&compressed, &completed] {
+            store
+                .store_headers_batch(&[(header, U256::from(1))], None, U256::MAX)
+                .unwrap();
+        }
+        assert_eq!(
+            store.header(hash).unwrap().unwrap().extension(),
+            Some(extension.clone())
+        );
+
+        store
+            .store_headers_batch(&[(&compressed, U256::from(1))], None, U256::MAX)
+            .unwrap();
+        assert_eq!(
+            store.header(hash).unwrap().unwrap().extension(),
+            Some(extension),
+            "the compressed copy took the place of the header its body completed"
+        );
     }
 
     #[test]

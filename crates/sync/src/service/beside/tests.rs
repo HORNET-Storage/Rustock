@@ -51,6 +51,11 @@ struct Node {
 async fn node() -> Node {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    node_over(dir, store).await
+}
+
+/// [`node`], over `store`, which keeps its data in `dir`.
+async fn node_over(dir: tempfile::TempDir, store: Arc<BlockStore>) -> Node {
     let trie = Arc::new(MemoryTrieStore::new()) as Arc<dyn TrieStore>;
     let empty = TrieNode::empty();
     let root = empty.compute_hash(trie.as_ref());
@@ -629,4 +634,67 @@ async fn a_switch_made_while_a_batch_runs_is_taken_up_from_where_the_batch_had_g
          announced"
     );
     assert_eq!(*node.best.lock().unwrap(), vec![b3.hash()]);
+}
+
+/// A block beside the chain whose header is held compressed, holding only the
+/// commitment to its RSKIP-351 extension, is neither run nor refused: its
+/// bloom and execution edges come beside its body, so the body is dropped and
+/// fetched again with them, as a block of the chain's is
+/// (`drop_body_without_extension`). Checked without them, testnet's #8,295,561
+/// and #8,295,940, blocks of rskj's chain, were refused for want of their
+/// edges and remembered as invalid, on 14 November 2026.
+#[tokio::test]
+async fn a_block_held_without_its_extension_is_fetched_again_not_run_or_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        BlockStore::open(dir.path())
+            .unwrap()
+            .with_activations(rustock_core::config::ActivationHeights::regtest()),
+    );
+    let mut node = node_over(dir, store).await;
+    // Headers as regtest reads them from block 1: versioned, completed.
+    let versioned = |header: Header| {
+        let extension = crate::tests::an_extension(0);
+        crate::tests::compressed(header, &extension)
+            .with_extension(&extension)
+            .expect("the extension it commits to")
+    };
+    let genesis = node.header(0, B256::ZERO, 1, 0);
+    let a1 = versioned(node.header(1, genesis.hash(), 1, 0xA0));
+    let a2 = versioned(node.header(2, a1.hash(), 1, 0xA0));
+    for (header, total) in [(&genesis, 1u64), (&a1, 2), (&a2, 3)] {
+        node.store.update_head(header, U256::from(total)).unwrap();
+    }
+    node.store.set_exec_head(a2.hash(), node.root).unwrap();
+    // #2', held compressed beside its body, level with #2.
+    let b2 = crate::tests::compressed(
+        node.header(2, a1.hash(), 1, 0xB0),
+        &crate::tests::an_extension(5),
+    );
+    let head = node.head();
+    node.store
+        .store_headers_batch(&[(&b2, U256::from(3))], head, U256::from(3))
+        .unwrap();
+    node.store.put_body(b2.hash(), &[], &[]).unwrap();
+    node.asked();
+
+    node.service
+        .take_up_competing(vec![b2.hash()], Some(PEER))
+        .await;
+
+    assert_eq!(node.runs(b2.hash()), 0, "run without its extension");
+    assert!(
+        !node.service.invalid_beside.contains(&b2.hash()),
+        "taken for invalid"
+    );
+    assert_eq!(
+        node.store.body(b2.hash()).unwrap(),
+        None,
+        "its body is kept beside a header it can't be run with"
+    );
+    let (bodies, _) = node.asked();
+    assert!(
+        bodies.contains(&b2.hash()),
+        "its body is not asked for again, with the extension"
+    );
 }
