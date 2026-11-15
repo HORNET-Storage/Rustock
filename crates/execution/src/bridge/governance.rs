@@ -1057,9 +1057,10 @@ fn load_fee_per_kb_election<CTX: crate::RskContextTr>(
 /// a non-positive or over-long value throws BridgeIllegalArgumentException;
 /// the sender must match an increase-locking-cap authorizer key (minimum
 /// ONE); the new cap may not be below the current one (equal is allowed)
-/// nor above current × lockingCapIncrementsMultiplier. Reading the current
-/// cap lazily initializes it (getLockingCap), so a failed bound check still
-/// persists the initial value — but a failed authorizer check does not.
+/// nor above current × lockingCapIncrementsMultiplier, a product that fails
+/// the call where it passes a Java long. Reading the current cap lazily
+/// initializes it (getLockingCap), so a failed bound check still persists
+/// the initial value — but a failed authorizer check does not.
 pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
@@ -1089,9 +1090,21 @@ pub fn increase_locking_cap<CTX: crate::RskContextTr>(
     }
 
     let current_cap = super::peg::get_or_init_locking_cap(ctx, config);
-    if new_cap < current_cap
-        || new_cap > current_cap.saturating_mul(config.locking_cap_increments_multiplier)
-    {
+    if new_cap < current_cap {
+        return Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()));
+    }
+    // The most the cap may grow to, as bitcoinj's `Coin.multiply` takes it:
+    // Guava's `LongMath.checkedMultiply`, which throws past a Java long, and
+    // `Bridge.execute` makes the throw a VMException that fails the call.
+    let most = i64::try_from(current_cap)
+        .ok()
+        .zip(i64::try_from(config.locking_cap_increments_multiplier).ok())
+        .and_then(|(cap, multiplier)| cap.checked_mul(multiplier))
+        .and_then(|most| u64::try_from(most).ok())
+        .ok_or_else(|| {
+            PrecompileError::other("increaseLockingCap: the cap times its multiplier passes a long")
+        })?;
+    if new_cap > most {
         return Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()));
     }
 
@@ -1673,6 +1686,47 @@ mod tests {
             call(address, encode::int(1_000)).unwrap(),
             -10,
             "then the sender"
+        );
+    }
+
+    /// rskj `LockingCapSupportImpl.increaseLockingCap` takes the most the cap
+    /// may grow to with bitcoinj's `Coin.multiply`, which is Guava's
+    /// `LongMath.checkedMultiply`: where the current cap times the increments
+    /// multiplier passes a Java long, it throws, and the Bridge call fails. A
+    /// new cap below the current one is refused before that product is taken,
+    /// and answers false.
+    #[test]
+    fn a_cap_whose_limit_passes_a_long_fails_the_increase() {
+        use crate::abi::encode::{self, Arg};
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let key =
+            alloy_primitives::hex::decode(config.increase_locking_cap_authorizer_keys[0]).unwrap();
+        let tx_ctx = crate::precompiles::BridgeTxContext {
+            rsk_sender: super::super::federation::rsk_address_from_public_key(&key).unwrap(),
+            ..Default::default()
+        };
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        // Mainnet's multiplier is 2, and twice this passes i64::MAX.
+        let cap: i64 = (1 << 62) + 1;
+        bridge_store_u256(&mut ctx, LOCKING_CAP_KEY, U256::from(cap));
+        let mut increase = |new_cap: i64| {
+            let args = encode::args(&[Arg::Word(encode::int(new_cap))]);
+            increase_locking_cap(&mut ctx, &args, 0, &config, &tx_ctx).map(|out| out.bytes[31] == 1)
+        };
+        assert!(
+            !increase(cap - 1).unwrap(),
+            "below the current cap: refused before the product is taken"
+        );
+        assert!(
+            increase(cap).is_err(),
+            "the product passes a long: the call fails"
+        );
+        assert_eq!(
+            bridge_load_u256(&mut ctx, LOCKING_CAP_KEY),
+            U256::from(cap),
+            "and the cap is as it was"
         );
     }
 
