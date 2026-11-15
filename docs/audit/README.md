@@ -124,14 +124,19 @@ took it for: testnet runs it.
 ### What sorting by status leaves out
 
 A rule is consensus when rskj runs it, whatever its RSKIP's status. Of the 97
-rules rskj's `reference.conf` schedules, the index at `5736b2c` lists 13 as
-Draft (RSKIP-110, -119, -122, -134, -152, -351, -529, -535, -536, -540, -544,
--551, -552) and does not list 13 at all (RSKIP-88, -90, -97, -103, -124, -126,
--136, -137, -143, -150, -151, -156, -559). The 13 Drafts fall in the class
-#149 set aside as not consensus, and the 13 unlisted were outside the audit
-altogether. The index also disagrees with the RSKIPs' own files: it has
-RSKIP-131, -179 and -191 as Adopted where their files say Draft, and RSKIP-59
-as Accepted where its file says Rejected.
+RSKIP rules rskj's `reference.conf` schedules (its 98th rule,
+`areBridgeTxsPaid`, has no RSKIP, and rustock schedules it at rskj's heights),
+the index at `5736b2c`, which #149 sorted by, lists 13 as Draft (RSKIP-110,
+-119, -122, -134, -152, -351, -529, -535, -536, -540, -544, -551, -552) and
+does not list 13 at all (RSKIP-88, -90, -97, -103, -124, -126, -136, -137,
+-143, -150, -151, -156, -559). The 13 Drafts fall in the class #149 set aside
+as not consensus, and the 13 unlisted were outside the audit altogether. The
+index has moved since: as it stands now (last changed 16 October), it has seven
+of those Drafts as Adopted (RSKIP-119, -152, -536, -540, -544, -551, -552),
+three as Adopted (Testnet) (RSKIP-351, -529, -535), and RSKIP-559 as Draft. The
+index at `5736b2c` also disagrees with the RSKIPs' own files: it has RSKIP-131,
+-179 and -191 as Adopted where their files say Draft, and RSKIP-59 as Accepted
+where its file says Rejected.
 
 None of those 26 is among the eleven, and the chain can't settle them: every
 block of both networks has been re-run and matches its header, which shows a
