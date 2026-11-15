@@ -23,7 +23,10 @@
 //! fetches what a waiting branch lacks, and takes up a switch the moment the
 //! store makes it.
 
-use super::{create_body_request, SyncService, FOLLOW_BODY_TIMEOUT, SYNC_MAX_DISTANCE};
+use super::{
+    create_body_request, pick_body_peer, SyncService, BODY_PEER_STRIKE_LIMIT, FOLLOW_BODY_TIMEOUT,
+    MAX_BODY_REQUESTS_PER_PEER, SYNC_MAX_DISTANCE,
+};
 use crate::state::SyncState;
 use alloy_primitives::{B256, B512};
 use rustock_core::types::header::Header;
@@ -35,7 +38,7 @@ use rustock_execution::silent::SilentRecord;
 use rustock_execution::{BlockProcessor, ProcessError};
 use rustock_storage::BlockStore;
 use rustock_trie::{TrieNode, TrieStore};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -126,6 +129,15 @@ const MAX_BRANCH_DEPTH: u64 = 4 * SYNC_MAX_DISTANCE;
 /// Headers asked for at once below a block beside the chain whose ancestry
 /// is not held: as many as a peer serves.
 const ANCESTORS_ASKED: u64 = 192;
+
+/// Blocks beside the chain remembered with the peer their last body request
+/// lapsed on, so that each is asked of another peer.
+const MAX_LAPSED_REMEMBERED: usize = 4 * MAX_BRANCH_BODY_REQUESTS;
+
+/// How long the headers asked for below a branch are remembered, with the
+/// peer asked, so that a request that lapses is asked of another: a few
+/// lapses.
+const BRANCH_ASKED_KEPT: Duration = FOLLOW_BODY_TIMEOUT.saturating_mul(4);
 
 /// How long the branch the store holds back may go with no body of it
 /// arriving and none of it executing before it is given up. A heavier chain
@@ -622,13 +634,14 @@ impl SyncService {
 
     /// Ask for the bodies of blocks beside the chain: each of a peer known to
     /// hold it, as rskj asks the peer that sent a block for the blocks it
-    /// lacks, or of the first peer.
+    /// lacks, or else of another, and never again of the peer a request for it
+    /// lapsed on while another can be asked ([`Self::branch_peer`]).
     async fn request_branch_bodies(&mut self, blocks: Vec<(B256, Header)>) {
         if self.spv || blocks.is_empty() {
             return;
         }
         let peers = self.peer_store.peers().await;
-        let Some(&first) = peers.first() else { return };
+        let mut load = self.branch_load(&peers);
         for (hash, header) in blocks {
             if self.pending_branch_bodies.len() >= MAX_BRANCH_BODY_REQUESTS {
                 break;
@@ -641,41 +654,41 @@ impl SyncService {
             {
                 continue;
             }
-            let holders = self.manager.block_holders(hash);
-            let peer = peers
-                .iter()
-                .copied()
-                .find(|p| holders.contains(p))
-                .unwrap_or(first);
+            let lapsed = self.branch_body_lapsed.get(&hash).copied();
+            let Some(peer) = self.branch_peer(&load, &self.manager.block_holders(hash), lapsed)
+            else {
+                break;
+            };
             let (request_id, message) = create_body_request(hash);
             self.peer_store.send_to_peer(&peer, message).await;
             self.pending_branch_bodies
                 .insert(request_id, (hash, header, Instant::now(), peer));
+            *load.entry(peer).or_default() += 1;
         }
     }
 
     /// Ask for the headers below a block beside the chain whose ancestry this
     /// node does not hold, ending at the first one missing, as rskj asks the
     /// peer that sent a block for its missing parent: of a peer known to hold
-    /// the branch, or the first peer. Once they link, the branch is executed
-    /// beside the chain like any other.
+    /// the branch or else of another, and of another peer than the last if
+    /// that one never answered ([`Self::branch_peer`]). Once they link, the
+    /// branch is executed beside the chain like any other.
     async fn request_branch_ancestors(&mut self, tip: B256, missing: B256, number: u64) {
         if self.spv {
             return;
         }
         self.branch_headers_asked
-            .retain(|_, asked| asked.elapsed() < FOLLOW_BODY_TIMEOUT);
-        if self.branch_headers_asked.contains_key(&missing) {
-            return;
-        }
+            .retain(|_, (asked, _)| asked.elapsed() < BRANCH_ASKED_KEPT);
+        let lapsed = match self.branch_headers_asked.get(&missing) {
+            Some((asked, _)) if asked.elapsed() < FOLLOW_BODY_TIMEOUT => return,
+            Some((_, peer)) => Some(*peer),
+            None => None,
+        };
         let peers = self.peer_store.peers().await;
-        let Some(&first) = peers.first() else { return };
-        let holders = self.manager.block_holders(tip);
-        let peer = peers
-            .iter()
-            .copied()
-            .find(|p| holders.contains(p))
-            .unwrap_or(first);
+        let load = self.branch_load(&peers);
+        let Some(peer) = self.branch_peer(&load, &self.manager.block_holders(tip), lapsed) else {
+            return;
+        };
         let count = ANCESTORS_ASKED.min(number.max(1)) as u32;
         debug!(
             target: "rustock::sync",
@@ -683,14 +696,35 @@ impl SyncService {
              ending there"
         );
         self.request_headers_from(&peer, missing, count).await;
-        self.branch_headers_asked.insert(missing, Instant::now());
+        self.branch_headers_asked
+            .insert(missing, (Instant::now(), peer));
     }
 
-    /// Drop body requests for blocks beside the chain that went unanswered;
-    /// the next tick asks again.
+    /// Drop body requests for blocks beside the chain that went unanswered.
+    /// The peer takes a strike, as one whose request the body pipeline
+    /// reclaims does, and the next tick asks another peer for the block.
     pub(crate) fn expire_stale_branch_bodies(&mut self) {
+        let now = Instant::now();
+        let lapsed: Vec<(B256, B512)> = self
+            .pending_branch_bodies
+            .values()
+            .filter(|(_, _, sent, _)| now.duration_since(*sent) >= FOLLOW_BODY_TIMEOUT)
+            .map(|(hash, _, _, peer)| (*hash, *peer))
+            .collect();
         self.pending_branch_bodies
-            .retain(|_, (_, _, sent, _)| sent.elapsed() < FOLLOW_BODY_TIMEOUT);
+            .retain(|_, (_, _, sent, _)| now.duration_since(*sent) < FOLLOW_BODY_TIMEOUT);
+        if !lapsed.is_empty() {
+            warn!(
+                target: "rustock::sync",
+                "Expired {} body request(s) for blocks beside the chain with no response; \
+                 they will be asked of other peers",
+                lapsed.len()
+            );
+        }
+        for (hash, peer) in lapsed {
+            *self.body_peer_strikes.entry(peer).or_default() += 1;
+            self.note_branch_body_lapsed(hash, peer);
+        }
         if let Some(number) = self
             .manager
             .store
@@ -705,6 +739,57 @@ impl SyncService {
                 .unwrap_or_else(|e| e.into_inner())
                 .retain(|_, (block, _)| block.saturating_add(UNLOGGED_KEPT_DEPTH) >= number);
         }
+    }
+
+    /// Remember that `peer` did not send the body of `hash`, beside the chain,
+    /// so that the block is asked of another peer next.
+    fn note_branch_body_lapsed(&mut self, hash: B256, peer: B512) {
+        if self.branch_body_lapsed.len() >= MAX_LAPSED_REMEMBERED
+            && !self.branch_body_lapsed.contains_key(&hash)
+        {
+            self.branch_body_lapsed.clear();
+        }
+        self.branch_body_lapsed.insert(hash, peer);
+    }
+
+    /// The requests out for blocks beside the chain, by connected peer.
+    fn branch_load(&self, peers: &[B512]) -> HashMap<B512, usize> {
+        let mut load: HashMap<B512, usize> = peers.iter().map(|peer| (*peer, 0)).collect();
+        for (.., peer) in self.pending_branch_bodies.values() {
+            if let Some(count) = load.get_mut(peer) {
+                *count += 1;
+            }
+        }
+        load
+    }
+
+    /// The peer to ask for something of a branch beside the chain: the
+    /// least-loaded of `holders` that is connected, still answers and is not
+    /// `lapsed`, the peer whose last request for it went unanswered; else the
+    /// least-loaded peer the body pipeline would pick (`pick_body_peer`), not
+    /// `lapsed` while another can be asked. It used to be a holder or else the
+    /// first peer connected, every time, and a peer is known to hold a block
+    /// only once it has announced it or sent it whole: on testnet on
+    /// 15 November 2026 the network's branch from #8,296,515 came by header
+    /// sync, and a first peer that never answered held the node off the chain
+    /// for over an hour.
+    fn branch_peer(
+        &self,
+        load: &HashMap<B512, usize>,
+        holders: &HashSet<B512>,
+        lapsed: Option<B512>,
+    ) -> Option<B512> {
+        load.iter()
+            .filter(|(peer, count)| {
+                holders.contains(*peer)
+                    && Some(**peer) != lapsed
+                    && **count < MAX_BODY_REQUESTS_PER_PEER
+                    && self.body_peer_strikes.get(*peer).copied().unwrap_or(0)
+                        < BODY_PEER_STRIKE_LIMIT
+            })
+            .min_by_key(|(_, count)| **count)
+            .map(|(peer, _)| *peer)
+            .or_else(|| pick_body_peer(load, &self.body_peer_strikes, lapsed))
     }
 
     /// A body asked for a block beside the chain. Returns `false` when
@@ -745,8 +830,9 @@ impl SyncService {
                 completed
             }
             Err(what) => {
-                // Asked again, of another peer if one holds it, on the next tick.
+                // Asked again, of another peer, on the next tick.
                 self.charge_bad_body(peer, header.number, what);
+                self.note_branch_body_lapsed(hash, peer);
                 return true;
             }
         };
@@ -755,6 +841,9 @@ impl SyncService {
             return true;
         }
         self.manager.note_block_holder(hash, peer);
+        // It answers, so its strikes go, as in the body pipeline.
+        self.body_peer_strikes.remove(&peer);
+        self.branch_body_lapsed.remove(&hash);
         // A body of a branch held back counts as progress on it.
         if let Some((_, since)) = self.deferred_watch.as_mut() {
             *since = Instant::now();

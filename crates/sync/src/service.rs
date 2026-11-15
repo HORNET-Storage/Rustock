@@ -748,9 +748,13 @@ pub struct SyncService {
     /// Body requests for blocks beside the chain, apart from the follow
     /// path's: that map being empty is how its checks see nothing in flight.
     pending_branch_bodies: HashMap<u64, (B256, Header, Instant, B512)>,
+    /// Body requests for blocks beside the chain that lapsed, by block, with
+    /// the peer each was out to, so that the block is asked of another peer.
+    branch_body_lapsed: HashMap<B256, B512>,
     /// Headers asked for below a block beside the chain whose ancestry is not
-    /// held, by the hash they end at, with when they were asked.
-    branch_headers_asked: HashMap<B256, Instant>,
+    /// held, by the hash they end at, with when they were asked and of whom,
+    /// so that a request that lapses is asked of another peer.
+    branch_headers_asked: HashMap<B256, (Instant, B512)>,
     /// The branch the store holds back and when it last made progress, so
     /// that one whose bodies never come is given up. See `beside`.
     deferred_watch: Option<(B256, Instant)>,
@@ -822,6 +826,7 @@ impl SyncService {
             beside_unlogged: Default::default(),
             invalid_beside: std::collections::HashSet::new(),
             pending_branch_bodies: HashMap::new(),
+            branch_body_lapsed: HashMap::new(),
             branch_headers_asked: HashMap::new(),
             deferred_watch: None,
         }

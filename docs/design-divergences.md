@@ -892,10 +892,12 @@ branch's highest executed block (`stage_execution_after_reorg`,
 `executed_climb`). The sync service executes every block whose body it holds
 as it arrives, against its own parent's state -- beside the chain when it is
 not canonical (`service::beside`, `BlockProcessor::process_beside`) -- fetches
-the bodies and missing headers of a branch held back, gives one up after 60 s
-without progress, and takes a switch up in the call that makes it: the
-in-memory root, the miner's best block, subscribers, the transaction pool, the
-gas price and the Bridge index. The store records each switch it makes, from
+the bodies and missing headers of a branch held back, each of a peer known to
+hold it or else of another, and not again of a peer that let a request lapse
+while another can be asked; gives a branch up after 60 s without progress;
+and takes a switch up in the call that makes it: the in-memory root, the
+miner's best block, subscribers, the transaction pool, the gas price and the
+Bridge index. The store records each switch it makes, from
 the executed head it found (`ExecutionSwitch`), and only those are taken up: a
 batch records its own progress on a thread of its own, which moves the
 executed head with no switch at all. Whether this node executed a block is the
@@ -911,13 +913,20 @@ turned to it after that, tens of thousands of blocks later, past any reorg this
 node follows.
 
 Tests: `service::beside::tests`: eight, each failing with the new behaviour
-switched off, and three failing on its first version: two where it took any
+switched off, and five failing on its first version: two where it took any
 move of the executed head for a switch
 (`execution_recording_its_progress_is_not_taken_for_a_switch`,
 `a_switch_made_while_a_batch_runs_is_taken_up_from_where_the_batch_had_got`),
-and one where it checked a block whose header was held without its RSKIP-351
+one where it checked a block whose header was held without its RSKIP-351
 extension, and refused it
-(`a_block_held_without_its_extension_is_fetched_again_not_run_or_refused`);
+(`a_block_held_without_its_extension_is_fetched_again_not_run_or_refused`),
+and two where it asked a peer that never answered for a branch's bodies, or
+the headers below it, every time
+(`a_branch_body_a_peer_never_sends_is_asked_of_another_peer`,
+`headers_below_a_branch_a_peer_never_sends_are_asked_of_another_peer`): on
+testnet on 15 November 2026 the network's branch from #8,296,515 came by
+header sync, which names no peer as holding its blocks, and a first peer that
+never answered held the node off the chain for over an hour;
 and the store's half in `crates/storage/src/position.rs`:
 `a_heavier_branch_waits_until_it_is_executed_past_the_executed_head`,
 `a_switch_takes_execution_to_the_executed_tip_of_the_new_branch`,

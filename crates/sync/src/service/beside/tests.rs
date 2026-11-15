@@ -698,3 +698,121 @@ async fn a_block_held_without_its_extension_is_fetched_again_not_run_or_refused(
         "its body is not asked for again, with the extension"
     );
 }
+
+/// A second peer.
+const OTHER: B512 = B512::repeat_byte(0x02);
+
+/// The peer a request for the body of `hash`, beside the chain, is out to.
+fn branch_body_asked_of(service: &SyncService, hash: B256) -> Option<B512> {
+    service
+        .pending_branch_bodies
+        .values()
+        .find(|(asked, ..)| *asked == hash)
+        .map(|(.., peer)| *peer)
+}
+
+/// Every request out for a block beside the chain, or for the headers below
+/// one, sent half a minute ago: lapsed, as one a peer never answers.
+fn lapse_branch_requests(service: &mut SyncService) {
+    let lapsed = Instant::now()
+        .checked_sub(Duration::from_secs(31))
+        .expect("the clock has run half a minute");
+    for (_, _, sent, _) in service.pending_branch_bodies.values_mut() {
+        *sent = lapsed;
+    }
+    for (asked, _) in service.branch_headers_asked.values_mut() {
+        *asked = lapsed;
+    }
+}
+
+/// The peer asked for the headers ending at `hash` since last looked: [`PEER`]
+/// or [`OTHER`], whose messages arrive in `other`.
+fn headers_asked_of(
+    node: &mut Node,
+    other: &mut mpsc::Receiver<P2pMessage>,
+    hash: B256,
+) -> Option<B512> {
+    let (_, headers) = node.asked();
+    if headers.iter().any(|(asked, _)| *asked == hash) {
+        return Some(PEER);
+    }
+    while let Ok(message) = other.try_recv() {
+        if let P2pMessage::RskMessage(RskMessage {
+            sub_message: RskSubMessage::BlockHeadersRequest(request),
+            ..
+        }) = message
+        {
+            if request.query.hash == hash {
+                return Some(OTHER);
+            }
+        }
+    }
+    None
+}
+
+/// A body of a branch beside the chain that the peer asked never sends is
+/// asked of another peer once the request has lapsed, as the body pipeline
+/// asks another (`retry_stale_body_requests`). It was asked of a peer known to
+/// hold the block or else of the first peer connected, every time, and a peer
+/// is known to hold a block only once it has announced it or sent it whole:
+/// on testnet on 15 November 2026 the network's branch from #8,296,515 came by
+/// header sync, its bodies were asked of a peer that never answered, and the
+/// node stood off the chain for over an hour.
+#[tokio::test]
+async fn a_branch_body_a_peer_never_sends_is_asked_of_another_peer() {
+    let mut node = node().await;
+    let (to_other, _other_inbox) = mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    node.service.peer_store.add_peer(OTHER, to_other).await;
+    let chain = node.chain(&[1, 2]); // totals 2 and 4
+    let a1 = chain[1].hash();
+    let x2 = node.header(2, a1, 1, 0xC0); // total 3
+    let x3 = node.header(3, x2.hash(), 9, 0xC0); // total 12
+    node.service
+        .on_headers_response(PEER, vec![x3.clone(), x2.clone()])
+        .await;
+    assert_eq!(
+        node.store.deferred_head(),
+        Some(x3.hash()),
+        "the branch is held back"
+    );
+    let first = branch_body_asked_of(&node.service, x2.hash())
+        .expect("the body of its first block is asked for");
+
+    // That peer never answers, and the request lapses.
+    lapse_branch_requests(&mut node.service);
+    node.service.expire_stale_branch_bodies();
+    node.service.advance_deferred_branch().await;
+
+    let again = branch_body_asked_of(&node.service, x2.hash()).expect("it is asked for again");
+    assert_ne!(again, first, "of another peer");
+}
+
+/// The headers below a branch whose ancestry this node lacks, asked of a peer
+/// that never sends them, are asked of another peer once the request has
+/// lapsed. They too were asked of a peer known to hold the branch's tip or
+/// else of the first peer connected, every time.
+#[tokio::test]
+async fn headers_below_a_branch_a_peer_never_sends_are_asked_of_another_peer() {
+    let mut node = node().await;
+    let (to_other, mut other_inbox) =
+        mpsc::channel(rustock_networking::peers::PEER_CHANNEL_CAPACITY);
+    node.service.peer_store.add_peer(OTHER, to_other).await;
+    // Our chain to #31; the network's #31, never downloaded, and a child of
+    // it that was.
+    let chain = node.chain(&[1; 31]);
+    let theirs = node.header(31, chain[30].hash(), 9, 0xCC);
+    let child = node.header(32, theirs.hash(), 9, 0xCC);
+    node.store.put_header(&child).unwrap();
+
+    node.service.take_up_stored_successors().await;
+    let first = headers_asked_of(&mut node, &mut other_inbox, theirs.hash())
+        .expect("the headers ending at the block it lacks are asked for");
+
+    // That peer never answers, and the request lapses.
+    lapse_branch_requests(&mut node.service);
+    node.service.take_up_stored_successors().await;
+
+    let again = headers_asked_of(&mut node, &mut other_inbox, theirs.hash())
+        .expect("they are asked for again");
+    assert_ne!(again, first, "of another peer");
+}
