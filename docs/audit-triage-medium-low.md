@@ -142,7 +142,7 @@ checking FRCR-674: **rskj's STATICCALL pops a value word before RSKIP103**
 (orchid060, mainnet #1,052,700). `VM.calculateCallValue` special-cases only
 DELEGATECALL until RSKIP103, so for mainnet blocks #729,000–#1,052,699 a
 STATICCALL consumes *three* stack items, and adds `VT_CALL` (9,000 gas) when the
-popped value is non-zero. rustock pops two, always. See *Not fixed here*.
+popped value is non-zero. rustock popped two, always. See *Fixed since*.
 
 **Are these live on mainnet?** No — and the evidence is good. rustock's
 `processor.rs` validates `gas_used`, `paid_fees`, the transactions root, the
@@ -239,7 +239,7 @@ builder failure returns an error.
 
 ### FRCR-674 (part two) — STATICCALL value semantics before RSKIP103
 
-Described in Group 2. Not fixed here — see below.
+Described in Group 2. Fixed since — see below.
 
 ---
 
@@ -251,13 +251,19 @@ Described in Group 2. Not fixed here — see below.
 | FRCR-674 (part one) | STATICCALL gated on RSKIP91 (orchid, #729,000); before it, the invalid-opcode handler, matching `VM.java` |
 | FRCR-673, -675, -680, -681 | testnet activation ladder corrected against rskj `config/testnet.conf`, plus a test transcribing **both** networks' tables as a block |
 
+## Fixed since
+
+| Finding | Fix |
+|---|---|
+| FRCR-274, -275 (DUPN/SWAPN/TXINDEX) | rskj's three opcodes before RSKIP191 (iris300), the doubled `program.step()` included: [audit/evm.md](audit/evm.md#rskip-191--dupn-swapn-and-txindex-removed) |
+| FRCR-674 (part two) | before RSKIP103 (orchid060, #1,052,700) STATICCALL takes a value as CALL does: it pays `VT_CALL`, brings the stipend, and moves the value to a callee that runs static (`rsk_static_call_with_value`): [audit/README.md](audit/README.md#what-sorting-by-status-leaves-out) |
+
 ## Not fixed here, with reasons
 
 | Finding | Why not |
 |---|---|
 | Group 1: RSKIP144 edges, RSKIP351 header checks | Gated on `reed810`, which is `-1` on mainnet. Testnet-only. |
-| FRCR-274, -275 (DUPN/SWAPN/TXINDEX) | Implementable — the semantics are recorded below — but proven unexercised on mainnet and permanently unreachable there. Matters for testnet replay. `doDUPN`/`doSWAPN` also call `program.step()` **twice**, so the PC advances by 2 and the byte after the opcode is skipped; that quirk has to be reproduced, and it is worth doing deliberately rather than in passing. |
-| FRCR-674 (part two) | Needs care: pre-RSKIP103 STATICCALL pops a third stack word and may charge `VT_CALL`, and the downstream static-call write-protection interacts with it. Window is #729,000–#1,052,699, permanently closed, proven unexercised. A wrong "fix" is worse than the documented gap. |
+
 | FRCR-574 | Mempool policy, not consensus. |
 
 ## No action — the RSKIP text is stale, rustock matches rskj

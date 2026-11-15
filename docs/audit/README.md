@@ -131,8 +131,68 @@ altogether. The index also disagrees with the RSKIPs' own files: it has
 RSKIP-131, -179 and -191 as Adopted where their files say Draft, and RSKIP-59
 as Accepted where its file says Rejected.
 
-None of those 26 is among the eleven, and this pass did not read them rule by
-rule. What covers them now is the chain: every block of both networks has
-been re-run and matches its header, which catches a difference wherever a
-real block exercises one. 17 of them are also among the rules
+None of those 26 is among the eleven, and the chain can't settle them: every
+block of both networks has been re-run and matches its header, which shows a
+rule matches wherever a real block exercised it, but says nothing of a case no
+block reached, or of a block rskj refuses, since the chain holds none. So each
+was read where rskj reads it, at `VETIVER-9.0.4`, against rustock. Five
+differed:
+
+| RSKIP | rskj | rustock did | fix, and its test |
+|---|---|---|---|
+| 90 | Before orchid (mainnet #729,000), a precompile that returns leaves the caller's return data as it was (`Program.executePrecompiled`). | Made the output the return data. | `RskHandler::with_rskip90`; `test_precompile_calls_and_the_return_data_by_height` |
+| 103 | Before orchid060 (mainnet #729,000 to #1,052,699), STATICCALL takes a value as CALL does (`VM.calculateCallValue`): seven arguments, `VT_CALL` and the stipend for a value, which moves to a callee that runs static. | Took six arguments and no value. | `rsk_static_call_with_value`; `test_pre_rskip103_staticcall_takes_a_value` |
+| 134 | `increaseLockingCap` fails the call where the new cap times its multiplier passes a `long` (`Coin.multiply`). | Saturated the product and went on. | `governance.rs`; `a_cap_whose_limit_passes_a_long_fails_the_increase` |
+| 136 | Before bahamas (mainnet #3,397, or wherever `rskip136` is moved), a transaction's own call to any precompile is held to its limit by the precompile's price alone, and pays that price on top of the intrinsic cost, past the limit if it comes to that (`TransactionExecutor.call`). | Did so for the Bridge only. | the executor's direct-call path; `before_rskip136_a_direct_precompile_call_is_held_to_its_limit_by_its_price_alone`, and the same for a native contract |
+| 150 | Before twoToThree (mainnet #2,018,000, testnet #504,000), a call's stipend is added to the gas it asks for as a plain `long` (`VM.getMessageCall`): at 2^63 - 2,300 or more the sum goes below zero, and the calling frame fails with all its gas. | Saturated the sum. | `rsk_callee_gas`; `test_pre_rskip150_stipend_sum_past_a_long_fails_the_caller` |
+
+Four of the five sit in windows the chain has passed, where no block reached
+the case, and RSKIP-134's needs a cap no authorizer has asked for.
+
+RSKIP-136 runs through the path for the calls rskj makes outside its VM, which
+also takes the federation's free Bridge transactions. Three more differences
+in that path are fixed with it:
+
+- It held a transaction to none of `TransactionExecutor.init`: its sender's
+  next nonce, a limit that pays its intrinsic cost, a balance that covers its
+  value and its whole limit. revm holds every other transaction to these.
+  `test_bridge_tx_gas0_fails_for_unknown_sender` asserted a block that `init`
+  refuses, which `TransactionListExecutor` stops at; it now asserts the
+  refusal. A free Bridge transaction meets this on rskj's regtest at any
+  height, where the federators' Bridge transactions stay free.
+- It priced a byte of data at 68 gas where RSKIP400 makes it 16.
+- Where a block runs as its sublists, it paid each fee to REMASC at once, and
+  REMASC was paid it again with the block's other fees.
+
+The last two, and RSKIP-136's own difference, can't happen on mainnet or
+testnet: mainnet's window is its first 3,397 blocks, which rustock replays,
+and testnet schedules bahamas at 0. They can on a chain that moves `rskip136`.
+
+The other 21 match:
+
+| RSKIP | what rskj gates on it |
+|---|---|
+| 88 | the Bridge refusing calls from contracts, and how it ends a call it can't read |
+| 97 | the difficulty's ten-minute rule and its minimum |
+| 110 | the fork-detection data in a merged-mining coinbase |
+| 119 | the BlockHeader precompile |
+| 122 | the Bridge's `getBtcTransactionConfirmations`, its price included |
+| 124 | the Bridge's `receiveHeaders`: its price, who may call it, a header's size |
+| 126 | the state root a header carries, and how a block's roots are checked |
+| 137 | the altBN128 precompiles, and their answer to a point off the curve before RSKIP197 |
+| 143 | the Bridge's coinbase-information methods |
+| 151 | SELFBALANCE |
+| 152 | CHAINID |
+| 156 | the difficulty's bound divisor, 400 from it except on regtest |
+| 351 | a block's sublist gas limits and their header field |
+| 529 | the Union Bridge's event methods |
+| 535 | the header's version 2, and the Union Bridge's base event it carries |
+| 536 | the BlockHeader precompile's `getCumulativeWork` and `getDifficultyWithUncles` |
+| 540 | the Bridge's `getEstimatedFeesForPegOutAmount` |
+| 544 | refusing new code that starts with 0xEF |
+| 551 | where a rejected peg-in stops being marked as processed |
+| 552 | BLAKE2F's price for a call with no data |
+| 559 | sorting the pegouts; no network schedules it, and `tbd1000`, its upgrade, is accepted and reported as changing nothing |
+
+18 of the 26 are also among the rules
 `every_rule_activates_where_rskjs_config_puts_it` holds to rskj's heights.

@@ -6412,9 +6412,9 @@ pub fn get_estimated_fees_for_next_pegout<CTX: crate::RskContextTr>(
 /// `getEstimatedFeesForPegOutAmount(uint256 pegoutAmountInWeis)` → uint256
 ///
 /// Enabled by RSKIP540 (Vetiver900). Validates the amount against the
-/// minimum peg-out value like rskj BridgeSupport.getEstimatedFeesForPegOutAmount;
-/// the fee simulation itself shares getEstimatedFeesForNextPegOutEvent's
-/// (stub) fidelity.
+/// minimum peg-out value like rskj BridgeSupport.getEstimatedFeesForPegOutAmount,
+/// then runs getEstimatedFeesForNextPegOutEvent's peg-out simulation with the
+/// caller's amount.
 pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     args: &[u8],
