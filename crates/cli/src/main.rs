@@ -1431,10 +1431,10 @@ struct Args {
     /// `blockchain.config.hardforkActivationHeights`. Repeatable. Names are
     /// rskj's: orchid to vetiver900, and afterBridgeSync, where the
     /// federators' and authorizers' Bridge transactions start to be paid.
-    /// bahamas and hop401 are accepted at the height this node already reads
-    /// them at; orchid060 and tbd1000 are accepted and change nothing
-    /// (tbd1000 is rskj's upgrade for RSKIP559, which no network schedules
-    /// and this node doesn't implement).
+    /// bahamas, orchid060 and hop401 are accepted at the height this node
+    /// already reads them at; tbd1000 is accepted and changes nothing (it is
+    /// rskj's upgrade for RSKIP559, which no network schedules and this node
+    /// doesn't implement).
     #[arg(long, value_name = "NAME=HEIGHT")]
     hardfork: Vec<String>,
 
@@ -5854,7 +5854,7 @@ mod genesis_tests {
         assert_eq!(config.min_gas_limit, 3_000_000);
         assert!(config.genesis_spec.is_none(), "mainnet's genesis stays");
         let (ladder, unmodelled) = hardfork_config(&config).unwrap();
-        assert_eq!(unmodelled, vec!["orchid060".to_string(), "tbd1000".to_string()]);
+        assert_eq!(unmodelled, vec!["tbd1000".to_string()]);
         assert!(!ladder.has_rskip144(9_002_503));
         assert!(ladder.has_rskip144(9_003_580));
         assert!(ladder.has_rskip351(9_003_580));

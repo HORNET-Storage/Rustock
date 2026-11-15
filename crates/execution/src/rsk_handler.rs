@@ -119,6 +119,11 @@ invisible_exception: Arc<AtomicBool>,
     /// account — preserving the prior call's 32-byte output sent it down a
     /// different branch and out of gas).
     rskip171_active: bool,
+    /// RSKIP90 (orchid): a precompile that returns makes its output the
+    /// caller's return data. Before it rskj's `Program.executePrecompiled`,
+    /// which runs a contract's call to a precompile before RSKIP197, leaves
+    /// the return data as the call before left it.
+    rskip90_active: bool,
     /// Fail a transaction as it starts to run code. rskj can't build its
     /// program's invocation from the block's header
     /// (`env::header_fits_program_invoke`), throws, and catches nothing:
@@ -250,6 +255,13 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         self
     }
 
+    /// Whether RSKIP90 is active, under which a precompile's output becomes
+    /// the caller's return data. See the field.
+    pub fn with_rskip90(mut self, active: bool) -> Self {
+        self.rskip90_active = active;
+        self
+    }
+
     /// Whether a local call to `to` runs whatever gas it has: a precompile,
     /// before RSKIP136. rskj leaves out the check that the gas covers a
     /// precompile's cost for every local call (TransactionExecutor.java:350).
@@ -339,6 +351,7 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             pre_rskip150_precompiles,
             active_precompiles,
             rskip171_active,
+            rskip90_active: true,
             // Per-transaction, as before RSKIP-144; `postponing_fees` opts in.
             postpone_fees: false,
             fail_programs: false,
@@ -994,14 +1007,17 @@ where
                                     ));
                                 }
                             }
-                            // rskj: only executed code and precompile calls
-                            // reset the caller's returnDataBuffer; a CALL
-                            // resolved without running anything keeps the
-                            // previous buffer (mainnet #2,669,886: RETURNDATASIZE
-                            // after a value transfer to an empty account still
-                            // reports the prior call's 32-byte output).
-                            // RSKIP171 (iris300): cleanReturnDataBuffer now
-                            // fires on every no-frame call, so the pre-iris
+                            // rskj: only executed code and a precompile that
+                            // returns reset the caller's returnDataBuffer, the
+                            // precompile only from RSKIP90 (orchid,
+                            // `Program.executePrecompiled`). A CALL resolved
+                            // without running anything, a precompile's too
+                            // where it is refused for the endowment or its gas,
+                            // keeps the previous buffer (mainnet #2,669,886:
+                            // RETURNDATASIZE after a value transfer to an empty
+                            // account still reports the prior call's 32-byte
+                            // output). RSKIP171 (iris300): cleanReturnDataBuffer
+                            // now fires on every no-frame call, so the pre-iris
                             // preservation is disabled and revm's EIP-211
                             // clearing stands.
                             // A CREATE that `createContract` refuses before it
@@ -1009,10 +1025,14 @@ where
                             // use) keeps the buffer at every height: RSKIP171's
                             // clean-up is only on the call paths.
                             let rskj_preserves = match &result {
-                                FrameResult::Call(_) => {
-                                    !self.rskip171_active
-                                        && callee
-                                            .is_some_and(|c| !self.active_precompiles.contains(&c))
+                                FrameResult::Call(outcome) => {
+                                    let precompile = callee
+                                        .is_some_and(|c| self.active_precompiles.contains(&c));
+                                    if precompile && outcome.instruction_result().is_ok() {
+                                        !self.rskip90_active
+                                    } else {
+                                        !self.rskip171_active
+                                    }
                                 }
                                 FrameResult::Create(outcome) => matches!(
                                     outcome.instruction_result(),

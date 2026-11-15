@@ -513,6 +513,8 @@ impl RskExecutor {
             self.hardfork_cfg.has_push0(header.number),
             self.hardfork_cfg.has_basefee(header.number),
             self.hardfork_cfg.has_rskip91(header.number),
+            !self.hardfork_cfg.has_rskip103(header.number),
+            !self.hardfork_cfg.has_rskip150(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
             !self.hardfork_cfg.has_rskip191(header.number),
@@ -535,6 +537,7 @@ impl RskExecutor {
                 self.hardfork_cfg.has_rskip171(header.number),
             )
             .failing_programs(!header_fits_program_invoke(header))
+            .with_rskip90(self.hardfork_cfg.has_rskip90(header.number))
             .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
             .from_nobody(no_sender)
             .with_reached_sequential_only(reached_sequential_only.clone());
@@ -658,6 +661,8 @@ impl RskExecutor {
             self.hardfork_cfg.has_push0(header.number),
             self.hardfork_cfg.has_basefee(header.number),
             self.hardfork_cfg.has_rskip91(header.number),
+            !self.hardfork_cfg.has_rskip103(header.number),
+            !self.hardfork_cfg.has_rskip150(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
             !self.hardfork_cfg.has_rskip191(header.number),
@@ -679,6 +684,7 @@ impl RskExecutor {
                 self.hardfork_cfg.has_rskip171(header.number),
             )
             .failing_programs(!header_fits_program_invoke(header))
+            .with_rskip90(self.hardfork_cfg.has_rskip90(header.number))
             .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
             .with_reached_sequential_only(reached_sequential_only.clone());
             use revm::inspector::InspectorHandler;
@@ -858,6 +864,8 @@ impl RskExecutor {
             self.hardfork_cfg.has_push0(header.number),
             self.hardfork_cfg.has_basefee(header.number),
             self.hardfork_cfg.has_rskip91(header.number),
+            !self.hardfork_cfg.has_rskip103(header.number),
+            !self.hardfork_cfg.has_rskip150(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
             !self.hardfork_cfg.has_rskip191(header.number),
@@ -879,6 +887,7 @@ impl RskExecutor {
                 self.hardfork_cfg.has_rskip171(header.number),
             )
             .failing_programs(!header_fits_program_invoke(header))
+            .with_rskip90(self.hardfork_cfg.has_rskip90(header.number))
             .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
             .from_nobody(no_sender)
             .with_reached_sequential_only(reached_sequential_only.clone());
@@ -1540,6 +1549,8 @@ impl RskExecutor {
             self.hardfork_cfg.has_push0(header.number),
             self.hardfork_cfg.has_basefee(header.number),
             self.hardfork_cfg.has_rskip91(header.number),
+            !self.hardfork_cfg.has_rskip103(header.number),
+            !self.hardfork_cfg.has_rskip150(header.number),
             self.hardfork_cfg.has_rskip446(header.number),
             self.hardfork_cfg.has_rskip445(header.number),
             !self.hardfork_cfg.has_rskip191(header.number),
@@ -2247,6 +2258,7 @@ impl RskExecutor {
             )
             .postponing_fees(postpone_fees)
             .failing_programs(fails_programs)
+            .with_rskip90(self.hardfork_cfg.has_rskip90(header.number))
             .with_called_precompiles(called_precompiles.clone())
             .with_reached_sequential_only(reached_sequential_only.clone());
                 // `inspect_run` for the one transaction being traced, `run`
@@ -5572,6 +5584,260 @@ mod tests {
             slot0.present_value, U256::MAX,
             "EXTCODESIZE of an active precompile must be 2^256-1 (RSKIP90)"
         );
+    }
+
+    /// rskj `VM.getMessageCall` adds the 2,300 stipend of a call that moves
+    /// value to the gas the call asks for. Before RSKIP150 (twoToThree,
+    /// mainnet #2,018,000) that is a plain `long` sum: a request of 2^63 - 2,300
+    /// or more (`Program.limitToMaxLong` holds any larger word at 2^63 - 1)
+    /// takes it below zero, `GasCost.add` throws for the negative callee gas,
+    /// and the frame that made the call fails with all its gas. From RSKIP150
+    /// the sum stops at 2^63 - 1 and the call goes ahead.
+    #[test]
+    fn test_pre_rskip150_stipend_sum_past_a_long_fails_the_caller() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAD);
+        // Main: CALL(gas = the calldata's word, sender, value 1, no input, no
+        //       output); POP; SSTORE(0, 1); STOP.
+        let main = Address::repeat_byte(0xBA);
+        let mut main_code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x01, 0x73,
+        ];
+        main_code.extend_from_slice(sender.as_slice());
+        main_code.extend_from_slice(&[
+            0x60, 0x00, 0x35, 0xf1, 0x50, 0x60, 0x01, 0x60, 0x00, 0x55, 0x00,
+        ]);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &main,
+            1,
+            U256::from(1_000),
+            &main_code,
+        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let run = |number: u64, gas: U256| {
+            let call = rustock_core::Transaction {
+                input: Bytes::from(gas.to_be_bytes::<32>().to_vec()),
+                ..plain_tx(0, &main, U256::ZERO)
+            };
+            let r = executor
+                .execute_block(
+                    &dummy_header(number),
+                    &[(call, sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("block");
+            let stored = r
+                .state_changes
+                .get(&main)
+                .and_then(|a| a.storage.get(&U256::ZERO))
+                .is_some_and(|s| s.present_value == U256::from(1));
+            (r.tx_results[0].success, r.tx_results[0].gas_used, stored)
+        };
+        // 2^63 - 2,300, the least a sum with the stipend takes past a long.
+        let wraps = U256::from(i64::MAX as u64 - 2_299);
+        assert!(
+            run(2_000_000, wraps - U256::from(1)).2,
+            "2^63 - 2,301 and the stipend make a long"
+        );
+        for gas in [wraps, U256::MAX] {
+            assert_eq!(
+                run(2_000_000, gas),
+                (false, 1_000_000, false),
+                "{gas:#x} before RSKIP150: the caller fails with all its gas"
+            );
+            assert!(run(2_018_000, gas).2, "{gas:#x} from RSKIP150");
+        }
+    }
+
+    /// rskj `VM.calculateCallValue`: before RSKIP103 (orchid060, mainnet
+    /// #1,052,700) STATICCALL takes a value off the stack as CALL does, seven
+    /// arguments in all. The value pays `VT_CALL` and brings the stipend, and
+    /// `Program.callToAddress` moves it to the callee, which runs static. Only
+    /// CALL refuses a value inside a static call, so a contract that runs
+    /// static moves one this way too. From RSKIP103 the value is always zero,
+    /// and STATICCALL takes six.
+    #[test]
+    fn test_pre_rskip103_staticcall_takes_a_value() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAE);
+        let payee = Address::repeat_byte(0xBC);
+        // STATICCALL(gas, `to`, `value`, no input, no output), as rskj reads it
+        // before RSKIP103.
+        let static_call = |to: &Address, value: u8| {
+            let mut code = vec![
+                0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, value, 0x73,
+            ];
+            code.extend_from_slice(to.as_slice());
+            code.extend_from_slice(&[0x5a, 0xfa]);
+            code
+        };
+        // Main: STATICCALL(payee, value 5); SSTORE(0, its result); STOP.
+        let main = Address::repeat_byte(0xBB);
+        let mut main_code = static_call(&payee, 5);
+        main_code.extend_from_slice(&[0x60, 0x00, 0x55, 0x00]);
+        // Relay, which runs static: STATICCALL(payee, value 5); STOP.
+        let relay = Address::repeat_byte(0xC1);
+        let mut relay_code = static_call(&payee, 5);
+        relay_code.push(0x00);
+        // Outer: STATICCALL(relay, value 0); SSTORE(0, its result); STOP.
+        let outer = Address::repeat_byte(0xC2);
+        let mut outer_code = static_call(&relay, 0);
+        outer_code.extend_from_slice(&[0x60, 0x00, 0x55, 0x00]);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account(&root, store.as_ref(), &payee, 0, U256::ZERO);
+        let root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &main,
+            1,
+            U256::from(1_000),
+            &main_code,
+        );
+        let root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &relay,
+            1,
+            U256::from(1_000),
+            &relay_code,
+        );
+        let root = put_account_with_code(&root, store.as_ref(), &outer, 1, U256::ZERO, &outer_code);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let run = |number: u64, to: &Address| {
+            let call = plain_tx(0, to, U256::ZERO);
+            let r = executor
+                .execute_block(
+                    &dummy_header(number),
+                    &[(call, sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("block");
+            assert!(r.tx_results[0].success, "#{number}");
+            let result = r
+                .state_changes
+                .get(to)
+                .and_then(|a| a.storage.get(&U256::ZERO))
+                .map_or(U256::ZERO, |s| s.present_value);
+            assert_eq!(result, U256::from(1), "#{number}: the STATICCALL succeeds");
+            let paid = r
+                .state_changes
+                .get(&payee)
+                .map_or(U256::ZERO, |a| a.info.balance);
+            (paid, r.tx_results[0].gas_used)
+        };
+        let (paid_before, gas_before) = run(1_000_000, &main);
+        let (paid_after, gas_after) = run(1_100_000, &main);
+        assert_eq!(
+            paid_before,
+            U256::from(5),
+            "before RSKIP103 the value moves"
+        );
+        assert_eq!(paid_after, U256::ZERO, "from RSKIP103 there is none");
+        assert_eq!(
+            gas_before - gas_after,
+            9_000,
+            "VT_CALL, the stipend coming back unspent"
+        );
+        assert_eq!(
+            run(1_000_000, &outer).0,
+            U256::from(5),
+            "before RSKIP103, from a contract that runs static too"
+        );
+        assert_eq!(run(1_100_000, &outer).0, U256::ZERO);
+    }
+
+    /// rskj `Program.executePrecompiled`, which runs a contract's call to a
+    /// precompile before RSKIP197, makes the output the caller's return data
+    /// only from RSKIP90 (orchid, mainnet #729,000): before it RETURNDATASIZE
+    /// still reads the call before. A precompile call refused for its gas
+    /// cleans the return data only from RSKIP171 (iris300, #3,614,800), as
+    /// `cleanReturnDataBuffer` does nothing before it.
+    #[test]
+    fn test_precompile_calls_and_the_return_data_by_height() {
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let sender = Address::repeat_byte(0xAF);
+        // Returner: RETURN 36 zero bytes.
+        let returner = Address::repeat_byte(0xBD);
+        let returner_code = [0x60, 0x24, 0x60, 0x00, 0xf3];
+        // Main: CALL returner; POP;
+        //       CALL identity (0x04) on 4 bytes with all the gas; POP;
+        //       SSTORE(0, RETURNDATASIZE + 1);
+        //       CALL identity on 32 bytes with no gas, which can't pay it; POP;
+        //       SSTORE(1, RETURNDATASIZE + 1); STOP.
+        let main = Address::repeat_byte(0xBE);
+        let mut main_code = vec![
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        main_code.extend_from_slice(returner.as_slice());
+        main_code.extend_from_slice(&[0x5a, 0xf1, 0x50]);
+        main_code.extend_from_slice(&[
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x04, 0x60, 0x00, 0x60, 0x00, 0x60, 0x04, 0x5a, 0xf1,
+            0x50,
+        ]);
+        main_code.extend_from_slice(&[0x3d, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55]);
+        main_code.extend_from_slice(&[
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x04, 0x60, 0x00,
+            0xf1, 0x50,
+        ]);
+        main_code.extend_from_slice(&[0x3d, 0x60, 0x01, 0x01, 0x60, 0x01, 0x55, 0x00]);
+
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(
+            &root,
+            store.as_ref(),
+            &returner,
+            1,
+            U256::ZERO,
+            &returner_code,
+        );
+        let root = put_account_with_code(&root, store.as_ref(), &main, 1, U256::ZERO, &main_code);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // Before orchid, before iris300, and after it.
+        for (number, after_return, after_refusal) in [
+            (700_000u64, 37u64, 37u64),
+            (1_700_000, 5, 5),
+            (3_700_000, 5, 1),
+        ] {
+            let call = plain_tx(0, &main, U256::ZERO);
+            let r = executor
+                .execute_block(
+                    &dummy_header(number),
+                    &[(call, sender)],
+                    &root,
+                    store.clone(),
+                )
+                .expect("block");
+            assert!(r.tx_results[0].success, "#{number}");
+            let slot = |key: u64| {
+                r.state_changes
+                    .get(&main)
+                    .and_then(|a| a.storage.get(&U256::from(key)))
+                    .map_or(U256::ZERO, |s| s.present_value)
+            };
+            assert_eq!(
+                slot(0),
+                U256::from(after_return),
+                "#{number}: RETURNDATASIZE + 1 after identity returned"
+            );
+            assert_eq!(
+                slot(1),
+                U256::from(after_refusal),
+                "#{number}: RETURNDATASIZE + 1 after identity was refused"
+            );
+        }
     }
 
     /// Regression for mainnet #1,071,481: before RSKIP453 (lovell700) an

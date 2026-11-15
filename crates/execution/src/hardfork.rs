@@ -89,6 +89,7 @@ pub const TESTNET_ACTIVATIONS: &[(u64, RskNetworkUpgrade)] = &[
 /// by name are here; every other rule follows its upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsensusRule {
+    Rskip103,
     Rskip136,
     Rskip144,
     Rskip351,
@@ -100,6 +101,7 @@ impl ConsensusRule {
     /// The rule rskj calls `name` in `consensusRules`.
     pub fn from_rskj_name(name: &str) -> Option<Self> {
         Some(match name {
+            "rskip103" => Self::Rskip103,
             "rskip136" => Self::Rskip136,
             "rskip144" => Self::Rskip144,
             "rskip351" => Self::Rskip351,
@@ -366,10 +368,11 @@ impl RskHardforkConfig {
     }
 
     /// A rung this ladder does not model as such but reads at one height
-    /// per chain: rskj's `bahamas` and `hop401`.
+    /// per chain: rskj's `bahamas`, `orchid060` and `hop401`.
     fn fixed_rskj_height(&self, name: &str) -> Option<u64> {
         let (mainnet, testnet) = match name {
             "bahamas" => (3_397, 0),
+            "orchid060" => (1_052_700, 0),
             "hop401" => (4_976_300, 3_362_200),
             _ => return None,
         };
@@ -402,14 +405,14 @@ impl RskHardforkConfig {
     ///   height, or removed.
     /// - `afterBridgeSync`: where the federators' and authorizers' Bridge
     ///   transactions start to be paid, or never.
-    /// - `bahamas`, `hop401`: read at one fixed height per chain, so they are
-    ///   accepted at that height and refused at any other.
-    /// - `orchid060` and `tbd1000`: nothing here reads them. `tbd1000` is
-    ///   rskj's upgrade for RSKIP559, which no network schedules and this
-    ///   node doesn't implement. Accepted and reported as such. Any other
-    ///   name is refused, as rskj's `NetworkUpgrade.named` refuses it.
-    /// - `rskip136`, `rskip144`, `rskip351`, `rskip535`, `rskip536`: scheduled
-    ///   apart from their upgrade.
+    /// - `bahamas`, `orchid060`, `hop401`: read at one fixed height per chain,
+    ///   so they are accepted at that height and refused at any other.
+    /// - `tbd1000`: nothing here reads it. It is rskj's upgrade for RSKIP559,
+    ///   which no network schedules and this node doesn't implement. Accepted
+    ///   and reported as such. Any other name is refused, as rskj's
+    ///   `NetworkUpgrade.named` refuses it.
+    /// - `rskip103`, `rskip136`, `rskip144`, `rskip351`, `rskip535` and
+    ///   `rskip536`: scheduled apart from their upgrade.
     /// - `rskipUMM`: accepted at any height. Only a header's layout reads it,
     ///   from the chain's activation heights, which the caller moves.
     ///
@@ -432,7 +435,7 @@ impl RskHardforkConfig {
                          cannot move it"
                     ));
                 }
-            } else if matches!(name.as_str(), "orchid060" | "tbd1000") {
+            } else if name == "tbd1000" {
                 unmodelled.push(name.clone());
             } else {
                 return Err(format!("hardfork {name}: not an rskj upgrade name"));
@@ -446,7 +449,7 @@ impl RskHardforkConfig {
             } else {
                 return Err(format!(
                     "consensus rule {name}: not one this node schedules on its own \
-                     (rskip136, rskip144, rskip351, rskip535, rskip536, rskipUMM)"
+                     (rskip103, rskip136, rskip144, rskip351, rskip535, rskip536, rskipUMM)"
                 ));
             }
         }
@@ -878,6 +881,19 @@ impl RskHardforkConfig {
     /// Disabled again by RSKIP551 at Vetiver900.
     pub fn has_rskip459(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Lovell700
+    }
+
+    /// RSKIP103 (orchid060 — mainnet 1_052_700, testnet/regtest genesis):
+    /// STATICCALL takes no value. Before it rskj's `VM.calculateCallValue`
+    /// takes one off the stack for every call but DELEGATECALL
+    /// (`rsk_instructions::rsk_static_call_with_value`). orchid060 carries no
+    /// other rule, and isn't a rung of this ladder.
+    pub fn has_rskip103(&self, block_number: u64) -> bool {
+        if let Some(height) = self.rule_override(ConsensusRule::Rskip103) {
+            return height.is_some_and(|h| block_number >= h);
+        }
+        self.fixed_rskj_height("orchid060")
+            .is_some_and(|h| block_number >= h)
     }
 
     /// RSKIP136 (bahamas — mainnet 3_397, testnet/regtest genesis): correct
@@ -1495,7 +1511,7 @@ mod override_tests {
     #[test]
     fn the_seed_schedule_turns_reed810_on_above_vetiver900() {
         let (cfg, unmodelled) = seed_ladder();
-        assert_eq!(unmodelled, vec!["orchid060".to_string(), "tbd1000".to_string()]);
+        assert_eq!(unmodelled, vec!["tbd1000".to_string()]);
         assert_eq!(cfg.activation_height(RskNetworkUpgrade::Reed810), Some(9_002_504));
         assert!(!cfg.has_rskip144(9_002_503));
         assert!(cfg.has_rskip144(9_002_504));
@@ -1719,6 +1735,7 @@ mod rskj_schedule_tests {
         ("rskip88", RskHardforkConfig::has_rskip88, Some(729_000), Some(0)),
         ("rskip90", RskHardforkConfig::has_rskip90, Some(729_000), Some(0)),
         ("rskip91", RskHardforkConfig::has_rskip91, Some(729_000), Some(0)),
+        ("rskip103", RskHardforkConfig::has_rskip103, Some(1_052_700), Some(0)),
         ("rskip123", RskHardforkConfig::has_rskip123, Some(1_591_000), Some(0)),
         ("rskip124", RskHardforkConfig::has_rskip124, Some(1_591_000), Some(0)),
         ("rskip125", RskHardforkConfig::has_rskip125, Some(1_591_000), Some(0)),
@@ -1897,7 +1914,7 @@ mod rskj_schedule_tests {
     /// rskj's `regtest.conf`, name by name, on rustock's own regtest ladder
     /// is `rskj_regtest`, rule for rule: what a node replaying rskj's
     /// regtest blocks would pass by hand, and what `--genesis` gives it.
-    /// `orchid060` and `tbd1000` are taken and change nothing.
+    /// `tbd1000` is taken and changes nothing.
     #[test]
     fn rskj_regtest_conf_by_name_is_rskj_regtest() {
         let named = |list: &[(&str, i64)]| -> Vec<(String, Option<u64>)> {
@@ -1908,7 +1925,7 @@ mod rskj_schedule_tests {
         let (by_name, unmodelled) = RskHardforkConfig::regtest()
             .with_rskj_overrides(&named(REGTEST_CONF_HARDFORKS), &named(REGTEST_CONF_RULES))
             .unwrap();
-        assert_eq!(unmodelled, ["orchid060", "tbd1000"]);
+        assert_eq!(unmodelled, ["tbd1000"]);
         let built_in = RskHardforkConfig::rskj_regtest();
         for &(rule, active, _, _) in SCHEDULE {
             for n in [0, 1, 2, LATER] {

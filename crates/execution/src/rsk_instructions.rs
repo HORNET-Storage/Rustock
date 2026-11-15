@@ -70,6 +70,10 @@ thread_local! {
     /// nothing with `keccak256("")` (`getCodeHashStandard`), or with 0 as
     /// before it (`getCodeHashNonStandard`). Set by `install`.
     static EXTCODEHASH_STANDARD: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    /// RSKIP150's absence: rskj adds a call's stipend to the gas it asks for
+    /// as a plain `long`, which a request near 2^63 takes below zero (see
+    /// `rsk_callee_gas`). Set by `install`.
+    static STIPEND_SUM_WRAPS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     /// The block's real miner address (`header.getCoinbase()`), pushed by the
     /// COINBASE opcode. rustock sets `block.beneficiary = REMASC_ADDR` so revm
     /// routes gas fees to REMASC; that would make COINBASE return REMASC, but
@@ -170,6 +174,12 @@ pub fn set_transaction_index(index: u64) {
 /// `dupn_swapn_txindex_enabled` is RSKIP191's absence: before iris300 rskj
 /// runs RSK's own DUPN, SWAPN and TXINDEX.
 ///
+/// `staticcall_takes_value` is RSKIP103's absence: before orchid060 rskj's
+/// STATICCALL takes a value as CALL does ([`rsk_static_call_with_value`]).
+///
+/// `stipend_sum_wraps` is RSKIP150's absence: before twoToThree rskj adds a
+/// call's stipend to the gas it asks for as a plain `long` (`rsk_callee_gas`).
+///
 /// `block` is what the block's header gives COINBASE, GASLIMIT and BASEFEE.
 pub fn install<WIRE, HOST>(
     instructions: &mut EthInstructions<WIRE, HOST>,
@@ -179,6 +189,8 @@ pub fn install<WIRE, HOST>(
     push0_enabled: bool,
     basefee_enabled: bool,
     staticcall_enabled: bool,
+    staticcall_takes_value: bool,
+    stipend_sum_wraps: bool,
     transient_storage_enabled: bool,
     mcopy_enabled: bool,
     dupn_swapn_txindex_enabled: bool,
@@ -356,18 +368,22 @@ pub fn install<WIRE, HOST>(
         opcode::DELEGATECALL,
         Instruction::new(rsk_delegate_call::<WIRE, HOST>, CALL_STATIC_GAS),
     );
+    STIPEND_SUM_WRAPS.with(|w| w.set(stipend_sum_wraps));
     // RSKIP91 (orchid, mainnet #729,000) introduced STATICCALL. rskj's
     // `VM.java` OP_STATICCALL throws `invalidOpCode` (consuming the frame's
     // gas) while RSKIP91 is inactive; rustock maps Genesis to BYZANTIUM, where
     // revm already provides the opcode, so before orchid it must be replaced
     // with the invalid-opcode handler -- same pattern as EXTCODEHASH before
-    // papyrus.
+    // papyrus. Until RSKIP103 (orchid060, mainnet #1,052,700) it takes a
+    // value.
     instructions.insert_instruction(
         opcode::STATICCALL,
-        if staticcall_enabled {
-            Instruction::new(rsk_static_call::<WIRE, HOST>, CALL_STATIC_GAS)
-        } else {
+        if !staticcall_enabled {
             Instruction::new(invalid_opcode::<WIRE, HOST>, 0)
+        } else if staticcall_takes_value {
+            Instruction::new(rsk_static_call_with_value::<WIRE, HOST>, CALL_STATIC_GAS)
+        } else {
+            Instruction::new(rsk_static_call::<WIRE, HOST>, CALL_STATIC_GAS)
         },
     );
     instructions.insert_instruction(
@@ -422,6 +438,7 @@ pub fn install<WIRE, HOST>(
         PUSH0_ENABLED.with(|f| f.set(push0_enabled));
         BASEFEE_ENABLED.with(|f| f.set(basefee_enabled));
         STATICCALL_ENABLED.with(|f| f.set(staticcall_enabled));
+        STATICCALL_TAKES_VALUE.with(|f| f.set(staticcall_takes_value));
         DUPN_SWAPN_TXINDEX_ENABLED.with(|f| f.set(dupn_swapn_txindex_enabled));
         let default_table = revm::interpreter::instructions::instruction_table_gas_changes_spec::<
             WIRE,
@@ -1105,6 +1122,8 @@ thread_local! {
     static BASEFEE_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     /// RSKIP91 flag for the all-ops tracer's STATICCALL dispatch.
     static STATICCALL_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    /// RSKIP103's absence, for the all-ops tracer's STATICCALL dispatch.
+    static STATICCALL_TAKES_VALUE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
     /// RSKIP191 flag for the all-ops tracer's DUPN/SWAPN/TXINDEX dispatch.
     static DUPN_SWAPN_TXINDEX_ENABLED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
@@ -1143,10 +1162,12 @@ fn traced_all<
         opcode::CALLCODE => rsk_call_code(context),
         opcode::DELEGATECALL => rsk_delegate_call(context),
         opcode::STATICCALL => {
-            if STATICCALL_ENABLED.with(|f| f.get()) {
-                rsk_static_call(context)
-            } else {
+            if !STATICCALL_ENABLED.with(|f| f.get()) {
                 invalid_opcode(context)
+            } else if STATICCALL_TAKES_VALUE.with(|f| f.get()) {
+                rsk_static_call_with_value(context)
+            } else {
+                rsk_static_call(context)
             }
         }
         opcode::SELFDESTRUCT => rsk_selfdestruct(context),
@@ -1256,6 +1277,13 @@ fn rsk_call_memory_range<WIRE: InterpreterTypes>(
     Some(offset..offset.saturating_add(len))
 }
 
+/// Whether a call's stipend and the gas it asks for make a plain `long` sum,
+/// before RSKIP150 (see `STIPEND_SUM_WRAPS`).
+fn stipend_sum_wraps() -> bool {
+    assert_configured("STIPEND_SUM_WRAPS");
+    STIPEND_SUM_WRAPS.with(|w| w.get())
+}
+
 /// rskj `VM.getMessageCall` gas math, shared by the four call opcodes.
 ///
 /// Assumes the base costs (static 700, memory expansion, value transfer,
@@ -1280,6 +1308,19 @@ where
     if remaining < stipend {
         context.interpreter.halt_oog();
         return None;
+    }
+    // Before RSKIP150 rskj adds the stipend to the gas asked for, which
+    // `Program.limitToMaxLong` holds at 2^63 - 1, as a plain `long`
+    // (`VM.getMessageCall`): past 2^63 - 1 the sum goes below zero,
+    // `GasCost.add` throws for the negative callee gas, and the frame that
+    // calls fails with all its gas. From RSKIP150 the sum stops at 2^63 - 1,
+    // more than any frame has, so the `min` below gives what rskj gives.
+    if stipend > 0 && stipend_sum_wraps() {
+        let held = requested.min(i64::MAX as u64);
+        if held > i64::MAX as u64 - stipend {
+            context.interpreter.halt_oog();
+            return None;
+        }
     }
     let callee_gas = core::cmp::min(remaining, requested.saturating_add(stipend));
     if !context.interpreter.gas.record_cost(callee_gas) {
@@ -1659,6 +1700,55 @@ pub fn rsk_static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         ))));
 }
 
+/// STATICCALL as rskj runs it before RSKIP103 (orchid060, mainnet
+/// #1,052,700): `VM.calculateCallValue` takes a value off the stack for every
+/// call but DELEGATECALL, so STATICCALL takes seven arguments, as CALL does.
+/// A value that isn't zero pays `VT_CALL` and brings the stipend
+/// (`computeCallGas`, `calculateGetMinimumTransferGas`), and
+/// `Program.callToAddress` moves it to the callee, which runs static. Only
+/// CALL refuses a value inside a static call, and only CALL pays for an
+/// account it creates.
+pub fn rsk_static_call_with_value<WIRE: InterpreterTypes, H: Host + ?Sized>(
+    mut context: InstructionContext<'_, H, WIRE>,
+) {
+    let Some([local_gas_limit, to, value]) = context.interpreter.stack.popn() else {
+        context.interpreter.halt_underflow();
+        return;
+    };
+    let to = Address::from_word(B256::from(to));
+    let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
+
+    let Some((input, return_memory_offset)) =
+        rsk_memory_input_and_out_ranges(context.interpreter, context.host.gas_params())
+    else {
+        return;
+    };
+
+    let Some((gas_limit, bytecode, bytecode_hash)) =
+        rsk_call_gas_common(&mut context, to, local_gas_limit, value, false)
+    else {
+        return;
+    };
+
+    context
+        .interpreter
+        .bytecode
+        .set_action(InterpreterAction::NewFrame(FrameInput::Call(Box::new(
+            CallInputs {
+                input: CallInput::SharedBuffer(input),
+                gas_limit,
+                target_address: to,
+                caller: context.interpreter.input.target_address(),
+                bytecode_address: to,
+                known_bytecode: Some((bytecode_hash, bytecode)),
+                value: CallValue::Transfer(value),
+                scheme: CallScheme::StaticCall,
+                is_static: true,
+                return_memory_offset,
+            },
+        ))));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1835,6 +1925,8 @@ mod thread_affinity_tests {
                 false,
                 false,
                 true,
+                false,
+                false,
                 false,
                 false,
                 false,

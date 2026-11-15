@@ -198,11 +198,10 @@ rustock --network-id 30 --allow-chain-overrides \
 
 The overrides reach everything that reads the schedule: header decoding and
 hashing, difficulty, execution, REMASC and the Bridge. Names the node reads at
-one fixed height per chain (`bahamas`, `afterBridgeSync`, `hop401`) are
-accepted at that height only; `orchid060` and `tbd1000` are accepted and
-change nothing, and the node says so (`tbd1000` only turns on RSKIP-559,
-pegout sorting in the Bridge, which it does not implement). A node started
-this way must not follow the real network.
+one fixed height per chain (`bahamas`, `orchid060`, `hop401`) are accepted at
+that height only; `tbd1000` is accepted and changes nothing, and the node says
+so (it only turns on RSKIP-559, pegout sorting in the Bridge, which the node
+does not implement). A node started this way must not follow the real network.
 
 Blocks rskj exported with its `ExportBlocks` tool (`number,hash,td,rlp` per
 line, plain or gzipped) can then be imported from an empty data directory:
