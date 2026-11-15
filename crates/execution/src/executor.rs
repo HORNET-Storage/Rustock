@@ -11604,6 +11604,157 @@ mod tests {
         }
     }
 
+    /// rskj's code header (`Program.processAndSkipCodeHeader`, which
+    /// `Program.precompile` runs for every program it builds, on every
+    /// network from genesis, under no rule): code of four bytes or more that
+    /// starts with HEADER (0xFC) runs from byte 4 + code[3], the header's
+    /// length read unsigned, and its jump destinations are found from there,
+    /// so none lies in the header. Code whose header reaches its end fails
+    /// with all its gas, as rskj fails reading past it. The cases of rskj's
+    /// `VMTest.testVersioning_1` and `_2` and `testScriptVersion0` to `3`,
+    /// each made to return what it computes, then the jump destinations, a
+    /// contract's call to such code, and a creation whose init code has a
+    /// header.
+    #[test]
+    fn a_code_header_is_skipped_as_rskj_skips_it() {
+        // Any height: the header is no upgrade's.
+        const HEIGHT: u64 = 1;
+        let word = |value: u8| {
+            let mut word = vec![0u8; 32];
+            word[31] = value;
+            word
+        };
+        // `testVersioning_1`'s code after its header leaves 0x12 on the
+        // stack (0x1234 stored at 0x20, the word at 0x1F loaded), returned.
+        let tail: &[u8] = &[
+            0x61, 0x12, 0x34, 0x60, 0x20, 0x52, 0x60, 0x1f, 0x51, // VMTest's
+            0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3, // MSTORE at 0, RETURN 32
+        ];
+        let plain = run_contract(HEIGHT, tail);
+        assert!(plain.success);
+        assert_eq!(plain.output, word(0x12));
+        // testVersioning_1, and testVersioning_2's header of 0x80 = 128
+        // bytes, the length read unsigned. The header costs nothing.
+        let mut long = vec![0xfc, 0x81, 0x01, 0x80];
+        long.extend([0u8; 128]);
+        for header in [&[0xfc, 0x01, 0x01, 0x00][..], &long[..]] {
+            let ran = run_contract(HEIGHT, &[header, tail].concat());
+            assert!(ran.success, "a header of {} bytes", header.len());
+            assert_eq!(
+                ran.output,
+                plain.output,
+                "a header of {} bytes",
+                header.len()
+            );
+            assert_eq!(
+                ran.gas_used,
+                plain.gas_used,
+                "a header of {} bytes",
+                header.len()
+            );
+        }
+        // testScriptVersion3: ten more bytes of header, then STOP.
+        let mut stops = vec![0xfc, 0x01, 0x01, 0x0a];
+        stops.extend(1..=10u8);
+        stops.push(0x00);
+        let ran = run_contract(HEIGHT, &stops);
+        assert!(ran.success);
+        assert_eq!(ran.gas_used, run_contract(HEIGHT, &[0x00]).gas_used);
+        // Each of these fails with all its gas: HEADER with no header behind
+        // it (testScriptVersion0), HEADER after a header (testScriptVersion1
+        // and 2), and a header that reaches the code's end or passes it.
+        for code in [
+            &[0xfc][..],
+            &[0xfc, 0x00, 0x00, 0x00, 0xfc][..],
+            &[0xfc, 0x01, 0x01, 0x00, 0xfc][..],
+            &[0xfc, 0x00, 0x00, 0x00][..],
+            &[0xfc, 0x00, 0x00, 0x05, 0x00, 0x00][..],
+        ] {
+            let ran = run_contract(HEIGHT, code);
+            let hex = alloy_primitives::hex::encode(code);
+            assert!(!ran.success, "{hex}");
+            assert_eq!(ran.gas_used, 1_000_000, "{hex}");
+        }
+        // Jump destinations are found from the header's end: the PUSH32 that
+        // ends this header of one more byte doesn't hide the JUMPDEST at 8,
+        // as it would from byte 0 ...
+        let header: &[u8] = &[0xfc, 0x00, 0x00, 0x01, 0x7f];
+        let jump_to_8: &[u8] = &[0x60, 0x08, 0x56];
+        // At 8: JUMPDEST, then 42 returned.
+        let at_8: &[u8] = &[
+            0x5b, 0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ];
+        let ran = run_contract(HEIGHT, &[header, jump_to_8, at_8].concat());
+        assert!(ran.success);
+        assert_eq!(ran.output, word(0x2a));
+        // ... and a JUMPDEST in the header is none: this header's two more
+        // bytes are a JUMPDEST, at 4, and a STOP.
+        let header: &[u8] = &[0xfc, 0x00, 0x00, 0x02, 0x5b, 0x00];
+        let jump_to_4: &[u8] = &[0x60, 0x04, 0x56];
+        let ran = run_contract(HEIGHT, &[header, jump_to_4].concat());
+        assert!(!ran.success);
+        assert_eq!(ran.gas_used, 1_000_000);
+
+        // A contract's call to code with a header runs it the same way: the
+        // caller is given 0x12 and a success. It CALLs with 100,000 gas,
+        // no value and no data, for 32 bytes at 0, stores the CALL's result
+        // at 0x20, and returns the two words.
+        let sender = Address::repeat_byte(0xC1);
+        let caller = Address::repeat_byte(0xC2);
+        let callee = Address::repeat_byte(0xC3);
+        let mut calls: Vec<u8> = vec![
+            0x60, 0x20, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x73,
+        ];
+        calls.extend_from_slice(callee.as_slice());
+        calls.extend([
+            0x62, 0x01, 0x86, 0xa0, 0xf1, 0x60, 0x20, 0x52, 0x60, 0x40, 0x60, 0x00, 0xf3,
+        ]);
+        let store = Arc::new(MemoryTrieStore::new());
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, one_rbtc);
+        let root = put_account_with_code(&root, store.as_ref(), &caller, 1, U256::ZERO, &calls);
+        let headed: Vec<u8> = [&[0xfc, 0x01, 0x01, 0x00][..], tail].concat();
+        let root = put_account_with_code(&root, store.as_ref(), &callee, 1, U256::ZERO, &headed);
+        // A creation whose init code has a header deploys what the same
+        // init code deploys without one. The header's four bytes are data
+        // the transaction pays for, 68 gas for the 0xFC and 4 for each zero
+        // before RSKIP400, and they cost nothing more.
+        let init: &[u8] = &[0x60, 0x2a, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let create = |nonce: u64, input: Vec<u8>| rustock_core::Transaction {
+            to: Bytes::new(),
+            input: Bytes::from(input),
+            ..bare_call(nonce, Address::ZERO)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let executor = RskExecutor::new(
+            RskHardforkConfig::mainnet(),
+            Arc::new(BlockStore::open(dir.path()).unwrap()),
+        );
+        let block = executor
+            .execute_block(
+                &dummy_header(HEIGHT),
+                &[
+                    (bare_call(0, caller), sender),
+                    (create(1, init.to_vec()), sender),
+                    (
+                        create(2, [&[0xfc, 0x00, 0x00, 0x00][..], init].concat()),
+                        sender,
+                    ),
+                ],
+                &root,
+                store,
+            )
+            .unwrap();
+        let [called, created, created_with_header] = &block.tx_results[..] else {
+            panic!("{} results", block.tx_results.len());
+        };
+        assert!(called.success);
+        assert_eq!(called.output, [word(0x12), word(1)].concat());
+        assert!(created.success && created.created_address.is_some());
+        assert!(created_with_header.success && created_with_header.created_address.is_some());
+        assert_eq!(created_with_header.gas_used, created.gas_used + 68 + 3 * 4);
+    }
+
     /// The byte after DUPN or SWAPN never runs, rskj's `doDUPN` and `doSWAPN`
     /// calling `program.step()` twice, though a jump may land on it: rskj's
     /// jump analysis, like revm's, skips only PUSH data. Where the second

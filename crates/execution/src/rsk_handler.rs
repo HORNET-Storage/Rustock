@@ -833,6 +833,7 @@ where
         // Top-level CREATE transaction: rskj's TransactionExecutor.create never
         // bumps the nonce (even post-RSKIP125), so it stays 0.
         set_created_contract_nonce(evm, 0);
+        skip_code_header(evm);
         self.open_frame(evm, false);
         evm.ctx().chain_mut().internal_txs.enter(None);
         // A local call whose gas limit can't pay its intrinsic cost (see
@@ -952,6 +953,7 @@ where
                             // created contract's nonce to 1; before, it is 0.
                             let nonce = u64::from(self.rskip125_active);
                             set_created_contract_nonce(evm, nonce);
+                            skip_code_header(evm);
                             self.open_frame(evm, creates);
                             // The program runs as that internal transaction,
                             // which carries the code it runs.
@@ -1781,6 +1783,54 @@ where
     if let Ok(mut acc) = evm.ctx().journal_mut().load_account_mut(created_address) {
         acc.set_nonce(nonce);
     }
+}
+
+/// rskj's code header (`Program.processAndSkipCodeHeader`, which
+/// `Program.precompile` runs for every program it builds, from genesis and
+/// under no rule): code of four bytes or more whose first is HEADER (0xFC)
+/// starts at byte 4 + code[3], and its jump destinations are found from
+/// there (`computeJumpDests(i)`), so none lies in the header. rskj reads the
+/// header's two versions too, but no opcode other than HEADER asks for one,
+/// and HEADER is invalid under any. Code whose header reaches its end is left
+/// to fail at the HEADER it starts with: rskj reads past `ops` there and
+/// fails the program with all its gas, as revm fails an invalid opcode.
+/// Applied to the top frame as it opens, before it runs or anything halts it.
+fn skip_code_header<EVM>(evm: &mut EVM)
+where
+    EVM: EvmTr<Frame = EthFrame<EthInterpreter>>,
+{
+    use revm::bytecode::{Bytecode, JumpTable};
+    use revm::interpreter::interpreter::ExtBytecode;
+    use revm::interpreter::interpreter_types::{Jumps, LoopControl};
+    let bytecode = &mut evm.frame_stack().get().interpreter.bytecode;
+    let code = bytecode.original_byte_slice();
+    if bytecode.is_end() || !bytecode.is_legacy() || code.len() < 4 || code[0] != 0xfc {
+        return;
+    }
+    let start = 4 + usize::from(code[3]);
+    if start >= code.len() {
+        return;
+    }
+    // `computeJumpDests` from the header's end: a JUMPDEST is a destination,
+    // and a PUSH's data is stepped over.
+    let mut jumps = vec![0u8; code.len().div_ceil(8)];
+    let mut at = start;
+    while at < code.len() {
+        match code[at] {
+            0x5b => jumps[at / 8] |= 1 << (at % 8),
+            push @ 0x60..=0x7f => at += usize::from(push - 0x5f),
+            _ => {}
+        }
+        at += 1;
+    }
+    let skipped = Bytecode::new_analyzed(
+        bytecode.bytecode().clone(),
+        code.len(),
+        JumpTable::from_slice(&jumps, code.len()),
+    );
+    let hash = bytecode.hash();
+    *bytecode = ExtBytecode::new_with_optional_hash(skipped, hash);
+    bytecode.absolute_jump(start);
 }
 
 /// Inspection support, for `debug_traceTransaction`, the `trace_*` methods,

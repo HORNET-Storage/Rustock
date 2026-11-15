@@ -16,9 +16,11 @@ to match the spec would *introduce* a fork.
 
 Re-checking the 40 medium/low findings inverted the severity column in both
 directions (see [audit-triage-medium-low.md](../audit-triage-medium-low.md)):
-13 of 40 were stale spec text where acting on the recommendation would have
-forked, while three findings rated LOW were real EVM divergences. The same
-inversion is expected in the remainder — and the first pass found it again.
+12 of 40 were stale spec text where acting on the recommendation would have
+forked, while three findings rated LOW were real EVM divergences. A thirteenth
+first filed as stale spec, FRCR-477, is a real EVM divergence too: rskj reads
+RSKIP-50's code header. The same inversion is expected in the remainder — and
+the first pass found it again.
 
 ## Verdict vocabulary
 
