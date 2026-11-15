@@ -6,7 +6,7 @@ pub mod flat_migrate;
 pub mod counting_trie_store;
 pub mod rskj_import;
 pub use position::{
-    BlockRef, Cursor, LineageBreak, Transition, Validated, verify_local_coherence,
+    BlockRef, Cursor, ExecutionSwitch, LineageBreak, Transition, Validated, verify_local_coherence,
 };
 pub use trie_store::RocksDbTrieStore;
 pub mod trie_tool;
@@ -189,6 +189,13 @@ pub struct BlockStore {
     /// node has not executed it past its executed head. See
     /// [`BlockStore::deferred_head`].
     deferred_head: std::sync::Mutex<Option<B256>>,
+    /// Held while a [`Transition`] is applied, and while a move of the head
+    /// is weighed against the executed head before it: a batch records
+    /// execution on a thread of its own meanwhile. See [`BlockStore::apply`].
+    transitions: std::sync::Mutex<()>,
+    /// The switches of execution that changes of head made, for the calls
+    /// that made them to take up. See [`BlockStore::switch_mark`].
+    switches: std::sync::Mutex<position::Switches>,
 }
 
 /// Says whether this node executed the block `hash` (whose header is the
@@ -378,6 +385,8 @@ impl BlockStore {
             activations: None,
             executed_check: std::sync::RwLock::new(None),
             deferred_head: std::sync::Mutex::new(None),
+            transitions: std::sync::Mutex::new(()),
+            switches: std::sync::Mutex::new(position::Switches::default()),
         })
     }
 
@@ -424,6 +433,8 @@ impl BlockStore {
             activations: None,
             executed_check: std::sync::RwLock::new(None),
             deferred_head: std::sync::Mutex::new(None),
+            transitions: std::sync::Mutex::new(()),
+            switches: std::sync::Mutex::new(position::Switches::default()),
         })
     }
 
@@ -1026,6 +1037,11 @@ impl BlockStore {
         // work and their bodies withheld would hold the node at the fork. So
         // a move that would leave the executed head off the chain waits until
         // this node has executed the new branch past it.
+        //
+        // Weighed and made under one lock: a batch recording execution in
+        // between would leave the weighing about an executed head that has
+        // moved on.
+        let held = self.transitions.lock().unwrap_or_else(|e| e.into_inner());
         if self.adoption_waits_for_execution(&proved)? {
             debug!(
                 target: "rustock::storage",
@@ -1047,7 +1063,8 @@ impl BlockStore {
             Transition::Adopt { head: proved }
         };
 
-        self.apply(&transition)?;
+        self.apply_holding(&held, &transition)?;
+        drop(held);
         let mut deferred = self.deferred_head.lock().unwrap_or_else(|e| e.into_inner());
         if *deferred == Some(new_head) {
             *deferred = None;

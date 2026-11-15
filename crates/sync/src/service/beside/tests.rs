@@ -5,7 +5,7 @@
 //! branch was adopted on its headers alone, and execution was pulled back to
 //! the fork point to run the new branch again on a later tick.
 
-use super::BesideFailure;
+use super::{Beside, BesideFailure};
 use crate::manager::SyncManager;
 use crate::service::SyncService;
 use crate::state::SyncState;
@@ -532,4 +532,101 @@ async fn a_block_whose_ancestry_was_never_downloaded_has_it_asked_for_and_nothin
             );
         }
     }
+}
+
+/// A batch executes on a thread of its own and records its progress as it
+/// goes, moving the executed head while the service stores headers. That is
+/// no switch, and taking it for one dropped what was queued, fetched again
+/// the bodies the batch held, and told the miner of a new best block: syncing
+/// mainnet from block 0 halted every few thousand blocks on it, on blocks the
+/// batch had run.
+#[tokio::test]
+async fn execution_recording_its_progress_is_not_taken_for_a_switch() {
+    let mut node = node().await;
+    let chain = node.chain(&[1, 1, 1, 1, 1, 1]);
+    node.store
+        .set_exec_head(chain[2].hash(), node.root)
+        .unwrap();
+    for header in &chain[3..] {
+        node.store.put_body(header.hash(), &[], &[]).unwrap();
+    }
+    let queued = (chain[5].hash(), chain[5].clone(), Vec::new(), Vec::new());
+    node.service.follow_buffer.insert(5, queued);
+    node.service.last_body_height = 6;
+    node.announced();
+
+    let before = node.store.switch_mark();
+    // The batch records #3 and #4 meanwhile.
+    for header in &chain[3..=4] {
+        assert!(crate::service::record_execution(
+            &node.store,
+            header.hash(),
+            node.root
+        ));
+    }
+    node.service.take_up_moved_execution(before);
+
+    assert_eq!(node.executed_head(), Some(chain[4].hash()));
+    assert_eq!(
+        node.announced(),
+        Vec::new(),
+        "blocks the batch ran were announced as a branch taken up"
+    );
+    assert!(
+        node.best.lock().unwrap().is_empty(),
+        "the miner was told of a switch"
+    );
+    assert!(
+        node.service.follow_buffer.contains_key(&5),
+        "what was queued was dropped"
+    );
+    assert_eq!(
+        node.service.last_body_height, 6,
+        "bodies held already are fetched again"
+    );
+}
+
+/// A switch the store makes while a batch runs is taken up from the block the
+/// batch had got to, not from where execution stood when the call began: the
+/// block the batch ran on the branch left is retracted, before the branch
+/// taken up is announced.
+#[tokio::test]
+async fn a_switch_made_while_a_batch_runs_is_taken_up_from_where_the_batch_had_got() {
+    let mut node = node().await;
+    let chain = node.chain(&[1, 1, 1]); // totals 2, 3 and 4
+    let (a1, a2) = (chain[1].hash(), chain[2].hash());
+    node.store.set_exec_head(a1, node.root).unwrap();
+    let b2 = node.header(2, a1, 1, 0xB0); // total 3
+    let b3 = node.header(3, b2.hash(), 2, 0xB0); // total 5
+    node.new_block(&b2).await;
+    assert_eq!(node.runs(b2.hash()), 1, "#2' is executed beside the chain");
+    node.announced();
+
+    let before = node.store.switch_mark();
+    // The batch records #2; then #3' comes, is executed beside the chain and
+    // outweighs it, and the store switches to its branch.
+    assert!(crate::service::record_execution(&node.store, a2, node.root));
+    let head = node.head();
+    let head_td = node.store.total_difficulty(head.unwrap()).unwrap().unwrap();
+    node.store
+        .store_headers_batch(&[(&b3, U256::from(5))], head, head_td)
+        .unwrap();
+    assert_eq!(
+        node.store.deferred_head(),
+        Some(b3.hash()),
+        "held until it is executed"
+    );
+    node.store.put_body(b3.hash(), &[], &[]).unwrap();
+    assert_eq!(node.service.execute_beside(b3.hash()), Beside::Executed);
+    node.store.retry_deferred_head().unwrap();
+    assert_eq!(node.executed_head(), Some(b3.hash()));
+    node.service.take_up_moved_execution(before);
+
+    assert_eq!(
+        node.announced(),
+        vec![(a2, true), (b2.hash(), false), (b3.hash(), false)],
+        "the block the batch ran on the branch left is retracted, then the branch taken up is \
+         announced"
+    );
+    assert_eq!(*node.best.lock().unwrap(), vec![b3.hash()]);
 }

@@ -369,20 +369,20 @@ impl SyncService {
         if self.beside_fn.is_none() || self.executing.is_some() {
             return;
         }
-        let before = self.manager.store.exec_head().ok().flatten();
+        let before = self.manager.store.switch_mark();
         let executed = self.execute_beside_with_descendants(hash);
         self.weigh_after_executing(&executed);
         self.follow_on(before).await;
         self.advance_deferred_branch().await;
     }
 
-    /// Take up a switch the store made since `before`, and, following the
-    /// tip, run at once the blocks of the chain just above the executed head
-    /// whose bodies are here, rather than on the next tick: a block executed
-    /// beside the chain that the chain has since taken up, on top of the
-    /// executed head, is adopted there without running again
-    /// (`fast_forward_state`).
-    async fn follow_on(&mut self, before: Option<(B256, B256)>) {
+    /// Take up a switch the store made since `before`, a mark of
+    /// [`BlockStore::switch_mark`], and, following the tip, run at once the
+    /// blocks of the chain just above the executed head whose bodies are
+    /// here, rather than on the next tick: a block executed beside the chain
+    /// that the chain has since taken up, on top of the executed head, is
+    /// adopted there without running again (`fast_forward_state`).
+    async fn follow_on(&mut self, before: u64) {
         self.take_up_moved_execution(before);
         if matches!(self.state, SyncState::Following) {
             self.refill_follow_buffer_from_store();
@@ -496,7 +496,7 @@ impl SyncService {
         {
             self.deferred_watch = Some((tip, Instant::now()));
         }
-        let before = self.manager.store.exec_head().ok().flatten();
+        let before = self.manager.store.switch_mark();
         match self.work_on_branch(tip).await {
             Some(executed) => {
                 if !executed.is_empty() {
@@ -563,7 +563,7 @@ impl SyncService {
                 self.manager.note_block_holder(*tip, peer);
             }
         }
-        let before = store.exec_head().ok().flatten();
+        let before = store.switch_mark();
         let mut executed = Vec::new();
         for tip in tips {
             if let Some(done) = self.work_on_branch(tip).await {
@@ -765,8 +765,16 @@ impl SyncService {
         true
     }
 
-    /// Take up a switch the store made: the executed head moved from `before`
-    /// to a block of another branch, executed already, with nothing run again.
+    /// Take up the switches the store made since `mark`
+    /// ([`BlockStore::switch_mark`]): the executed head moved to a block of
+    /// another branch, executed already, with nothing run again.
+    ///
+    /// Only a switch the store made counts, taken from the executed head it
+    /// found. The executed head moves too when execution records its progress,
+    /// and a batch does that on a thread of its own while this call runs.
+    /// Taking that for a switch dropped what was queued, fetched again bodies
+    /// already held, and announced blocks the batch had run: a node syncing
+    /// mainnet from block 0 halted every few thousand blocks on it.
     ///
     /// What executing those blocks one by one would have done is done here:
     /// the in-memory root is the new executed head's committed state; what
@@ -775,12 +783,12 @@ impl SyncService {
     /// rskj's logs emitter does; the index kept by height follows; the pool
     /// loses the transactions the new branch mined; and the miner is told of
     /// its new best block, as rskj's `onBestBlock` tells it.
-    pub(crate) fn take_up_moved_execution(&mut self, before: Option<(B256, B256)>) {
+    pub(crate) fn take_up_moved_execution(&mut self, mark: u64) {
         let store = self.manager.store.clone();
-        let after = store.exec_head().ok().flatten();
-        let (Some((old, _)), Some((new, new_root))) = (before, after) else {
+        let Some(switch) = store.take_switches_since(mark) else {
             return;
         };
+        let (old, new, new_root) = (switch.from, switch.to, switch.state_root);
         if old == new {
             return;
         }

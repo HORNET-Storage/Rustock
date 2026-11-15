@@ -3995,7 +3995,7 @@ impl SyncService {
 
                 // Process all consecutive ready chunks
                 let ready = tracker.drain_ready();
-                let executed_before = self.manager.store.exec_head().ok().flatten();
+                let executed_before = self.manager.store.switch_mark();
                 for (_idx, chunk_peer, chunk_headers) in &ready {
                     // A chunk that does not connect is a failure, not
                     // something to carry on past. Chunks are released in
@@ -4113,7 +4113,7 @@ impl SyncService {
                 self.state = other;
                 let before_height = self.our_head_number();
                 let before_hash = self.manager.store.head().ok().flatten();
-                let executed_before = self.manager.store.exec_head().ok().flatten();
+                let executed_before = self.manager.store.switch_mark();
                 let _ = self.manager.handle_headers_response(headers.clone(), peer);
                 self.take_up_moved_execution(executed_before);
                 if is_following {
@@ -4379,7 +4379,7 @@ impl SyncService {
         self.manager.note_whole_block_difficulty(&header, &ommers);
         let before_height = self.our_head_number();
         let before_hash = self.manager.store.head().ok().flatten();
-        let executed_before = self.manager.store.exec_head().ok().flatten();
+        let executed_before = self.manager.store.switch_mark();
         match self
             .manager
             .handle_headers_response(vec![header.clone()], peer)

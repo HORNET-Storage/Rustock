@@ -248,6 +248,37 @@ impl Transition {
     }
 }
 
+/// A move of the executed head that a change of head made: execution taken
+/// off a block the new chain leaves out, or that stands above its new head,
+/// to a block of the new chain (see `stage_execution_after_reorg`).
+///
+/// Execution recording its own progress is not one. A batch does that on a
+/// thread of its own while the sync service stores headers, so the executed
+/// head read before and after a call can differ with no switch at all. The
+/// switch is what the store records here, from the executed head it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionSwitch {
+    /// The executed head the change of head found.
+    pub from: B256,
+    /// Where it put it.
+    pub to: B256,
+    /// The state root recorded with `to`.
+    pub state_root: B256,
+}
+
+/// How many switches are kept for the calls that made them to take up. A
+/// call makes a few at most: one for each block it weighs again.
+const SWITCHES_KEPT: usize = 1024;
+
+/// The switches changes of head made, numbered, the latest kept.
+#[derive(Debug, Default)]
+pub(crate) struct Switches {
+    /// The number the next switch gets.
+    next: u64,
+    /// The latest, oldest first.
+    kept: std::collections::VecDeque<(u64, ExecutionSwitch)>,
+}
+
 impl BlockStore {
     /// Read all three position keys together.
     ///
@@ -294,19 +325,36 @@ impl BlockStore {
     /// `put`, which is precisely the window stall 6 lived in -- except that it
     /// did not even need a crash to get there, because the two calls were made
     /// from different places.
+    ///
+    /// And one at a time. A batch records execution on a thread of its own
+    /// while the sync service moves the head, and each reads the executed head
+    /// it changes: a move of the head that read it just before the batch's
+    /// record landed would leave execution on a block the new chain leaves
+    /// out, and record the switch from the wrong block.
     pub fn apply(&self, transition: &Transition) -> Result<Cursor> {
+        let held = self.transitions.lock().unwrap_or_else(|e| e.into_inner());
+        self.apply_holding(&held, transition)
+    }
+
+    /// [`Self::apply`], for a caller that holds the lock on transitions
+    /// already: one that weighs a move against the executed head first.
+    pub(crate) fn apply_holding(
+        &self,
+        _held: &std::sync::MutexGuard<'_, ()>,
+        transition: &Transition,
+    ) -> Result<Cursor> {
         let cf_numbers = self.cf(CF_NUMBERS)?;
         let mut batch = WriteBatch::default();
         let before = self.cursor()?;
 
-        match transition {
+        let switch = match transition {
             Transition::Adopt { head } => {
                 for (number, hash) in &head.lineage {
                     batch.put_cf(cf_numbers, number.to_be_bytes(), hash.as_slice());
                 }
                 self.stage_drop_above(&mut batch, cf_numbers, head.number())?;
                 batch.put(KEY_HEAD, head.hash().as_slice());
-                self.stage_execution_after_reorg(&mut batch, before.as_ref(), head)?;
+                self.stage_execution_after_reorg(&mut batch, before.as_ref(), head)?
             }
             Transition::Retreat { to } => {
                 for (number, hash) in &to.lineage {
@@ -314,7 +362,7 @@ impl BlockStore {
                 }
                 self.stage_drop_above(&mut batch, cf_numbers, to.number())?;
                 batch.put(KEY_HEAD, to.hash().as_slice());
-                self.stage_execution_after_reorg(&mut batch, before.as_ref(), to)?;
+                self.stage_execution_after_reorg(&mut batch, before.as_ref(), to)?
             }
             Transition::Executed { at, state_root } => {
                 // `Validated` proves lineage, not canonicity: a fork block is
@@ -345,15 +393,59 @@ impl BlockStore {
                 buf.extend_from_slice(at.hash().as_slice());
                 buf.extend_from_slice(state_root.as_slice());
                 batch.put(KEY_EXEC_HEAD, &buf);
+                None
             }
-        }
+        };
 
         self.db
             .write(batch)
             .with_context(|| format!("applying transition: {}", transition.describe()))?;
+        if let Some(switch) = switch {
+            self.note_switch(switch);
+        }
 
         self.cursor()?
             .context("position is unreadable immediately after applying a transition")
+    }
+
+    /// A mark to take up switches of execution from:
+    /// [`Self::take_switches_since`] returns those made after it.
+    pub fn switch_mark(&self) -> u64 {
+        self.switches.lock().unwrap_or_else(|e| e.into_inner()).next
+    }
+
+    /// The switches of execution changes of head made since `mark`, as one:
+    /// from the executed head the first found to where the last put it.
+    /// `None` when there were none, though the executed head may have moved all
+    /// the same, by execution recording its progress, which is no switch. Each
+    /// is returned once.
+    pub fn take_switches_since(&self, mark: u64) -> Option<ExecutionSwitch> {
+        let mut switches = self.switches.lock().unwrap_or_else(|e| e.into_inner());
+        let mut taken: Option<ExecutionSwitch> = None;
+        switches.kept.retain(|&(number, switch)| {
+            if number < mark {
+                return true;
+            }
+            taken = Some(match taken {
+                Some(first) => ExecutionSwitch {
+                    from: first.from,
+                    ..switch
+                },
+                None => switch,
+            });
+            false
+        });
+        taken
+    }
+
+    fn note_switch(&self, switch: ExecutionSwitch) {
+        let mut switches = self.switches.lock().unwrap_or_else(|e| e.into_inner());
+        let number = switches.next;
+        switches.next += 1;
+        if switches.kept.len() == SWITCHES_KEPT {
+            switches.kept.pop_front();
+        }
+        switches.kept.push_back((number, switch));
     }
 
     /// Bring the executed head back with the chain when adopting or retreating
@@ -388,13 +480,17 @@ impl BlockStore {
     /// The state root comes from the target header, which post-RSKIP126 is the
     /// committed unitrie root -- the same source the reorg path has always
     /// used.
+    ///
+    /// Returns the switch it stages, when it moves execution.
     fn stage_execution_after_reorg(
         &self,
         batch: &mut WriteBatch,
         before: Option<&Cursor>,
         new_head: &Validated,
-    ) -> Result<()> {
-        let Some(before) = before else { return Ok(()) };
+    ) -> Result<Option<ExecutionSwitch>> {
+        let Some(before) = before else {
+            return Ok(None);
+        };
         // Nothing executed is nothing to bring back. Without a recorded
         // executed head, `cursor` reads execution as the head, and taken at
         // its word that stand-in is above any retreat -- so the rollback below
@@ -405,7 +501,7 @@ impl BlockStore {
         // could not clear that either, because snapshot sync starts only on a
         // node that has executed nothing.
         if self.exec_head()?.is_none() {
-            return Ok(());
+            return Ok(None);
         }
         let executed = before.executed;
 
@@ -421,7 +517,7 @@ impl BlockStore {
         let orphaned = canonical_at_exec != Some(executed.hash);
         let above_head = executed.number > new_head.number();
         if !orphaned && !above_head {
-            return Ok(());
+            return Ok(None);
         }
 
         // The fork point: just below the lowest height this transition
@@ -439,7 +535,7 @@ impl BlockStore {
         // there would claim a state never computed. That repair belongs to the
         // sync layer, which can see what state is held (I5).
         if target_number >= executed.number {
-            return Ok(());
+            return Ok(None);
         }
 
         // Resolve the target on the chain as it will be after this batch.
@@ -472,7 +568,11 @@ impl BlockStore {
         buf.extend_from_slice(target_hash.as_slice());
         buf.extend_from_slice(target.state_root.as_slice());
         batch.put(KEY_EXEC_HEAD, &buf);
-        Ok(())
+        Ok(Some(ExecutionSwitch {
+            from: executed.hash,
+            to: target_hash,
+            state_root: target.state_root,
+        }))
     }
 
     /// The highest block of `lineage` above height `above`, and not above
@@ -1136,6 +1236,57 @@ mod tests {
             store.exec_head().unwrap().map(|(h, _)| h),
             Some(branch[3].0.hash()),
             "execution went back to the fork point, to run again blocks it ran already"
+        );
+    }
+
+    /// A change of head that takes execution off its branch is recorded as a
+    /// switch, from the executed head it found; execution recording its own
+    /// progress is no switch. A batch records its progress on a thread of its
+    /// own while the sync service stores headers, and the service takes up
+    /// the switches and nothing else.
+    #[test]
+    fn only_a_change_of_head_that_moves_execution_is_a_switch() {
+        let (store, _d, hs) = chain(10);
+        let executed = executed_set(&store, &hs);
+        store.set_exec_head(hs[7].hash(), B256::ZERO).unwrap();
+
+        let mark = store.switch_mark();
+        for h in &hs[8..=9] {
+            let at = Validated::prove(&store, h.hash()).unwrap();
+            store
+                .apply(&Transition::Executed {
+                    at,
+                    state_root: B256::ZERO,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            store.take_switches_since(mark),
+            None,
+            "execution recording its progress was taken for a switch"
+        );
+
+        // A branch off #7, executed as it came, outweighs the chain.
+        let mark = store.switch_mark();
+        let branch = branch_from_seven(&hs);
+        executed
+            .lock()
+            .unwrap()
+            .extend(branch[..4].iter().map(|(h, _)| h.hash()));
+        ingest(&store, &branch);
+        assert_eq!(
+            store.take_switches_since(mark),
+            Some(ExecutionSwitch {
+                from: hs[9].hash(),
+                to: branch[3].0.hash(),
+                state_root: branch[3].0.state_root,
+            }),
+            "the switch is from the block execution had got to"
+        );
+        assert_eq!(
+            store.take_switches_since(mark),
+            None,
+            "a switch is taken up once"
         );
     }
 

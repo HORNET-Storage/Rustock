@@ -895,7 +895,10 @@ not canonical (`service::beside`, `BlockProcessor::process_beside`) -- fetches
 the bodies and missing headers of a branch held back, gives one up after 60 s
 without progress, and takes a switch up in the call that makes it: the
 in-memory root, the miner's best block, subscribers, the transaction pool, the
-gas price and the Bridge index. Whether this node executed a block is the
+gas price and the Bridge index. The store records each switch it makes, from
+the executed head it found (`ExecutionSwitch`), and only those are taken up: a
+batch records its own progress on a thread of its own, which moves the
+executed head with no switch at all. Whether this node executed a block is the
 block's own receipts hashed against its header, with its state root resolving
 in the trie, so nothing durable names a losing branch's state and the epoch
 collector is unchanged ([`follow-mode-rskj-vs-rustock.md`](./follow-mode-rskj-vs-rustock.md)
@@ -907,11 +910,16 @@ long as the collector does, and would run such a branch again if the chain
 turned to it after that, tens of thousands of blocks later, past any reorg this
 node follows.
 
-Tests: `service::beside::tests`, eight, each failing with the new behaviour
-switched off; and the store's half in `crates/storage/src/position.rs`:
+Tests: `service::beside::tests`: eight, each failing with the new behaviour
+switched off, and two failing on its first version, which took any move of the
+executed head for a switch
+(`execution_recording_its_progress_is_not_taken_for_a_switch`,
+`a_switch_made_while_a_batch_runs_is_taken_up_from_where_the_batch_had_got`);
+and the store's half in `crates/storage/src/position.rs`:
 `a_heavier_branch_waits_until_it_is_executed_past_the_executed_head`,
 `a_switch_takes_execution_to_the_executed_tip_of_the_new_branch`,
 `a_node_without_the_check_adopts_on_headers_as_before`,
-`a_waiting_branch_the_chain_outgrows_is_forgotten` and
-`a_block_weighed_again_takes_the_head_once_it_outweighs_it`.
+`a_waiting_branch_the_chain_outgrows_is_forgotten`,
+`a_block_weighed_again_takes_the_head_once_it_outweighs_it` and
+`only_a_change_of_head_that_moves_execution_is_a_switch`.
 
