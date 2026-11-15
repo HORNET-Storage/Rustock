@@ -762,25 +762,65 @@ impl RskPrecompileProvider {
         }
     }
 
-    /// Whether this is a transaction's own call to BLAKE2F with no data before
-    /// RSKIP552 (vetiver900), whose block rskj can't process. rskj reads empty
-    /// data as null (`RLPItem.getRLPData`), and BLAKE2F's `getGasForData`
-    /// reads its length: a NullPointerException, which
-    /// `TransactionExecutor.call` doesn't catch. RSKIP552 prices null data at
-    /// 0 and refuses it as any other wrong length. Every other precompile's
-    /// `getGasForData` takes null, and a contract's call never passes null
-    /// (`Program.callToPrecompiledAddress`).
-    fn blake2f_reads_null<CTX: crate::RskContextTr>(
+    /// Whether a transaction's own call to `addr` with `input` is one to
+    /// BLAKE2F with no data before RSKIP552 (vetiver900), whose block rskj
+    /// can't process. rskj reads empty data as null (`RLPItem.getRLPData`),
+    /// and BLAKE2F's `getGasForData` reads its length: a NullPointerException,
+    /// which `TransactionExecutor.call` doesn't catch. RSKIP552 prices null
+    /// data at 0 and refuses it as any other wrong length. Every other
+    /// precompile's `getGasForData` takes null, and a contract's call never
+    /// passes null (`Program.callToPrecompiledAddress`).
+    fn blake2f_reads_null(&self, block: u64, addr: &Address, input: &[u8]) -> bool {
+        *addr == BLAKE2F_ADDR && input.is_empty() && !self.hardfork_cfg.has_rskip552(block)
+    }
+
+    /// What the precompile at `addr`, not REMASC nor the Bridge, makes of
+    /// `input`, held to `gas_limit`: a transaction's own call where
+    /// `own_call`, a contract's otherwise.
+    fn outcome<CTX: crate::RskContextTr>(
         &self,
         context: &CTX,
-        addr: &Address,
+        addr: Address,
+        precompile: &Precompile,
         input: &[u8],
-    ) -> bool {
+        gas_limit: u64,
+        own_call: bool,
+    ) -> Outcome {
         let block = context.block().number().to::<u64>();
-        *addr == BLAKE2F_ADDR
-            && input.is_empty()
-            && context.journal().depth() == 1
-            && !self.hardfork_cfg.has_rskip552(block)
+        if own_call && self.blake2f_reads_null(block, &addr, input) {
+            Outcome::Fatal("BLAKE2F's getGasForData throws on null data".into())
+        } else if NATIVE_CONTRACTS.contains(&addr) {
+            self.run_native(context, addr, input, gas_limit)
+        } else {
+            run_precompile(
+                precompile,
+                &addr,
+                input,
+                gas_limit,
+                self.hardfork_cfg.has_rskip197(block),
+            )
+        }
+    }
+
+    /// A transaction's own call to the precompile at `addr`, as rskj's
+    /// `TransactionExecutor.call` makes it: the transaction's data whole, held
+    /// to `gas_limit`. `None` where `addr` holds no precompile at this block,
+    /// and for REMASC and the Bridge, which the executor runs itself. The
+    /// executor runs such a call this way before RSKIP136, where the price is
+    /// held to the transaction's whole limit; a precompile writes nothing, so
+    /// what it does is known before the transaction is charged.
+    pub(crate) fn run_for_a_transaction<CTX: crate::RskContextTr>(
+        &self,
+        context: &CTX,
+        addr: Address,
+        input: &[u8],
+        gas_limit: u64,
+    ) -> Option<Outcome> {
+        if addr == REMASC_ADDR || addr == BRIDGE_ADDR {
+            return None;
+        }
+        let precompile = self.precompiles.get(&addr)?;
+        Some(self.outcome(context, addr, precompile, input, gas_limit, true))
     }
 }
 
@@ -1376,7 +1416,6 @@ impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider
             context.journal_mut().touch_account(inputs.target_address);
         }
 
-        let rskip197 = self.rskip197_active(context);
         let max_input = self.max_input(context, &addr);
         let outcome = {
             let shared;
@@ -1393,13 +1432,8 @@ impl<CTX: crate::RskContextTr> PrecompileProvider<CTX> for RskPrecompileProvider
                 CallInput::Bytes(bytes) => bytes.as_ref(),
             };
             let input = max_input.map_or(input, |max| &input[..input.len().min(max)]);
-            if self.blake2f_reads_null(context, &addr, input) {
-                Outcome::Fatal("BLAKE2F's getGasForData throws on null data".into())
-            } else if NATIVE_CONTRACTS.contains(&addr) {
-                self.run_native(context, addr, input, inputs.gas_limit)
-            } else {
-                run_precompile(precompile, &addr, input, inputs.gas_limit, rskip197)
-            }
+            let own_call = context.journal().depth() == 1;
+            self.outcome(context, addr, precompile, input, inputs.gas_limit, own_call)
         };
         self.finish(context, addr, inputs.gas_limit, outcome)
             .map(Some)

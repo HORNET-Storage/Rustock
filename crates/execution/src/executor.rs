@@ -1940,23 +1940,128 @@ impl RskExecutor {
                 }
             }
 
-            // Direct Bridge calls that revm's gas validation cannot model:
+            // A transaction's own call to a precompile that rskj runs in a way
+            // revm's gas validation cannot model (`TransactionExecutor.call`):
             // - free bridge transactions (pre-areBridgeTxsPaid): gas_limit 0,
             //   nothing charged (Transaction.transactionCost == 0,
             //   Bridge.getGasForData == 0);
             // - paid calls before RSKIP136 (bahamas): rskj checked the limit
-            //   against the precompile cost ALONE and recorded
-            //   gasUsed = precompileCost + intrinsicCost, possibly above the
-            //   tx gas limit (mainnet #3307: 31280 used with a 30000 limit).
+            //   against the precompile's price ALONE and recorded
+            //   gasUsed = price + intrinsicCost, possibly above the tx gas
+            //   limit (mainnet #3307: 31280 used with a 30000 limit). REMASC
+            //   asks for nothing (`RemascContract.getGasForData`), so the rule
+            //   changes nothing for it, and its calls stay in the EVM.
             let is_free = self.is_free_bridge_tx(tx, *sender, header.number);
-            let is_pre136_bridge = !self.hardfork_cfg.has_rskip136(header.number)
-                && tx.to.len() == 20
-                && tx.to.as_ref() == crate::precompiles::BRIDGE_ADDR.as_slice();
-            if is_free || is_pre136_bridge {
-                debug!(tx_index = i, is_free, "executing direct bridge call");
+            let before_rskip136 =
+                !self.hardfork_cfg.has_rskip136(header.number) && tx.to.len() == 20;
+            let is_pre136_bridge =
+                before_rskip136 && tx.to.as_ref() == crate::precompiles::BRIDGE_ADDR.as_slice();
+            // Any other precompile is run now: it writes nothing, so what it
+            // does is known before the transaction is charged.
+            let pre136_outcome = if before_rskip136 && !is_pre136_bridge {
+                evm.precompiles.run_for_a_transaction(
+                    &evm.ctx,
+                    Address::from_slice(tx.to.as_ref()),
+                    tx.input.as_ref(),
+                    tx_gas,
+                )
+            } else {
+                None
+            };
+            if is_free || is_pre136_bridge || pre136_outcome.is_some() {
+                let callee = Address::from_slice(tx.to.as_ref());
+                debug!(tx_index = i, is_free, %callee, "executing a direct precompile call");
+                use crate::native::Outcome;
                 use revm::context_interface::journaled_state::account::JournaledAccountTr;
                 use revm::context_interface::{ContextTr, JournalTr};
-                // rskj increments the sender nonce in init(), outside the
+                // rskj `Transaction.transactionCost`: nothing for a free Bridge
+                // transaction, and 68 for a byte of data that isn't zero, 16
+                // from RSKIP400.
+                let basic: u64 = if is_free {
+                    0
+                } else {
+                    let nonzero = if self.hardfork_cfg.has_reduced_calldata_cost(header.number) {
+                        16
+                    } else {
+                        68
+                    };
+                    21_000
+                        + tx.input
+                            .iter()
+                            .map(|b| if *b == 0 { 4u64 } else { nonzero })
+                            .sum::<u64>()
+                };
+                // rskj `TransactionExecutor.init`, which revm's own checks are
+                // for every other transaction: a limit that pays the intrinsic
+                // cost, the sender's next nonce, and a balance that covers the
+                // value and, for a priced transaction, the whole limit. Mining
+                // takes a call only where the balance covers what it can come
+                // to past its limit as well: rskj would take that whatever the
+                // sender holds (see the fee below), which this node can't. A
+                // precompile's run says what that is; the Bridge's price is
+                // known only as it runs, so for it the most it can be.
+                let most = match &pre136_outcome {
+                    Some(Outcome::Returned { gas, .. } | Outcome::Null { gas }) => {
+                        gas.saturating_add(basic)
+                    }
+                    Some(_) => tx_gas,
+                    None => tx_gas.saturating_add(basic),
+                };
+                let refusal = {
+                    let account = evm
+                        .ctx
+                        .journal_mut()
+                        .load_account(*sender)
+                        .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?;
+                    let (nonce, balance) = (account.data.info.nonce, account.data.info.balance);
+                    let covers = |gas: u64| {
+                        let cost = if basic > 0 {
+                            tx.gas_price
+                                .checked_mul(U256::from(gas))
+                                .and_then(|cost| cost.checked_add(tx.value))
+                        } else {
+                            Some(tx.value)
+                        };
+                        cost.is_some_and(|cost| balance >= cost)
+                    };
+                    if tx_gas < basic {
+                        Some((
+                            format!("Not enough gas for transaction execution: tx needs: {basic} tx sent: {tx_gas}"),
+                            true,
+                        ))
+                    } else if nonce != tx.nonce {
+                        Some((
+                            format!("Invalid nonce: required: {nonce} , tx.nonce: {}", tx.nonce),
+                            true,
+                        ))
+                    } else if !covers(tx_gas) {
+                        Some((format!("Not enough cash: Sender cash: {balance}"), true))
+                    } else if discard_unfitting.is_some() && !covers(most) {
+                        Some((
+                            "its sender may not cover the gas past its limit".to_string(),
+                            false,
+                        ))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((reason, refused)) = refusal {
+                    if let Some(drops) = discard_unfitting.as_deref_mut() {
+                        debug!(tx_index = i, %reason, "mining: dropping a direct precompile call");
+                        // What rskj refuses its miner reports as invalid, for
+                        // the pool to forget. The other stays pending.
+                        if refused {
+                            drops.invalid.push(i);
+                        } else {
+                            drops.unfitting.push(i);
+                        }
+                        dropped_senders.insert(*sender);
+                        evm.ctx.chain_mut().raw_storage.discard_tx();
+                        continue;
+                    }
+                    return Err(ExecutionError::Evm(format!("transaction {i}: {reason}")));
+                }
+                // rskj increments the sender nonce in `execute()`, outside the
                 // execution rollback scope.
                 {
                     let mut acc = evm.ctx.journal_mut().load_account_mut(*sender)
@@ -1964,131 +2069,168 @@ impl RskExecutor {
                     acc.data.bump_nonce();
                 }
 
-                // Warm the Bridge account: outside revm's transact flow the
+                // Warm the callee: outside revm's transact flow the
                 // precompile warm-set is not populated and journal sloads on
                 // a cold account fail.
-                let _ = evm.ctx.journal_mut()
-                    .load_account(crate::precompiles::BRIDGE_ADDR);
-
-                // Pre-RSKIP136 gas accounting (rskj TransactionExecutor.call).
-                let (gas_used, enough_gas) = if is_free {
-                    (0u64, true)
-                } else {
-                    let required = crate::bridge::bridge_call_gas_cost(
-                        &mut evm.ctx,
-                        tx.input.as_ref(),
-                        &self.bridge_constants,
-                        &self.hardfork_cfg,
-                    )
-                    .unwrap_or(0);
-                    let basic: u64 = 21_000
-                        + tx.input.iter()
-                            .map(|b| if *b == 0 { 4u64 } else { 68 })
-                            .sum::<u64>();
-                    let limit = tx_gas;
-                    if limit >= required {
-                        // gasUsed may exceed the limit; that is consensus here.
-                        (required.saturating_add(basic), true)
-                    } else {
-                        // rskj execError: all gas consumed, nothing executed.
-                        (limit, false)
-                    }
-                };
+                let _ = evm.ctx.journal_mut().load_account(callee);
 
                 let mut invisible_exception = false;
-                let (success, output, logs) = if enough_gas {
-                    let tx_ctx = bridge_ctx_slot.lock().map(|g| g.clone()).unwrap_or_default();
-                    let use_v2 = self.hardfork_cfg.has_stored_block_v2(header.number);
-                    let checkpoint = evm.ctx.journal_mut().checkpoint();
-                    let outcome = crate::bridge::execute_bridge(
-                        &mut evm.ctx,
-                        tx.input.as_ref(),
-                        u64::MAX, // cost already accounted above
-                        &self.bridge_constants,
-                        Some(&self.block_store),
-                        use_v2,
-                        &self.hardfork_cfg,
-                        &tx_ctx,
-                        *sender,
-                        1, // a direct top-level tx is depth 1 (not a contract call)
-                        crate::bridge::BridgeCallKind::Call, // a tx is always a plain CALL
-                        tx.value, // top-level call value = the tx value
-                    );
-                    match outcome {
-                        Ok(out) => {
-                            evm.ctx.chain_mut().raw_storage.commit_call();
-                            evm.ctx.journal_mut().checkpoint_commit();
-                            // rskj transfers the endowment after execute()
-                            // returns without throwing.
-                            if !tx.value.is_zero() {
-                                let _ = evm.ctx.journal_mut().transfer(
-                                    *sender,
-                                    crate::precompiles::BRIDGE_ADDR,
-                                    tx.value,
-                                );
-                            }
-                            // rskj setupContract after a successful direct
-                            // precompile call (TransactionExecutor.call).
-                            if !markers.precompiles.contains(&crate::precompiles::BRIDGE_ADDR) {
-                                markers.precompiles.push(crate::precompiles::BRIDGE_ADDR);
-                            }
-                            // Drain bridge events into the receipt like revm
-                            // does for normal transactions.
-                            let logs = evm.ctx.journal_mut().take_logs();
-                            (true, out.bytes.to_vec(), logs)
-                        }
-                        Err(e) if crate::bridge::is_invisible_exception(&e) => {
-                            // rskj invisible exception: receipt SUCCESS with
-                            // the spent gas, no logs, no endowment — but the
-                            // sender is charged the FULL gas limit.
-                            evm.ctx.chain_mut().raw_storage.discard_call();
-                            // RSKIP-144: the writes this call attempted are
-                            // about to be popped off the journal. The EVM's
-                            // own frames are covered in `rsk_handler`; a
-                            // direct bridge call never enters one.
-                            if crate::collision::records_attempted_writes() {
-                                let j = &evm.ctx.journal_mut().inner;
-                                crate::collision::note_journal_entries(&j.journal, &j.state);
-                            }
-                            evm.ctx.journal_mut().checkpoint_revert(checkpoint);
-                            crate::collision::forget_entries_above(
-                                evm.ctx.journal_mut().inner.journal.len(),
-                            );
-                            invisible_exception = true;
-                            (true, Vec::new(), Vec::new())
-                        }
-                        Err(e) => {
-                            evm.ctx.chain_mut().raw_storage.discard_call();
-                            // RSKIP-144: the writes this call attempted are
-                            // about to be popped off the journal. The EVM's
-                            // own frames are covered in `rsk_handler`; a
-                            // direct bridge call never enters one.
-                            if crate::collision::records_attempted_writes() {
-                                let j = &evm.ctx.journal_mut().inner;
-                                crate::collision::note_journal_entries(&j.journal, &j.state);
-                            }
-                            evm.ctx.journal_mut().checkpoint_revert(checkpoint);
-                            crate::collision::forget_entries_above(
-                                evm.ctx.journal_mut().inner.journal.len(),
-                            );
-                            debug!(tx_index = i, error = %e, "direct bridge call failed");
-                            (false, Vec::new(), Vec::new())
-                        }
+                let (gas_used, success, output, logs) = match pre136_outcome {
+                    // What `getGasForData` asked for came to more than the whole
+                    // limit: rskj's execError, all the gas used and nothing run.
+                    Some(Outcome::OutOfGas) => (tx_gas, false, Vec::new(), Vec::new()),
+                    // `execute` threw: rskj's invisible exception, as for the
+                    // Bridge below.
+                    Some(Outcome::Threw { gas, reason }) => {
+                        debug!(tx_index = i, %reason, "direct precompile call threw");
+                        invisible_exception = true;
+                        (gas.saturating_add(basic), true, Vec::new(), Vec::new())
                     }
-                } else {
-                    // Out of gas before `execute`. rskj's `go()` commits the
-                    // repository all the same, with what `getGasForData` wrote
-                    // straight into it (a BTC store its cost seeded): the
-                    // writes this keeps of the cost's.
-                    evm.ctx.chain_mut().raw_storage.discard_call();
-                    (false, Vec::new(), Vec::new())
+                    Some(Outcome::Fatal(reason)) => return Err(ExecutionError::Evm(reason)),
+                    // It returned, or returned rskj's null, which is no output.
+                    // rskj sets the callee up as a contract and moves the value
+                    // to it, which creates its account even where there is none
+                    // to move (`Repository.transfer`).
+                    Some(Outcome::Returned { gas, output }) => {
+                        let _ = evm.ctx.journal_mut().transfer(*sender, callee, tx.value);
+                        if !markers.precompiles.contains(&callee) {
+                            markers.precompiles.push(callee);
+                        }
+                        (gas.saturating_add(basic), true, output.to_vec(), Vec::new())
+                    }
+                    Some(Outcome::Null { gas }) => {
+                        let _ = evm.ctx.journal_mut().transfer(*sender, callee, tx.value);
+                        if !markers.precompiles.contains(&callee) {
+                            markers.precompiles.push(callee);
+                        }
+                        (gas.saturating_add(basic), true, Vec::new(), Vec::new())
+                    }
+                    // The Bridge, whose price depends on what its storage holds.
+                    None => {
+                        // Pre-RSKIP136 gas accounting (rskj TransactionExecutor.call).
+                        let (gas_used, enough_gas) = if is_free {
+                            (0u64, true)
+                        } else {
+                            let required = crate::bridge::bridge_call_gas_cost(
+                                &mut evm.ctx,
+                                tx.input.as_ref(),
+                                &self.bridge_constants,
+                                &self.hardfork_cfg,
+                            )
+                            .unwrap_or(0);
+                            let limit = tx_gas;
+                            if limit >= required {
+                                // gasUsed may exceed the limit; that is consensus here.
+                                (required.saturating_add(basic), true)
+                            } else {
+                                // rskj execError: all gas consumed, nothing executed.
+                                (limit, false)
+                            }
+                        };
+                        let (success, output, logs) = if enough_gas {
+                            let tx_ctx = bridge_ctx_slot
+                                .lock()
+                                .map(|g| g.clone())
+                                .unwrap_or_default();
+                            let use_v2 = self.hardfork_cfg.has_stored_block_v2(header.number);
+                            let checkpoint = evm.ctx.journal_mut().checkpoint();
+                            let outcome = crate::bridge::execute_bridge(
+                                &mut evm.ctx,
+                                tx.input.as_ref(),
+                                u64::MAX, // cost already accounted above
+                                &self.bridge_constants,
+                                Some(&self.block_store),
+                                use_v2,
+                                &self.hardfork_cfg,
+                                &tx_ctx,
+                                *sender,
+                                1, // a direct top-level tx is depth 1 (not a contract call)
+                                crate::bridge::BridgeCallKind::Call, // a tx is always a plain CALL
+                                tx.value, // top-level call value = the tx value
+                            );
+                            match outcome {
+                                Ok(out) => {
+                                    evm.ctx.chain_mut().raw_storage.commit_call();
+                                    evm.ctx.journal_mut().checkpoint_commit();
+                                    // rskj transfers the endowment after execute()
+                                    // returns without throwing.
+                                    if !tx.value.is_zero() {
+                                        let _ = evm.ctx.journal_mut().transfer(
+                                            *sender,
+                                            crate::precompiles::BRIDGE_ADDR,
+                                            tx.value,
+                                        );
+                                    }
+                                    // rskj setupContract after a successful direct
+                                    // precompile call (TransactionExecutor.call).
+                                    let bridge = crate::precompiles::BRIDGE_ADDR;
+                                    if !markers.precompiles.contains(&bridge) {
+                                        markers.precompiles.push(bridge);
+                                    }
+                                    // Drain bridge events into the receipt like revm
+                                    // does for normal transactions.
+                                    let logs = evm.ctx.journal_mut().take_logs();
+                                    (true, out.bytes.to_vec(), logs)
+                                }
+                                Err(e) if crate::bridge::is_invisible_exception(&e) => {
+                                    // rskj invisible exception: receipt SUCCESS with
+                                    // the spent gas, no logs, no endowment — but the
+                                    // sender is charged the FULL gas limit.
+                                    evm.ctx.chain_mut().raw_storage.discard_call();
+                                    // RSKIP-144: the writes this call attempted are
+                                    // about to be popped off the journal. The EVM's
+                                    // own frames are covered in `rsk_handler`; a
+                                    // direct bridge call never enters one.
+                                    if crate::collision::records_attempted_writes() {
+                                        let j = &evm.ctx.journal_mut().inner;
+                                        crate::collision::note_journal_entries(
+                                            &j.journal, &j.state,
+                                        );
+                                    }
+                                    evm.ctx.journal_mut().checkpoint_revert(checkpoint);
+                                    crate::collision::forget_entries_above(
+                                        evm.ctx.journal_mut().inner.journal.len(),
+                                    );
+                                    invisible_exception = true;
+                                    (true, Vec::new(), Vec::new())
+                                }
+                                Err(e) => {
+                                    evm.ctx.chain_mut().raw_storage.discard_call();
+                                    // RSKIP-144: the writes this call attempted are
+                                    // about to be popped off the journal. The EVM's
+                                    // own frames are covered in `rsk_handler`; a
+                                    // direct bridge call never enters one.
+                                    if crate::collision::records_attempted_writes() {
+                                        let j = &evm.ctx.journal_mut().inner;
+                                        crate::collision::note_journal_entries(
+                                            &j.journal, &j.state,
+                                        );
+                                    }
+                                    evm.ctx.journal_mut().checkpoint_revert(checkpoint);
+                                    crate::collision::forget_entries_above(
+                                        evm.ctx.journal_mut().inner.journal.len(),
+                                    );
+                                    debug!(tx_index = i, error = %e, "direct bridge call failed");
+                                    (false, Vec::new(), Vec::new())
+                                }
+                            }
+                        } else {
+                            // Out of gas before `execute`. rskj's `go()` commits the
+                            // repository all the same, with what `getGasForData` wrote
+                            // straight into it (a BTC store its cost seeded): the
+                            // writes this keeps of the cost's.
+                            evm.ctx.chain_mut().raw_storage.discard_call();
+                            (false, Vec::new(), Vec::new())
+                        };
+                        (gas_used, success, output, logs)
+                    }
                 };
 
                 // Every transaction's, traced or not, so that one's can't reach
                 // the next transaction's trace.
                 let transfers = std::mem::take(&mut evm.ctx.chain_mut().precompile_transfers);
                 if traced.includes(i) {
-                    // The Bridge never enters the EVM here, so the tracer
+                    // The precompile never enters the EVM here, so the tracer
                     // records nothing, but rskj traces the transaction all
                     // the same (`TransactionExecutor.extractTrace`'s
                     // `program == null` branch, as for REMASC above): its own
@@ -2096,11 +2238,8 @@ impl RskExecutor {
                     // the Bridge made. Left out, every later transaction of
                     // the block would be answered with the trace of the one
                     // after it.
-                    let subtraces = crate::tracer::precompile_subtraces(
-                        Some(crate::precompiles::BRIDGE_ADDR),
-                        success,
-                        transfers,
-                    );
+                    let subtraces =
+                        crate::tracer::precompile_subtraces(Some(callee), success, transfers);
                     traces.insert(
                         i,
                         crate::tracer::ProgramTrace {
@@ -2118,13 +2257,36 @@ impl RskExecutor {
                 } else {
                     gas_used
                 };
-                let fee = U256::from(fee_gas) * tx.gas_price;
+                let fee = U256::from(fee_gas).saturating_mul(tx.gas_price);
                 if !fee.is_zero() {
-                    let _ = evm.ctx.journal_mut().transfer(
-                        *sender,
-                        crate::precompiles::REMASC_ADDR,
-                        fee,
-                    );
+                    // The sender pays it. Before RSKIP136 a call can come to
+                    // more than its limit, and rskj takes that whatever the
+                    // sender holds: `TransactionExecutor.finalization` adds a
+                    // negative leftover, and the balance goes below zero, which
+                    // rskj stores signed (`RLP.encodeSignedCoinNonNullZero`).
+                    // A balance can't here, so such a block is refused.
+                    let paid = evm
+                        .ctx
+                        .journal_mut()
+                        .load_account_mut(*sender)
+                        .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?
+                        .decr_balance(fee);
+                    if !paid {
+                        return Err(ExecutionError::Evm(format!(
+                            "transaction {i} used {gas_used} gas on a limit of {tx_gas}, and its \
+                             sender can't pay for the rest: rskj leaves the sender's balance \
+                             below zero, which this node can't hold"
+                        )));
+                    }
+                    // REMASC has it now, or with the block's other fees where
+                    // they wait (`postponeFeePayment`).
+                    if !postpone_fees {
+                        evm.ctx
+                            .journal_mut()
+                            .load_account_mut(crate::precompiles::REMASC_ADDR)
+                            .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?
+                            .incr_balance(fee);
+                    }
                 }
                 // What this transaction paid in that nobody was credited
                 // with, for the per-transaction supply check.
@@ -2133,8 +2295,10 @@ impl RskExecutor {
 
                 total_gas += gas_used;
                 tx_results.push(TxExecutionResult {
-                    // This branch exists only to call the Bridge.
-                    reached_sequential_only: true,
+                    // REMASC and the Bridge bar a transaction from a parallel
+                    // sublist.
+                    reached_sequential_only: crate::precompiles::SEQUENTIAL_ONLY_PRECOMPILES
+                        .contains(&callee),
                     gas_used,
                     success,
                     output,
@@ -10277,6 +10441,294 @@ mod tests {
         assert_eq!(result.tx_results[0].gas_used, enough);
     }
 
+    /// rskj `TransactionExecutor.call`: before RSKIP136 (bahamas, mainnet
+    /// #3,397) what a transaction's own call to a precompile asks for
+    /// (`getGasForData`) is held to the whole gas limit (`enoughGas`), and the
+    /// transaction uses it on top of its intrinsic cost, past the limit if it
+    /// comes to that. From RSKIP136 the two together are held to the limit.
+    /// The Bridge's calls ran this way already; ECRECOVER asks for 3,000
+    /// whatever it is given.
+    #[test]
+    fn before_rskip136_a_direct_precompile_call_is_held_to_its_limit_by_its_price_alone() {
+        let ecrecover = Address::with_last_byte(1);
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let value = U256::from(7);
+        let run = |height| {
+            execute_alone(
+                RskHardforkConfig::mainnet(),
+                height,
+                ecrecover,
+                value,
+                21_000,
+                &[],
+                &[],
+            )
+        };
+
+        let result = run(3_396);
+        let receipt = &result.tx_results[0];
+        assert!(receipt.success);
+        assert_eq!(receipt.gas_used, 24_000, "3,000 on top of 21,000");
+        assert_eq!(result.paid_fees, fee(24_000));
+        assert_eq!(
+            result.state_changes.get(&sender).unwrap().info.balance,
+            one_rbtc - value - fee(24_000)
+        );
+        assert_eq!(
+            result.state_changes.get(&ecrecover).unwrap().info.balance,
+            value
+        );
+        assert!(
+            result.markers.precompiles.contains(&ecrecover),
+            "setupContract"
+        );
+
+        let result = run(3_397);
+        let receipt = &result.tx_results[0];
+        assert!(
+            !receipt.success,
+            "from RSKIP136, 21,000 can't pay for 24,000"
+        );
+        assert_eq!(receipt.gas_used, 21_000);
+        assert_eq!(result.paid_fees, fee(21_000));
+        assert!(result
+            .state_changes
+            .get(&ecrecover)
+            .is_none_or(|account| account.info.balance.is_zero()));
+        assert!(!result.markers.precompiles.contains(&ecrecover));
+    }
+
+    /// The same for a native contract, with RSKIP136 moved off bahamas as a
+    /// `consensusRules` entry moves it: HDWalletUtils asks for 11,300, which
+    /// before RSKIP136 a transaction carrying only its intrinsic gas pays. A
+    /// call that throws there is rskj's invisible exception all the same, and
+    /// its sender pays for its whole limit. The blocks run as their sublists,
+    /// so each fee reaches REMASC once, with the block's others.
+    #[test]
+    fn before_rskip136_a_direct_native_contract_call_is_held_to_its_limit_by_its_price_alone() {
+        let hd_wallet = crate::precompiles::HD_WALLET_UTILS_ADDR;
+        let remasc = crate::precompiles::REMASC_ADDR;
+        let sender = Address::repeat_byte(0xAA);
+        let one_rbtc = U256::from(10u64).pow(U256::from(18));
+        let value = U256::from(7);
+        let (cfg, _) = RskHardforkConfig::all_active_parallel(33)
+            .with_rskj_overrides(&[], &[("rskip136".to_string(), Some(9_000_000))])
+            .unwrap();
+        assert!(cfg.runs_sublists(8_000_000));
+        let run = |height, input: &[u8]| {
+            let limit = intrinsic_gas(input, 16);
+            (
+                limit,
+                execute_alone(cfg.clone(), height, hd_wallet, value, limit, input, &[]),
+            )
+        };
+        let remasc_holds = |result: &BlockExecutionResult| {
+            result
+                .state_changes
+                .get(&remasc)
+                .map_or(U256::ZERO, |account| account.info.balance)
+        };
+
+        let reads = extract_public_key_call(XPUB.as_bytes());
+        let (limit, result) = run(8_000_000, &reads);
+        let receipt = &result.tx_results[0];
+        assert!(receipt.success);
+        assert!(!receipt.output.is_empty());
+        assert_eq!(receipt.gas_used, limit + 11_300, "past its limit");
+        assert_eq!(result.paid_fees, fee(limit + 11_300));
+        assert_eq!(
+            remasc_holds(&result),
+            fee(limit + 11_300),
+            "REMASC is paid once"
+        );
+        assert_eq!(
+            result.state_changes.get(&sender).unwrap().info.balance,
+            one_rbtc - value - fee(limit + 11_300)
+        );
+        assert_eq!(
+            result.state_changes.get(&hd_wallet).unwrap().info.balance,
+            value
+        );
+        assert!(result.markers.precompiles.contains(&hd_wallet));
+
+        let throws = extract_public_key_call(b"this-is-not-an-xpub");
+        let (limit, result) = run(8_000_000, &throws);
+        let receipt = &result.tx_results[0];
+        assert!(receipt.success, "the receipt records success");
+        assert!(receipt.output.is_empty());
+        assert_eq!(receipt.gas_used, limit + 11_300);
+        assert_eq!(
+            result.paid_fees,
+            fee(limit),
+            "the sender pays for its whole limit"
+        );
+        assert_eq!(remasc_holds(&result), fee(limit));
+        assert_eq!(
+            result.state_changes.get(&sender).unwrap().info.balance,
+            one_rbtc - fee(limit),
+            "and keeps the value"
+        );
+        assert!(result
+            .state_changes
+            .get(&hd_wallet)
+            .is_none_or(|account| !account.is_touched()));
+        assert!(!result.markers.precompiles.contains(&hd_wallet));
+
+        for input in [reads, throws] {
+            let (limit, result) = run(9_000_000, &input);
+            let receipt = &result.tx_results[0];
+            assert!(
+                !receipt.success,
+                "from RSKIP136 its limit can't pay for 11,300 more"
+            );
+            assert_eq!(receipt.gas_used, limit);
+            assert_eq!(result.paid_fees, fee(limit));
+            assert_eq!(remasc_holds(&result), fee(limit));
+        }
+    }
+
+    /// Where a block runs as its sublists, each fee reaches REMASC with the
+    /// block's others, just before the REMASC transaction or after the last
+    /// one (`postponeFeePayment`). A transaction's own call to the Bridge
+    /// before RSKIP136 paid its fee to REMASC straight away as well, and
+    /// REMASC had it twice.
+    #[test]
+    fn before_rskip136_a_direct_bridge_call_pays_remasc_once_where_fees_wait() {
+        let (cfg, _) = RskHardforkConfig::all_active_parallel(33)
+            .with_rskj_overrides(&[], &[("rskip136".to_string(), Some(9_000_000))])
+            .unwrap();
+        let input = crate::abi::selector("getBtcBlockchainBestChainHeight()").to_vec();
+        let result = execute_alone(
+            cfg,
+            8_000_000,
+            crate::precompiles::BRIDGE_ADDR,
+            U256::ZERO,
+            1_000_000,
+            &input,
+            &[],
+        );
+        let receipt = &result.tx_results[0];
+        assert!(receipt.success);
+        assert_eq!(result.paid_fees, fee(receipt.gas_used));
+        assert_eq!(
+            result
+                .state_changes
+                .get(&crate::precompiles::REMASC_ADDR)
+                .unwrap()
+                .info
+                .balance,
+            fee(receipt.gas_used)
+        );
+    }
+
+    /// Before RSKIP136 a transaction's own call to a precompile can use more
+    /// gas than its limit, and rskj takes the excess from its sender whatever
+    /// the sender holds: `TransactionExecutor.finalization` adds a negative
+    /// leftover, and the balance goes below zero, which rskj stores signed
+    /// (`RLP.encodeSignedCoinNonNullZero`). This node's balances can't go
+    /// below zero, so it refuses such a block rather than reach another state.
+    #[test]
+    fn before_rskip136_a_sender_who_cannot_cover_the_excess_fails_the_block() {
+        let ecrecover = Address::with_last_byte(1);
+        let sender = Address::repeat_byte(0xAA);
+        let price = U256::from(60_000_000u64);
+        let value = U256::from(7);
+        let store = Arc::new(MemoryTrieStore::new());
+        // What rskj asks a sender to hold before it runs the transaction:
+        // the value and the whole limit (`TransactionExecutor.init`).
+        let holds = value + U256::from(21_000) * price;
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, holds);
+        let tx = rustock_core::Transaction {
+            gas_price: price,
+            gas_limit: U256::from(21_000),
+            ..plain_tx(0, &ecrecover, value)
+        };
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let before = executor.execute_block(
+            &dummy_header(3_396),
+            &[(tx.clone(), sender)],
+            &root,
+            store.clone(),
+        );
+        match before {
+            Err(error) => assert!(error.to_string().contains("below zero"), "{error}"),
+            Ok(_) => panic!("the block executes"),
+        }
+        let after = executor
+            .execute_block(&dummy_header(3_397), &[(tx, sender)], &root, store)
+            .expect("from RSKIP136 the call fails within its limit");
+        assert!(!after.tx_results[0].success);
+    }
+
+    /// rskj `TransactionExecutor.init` holds a transaction to its sender's
+    /// next nonce, a limit that pays its intrinsic cost, and a balance that
+    /// covers its value and whole limit, before anything runs. One that fails
+    /// makes its block invalid, and the miner drops it for the pool to forget.
+    /// A transaction's own call that rskj runs outside its VM, here before
+    /// RSKIP136, is held to the same. Mining also leaves one whose sender
+    /// couldn't pay for what it comes to past its limit, keeping it for later.
+    #[test]
+    fn a_direct_precompile_call_is_held_to_rskjs_checks_before_it_runs() {
+        let ecrecover = Address::with_last_byte(1);
+        let sender = Address::repeat_byte(0xAA);
+        let price = U256::from(60_000_000u64);
+        let value = U256::from(7);
+        let store = Arc::new(MemoryTrieStore::new());
+        // The value and the 24,000 gas a 21,000 limit comes to.
+        let holds = value + U256::from(24_000) * price;
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, holds);
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        let header = dummy_header(3_396);
+        let call = |nonce: u64, gas_limit: u64, value: U256| rustock_core::Transaction {
+            gas_price: price,
+            gas_limit: U256::from(gas_limit),
+            ..plain_tx(nonce, &ecrecover, value)
+        };
+        let too_much = value + U256::from(3_000) * price + U256::from(1);
+        for (tx, refused) in [
+            (call(1, 21_000, value), "Invalid nonce"),
+            (call(0, 20_999, value), "Not enough gas"),
+            (call(0, 21_000, too_much), "Not enough cash"),
+        ] {
+            match executor.execute_block(&header, &[(tx.clone(), sender)], &root, store.clone()) {
+                Err(error) => assert!(error.to_string().contains(refused), "{error}"),
+                Ok(_) => panic!("{refused}: the block executes"),
+            }
+            let (result, drops) = executor
+                .execute_block_for_mining(&header, &[(tx, sender)], &root, store.clone())
+                .expect("mining");
+            assert!(result.tx_results.is_empty(), "{refused}");
+            assert_eq!(drops.invalid, vec![0], "{refused}");
+        }
+
+        let (result, drops) = executor
+            .execute_block_for_mining(
+                &header,
+                &[(call(0, 21_000, value), sender)],
+                &root,
+                store.clone(),
+            )
+            .expect("mining");
+        assert!(drops.invalid.is_empty() && drops.unfitting.is_empty());
+        assert_eq!(result.tx_results[0].gas_used, 24_000);
+        let short = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &sender,
+            0,
+            holds - U256::from(1),
+        );
+        let (result, drops) = executor
+            .execute_block_for_mining(&header, &[(call(0, 21_000, value), sender)], &short, store)
+            .expect("mining");
+        assert!(result.tx_results.is_empty());
+        assert!(drops.invalid.is_empty());
+        assert_eq!(drops.unfitting, vec![0], "kept for later");
+    }
+
     /// rskj's BTC block store writes straight into the repository a
     /// transaction's own call to the Bridge is given, which
     /// `TransactionExecutor.go` commits however the call ends. So such a call
@@ -12107,6 +12559,43 @@ mod tests {
         assert_eq!(result.gas_used, 0);
     }
 
+    /// A free Bridge transaction is held to its sender's next nonce all the
+    /// same (`TransactionExecutor.init`): rskj refuses one that isn't, and
+    /// the block that holds it.
+    #[test]
+    fn a_free_bridge_tx_is_held_to_its_senders_nonce() {
+        let federator = rsk_address_from_pubkey_hex(
+            "03b53899c390573471ba30e5054f78376c5f797fda26dde7a760789f02908cbad2",
+        )
+        .unwrap();
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(
+            &TrieNode::empty(),
+            store.as_ref(),
+            &federator,
+            0,
+            U256::ZERO,
+        );
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let tx = rustock_core::Transaction {
+            nonce: 1,
+            gas_price: U256::ZERO,
+            gas_limit: U256::ZERO,
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::copy_from_slice(&block_header_selector("updateCollections()")),
+            v: 28,
+            r: U256::from(1),
+            s: U256::from(1),
+            cached_rlp: None,
+        };
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        match executor.execute_block(&dummy_header(457), &[(tx, federator)], &root, store) {
+            Err(error) => assert!(error.to_string().contains("Invalid nonce"), "{error}"),
+            Ok(_) => panic!("the block executes"),
+        }
+    }
+
     /// From areBridgeTxsPaid on, the same tx goes through normal gas
     /// validation and is rejected (gas_limit 0 < intrinsic cost).
     #[test]
@@ -12118,15 +12607,17 @@ mod tests {
         assert!(run_bridge_tx_gas0(370_000, federator).is_err());
     }
 
-    /// A non-federation sender never gets the free path. Pre-RSKIP136 the
-    /// call is still included: rskj execError (insufficient limit for the
-    /// precompile cost) yields a failed receipt consuming the (zero) limit.
+    /// A non-federation sender never gets the free path, and a limit of 0
+    /// can't pay the intrinsic cost: rskj's `TransactionExecutor.init` refuses
+    /// the transaction before anything runs (`gasIsValid`), and
+    /// `TransactionListExecutor` stops the block there, which makes it
+    /// invalid. The call's own price is never reached.
     #[test]
     fn test_bridge_tx_gas0_fails_for_unknown_sender() {
-        let result = run_bridge_tx_gas0(457, Address::repeat_byte(0xEE))
-            .expect("pre-RSKIP136 direct bridge call is included, not rejected");
-        assert!(!result.tx_results[0].success);
-        assert_eq!(result.tx_results[0].gas_used, 0, "all of the zero gas limit consumed");
+        match run_bridge_tx_gas0(457, Address::repeat_byte(0xEE)) {
+            Err(error) => assert!(error.to_string().contains("Not enough gas"), "{error}"),
+            Ok(_) => panic!("the block executes"),
+        }
     }
 
     /// rskj reads every ABI offset, length and count with `intValue()`: the
