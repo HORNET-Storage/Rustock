@@ -3,4 +3,5 @@
 
 mod support;
 
+mod bridge_utils_legacy_test;
 mod bridge_utils_test;
