@@ -216,9 +216,15 @@ impl BlockTemplateBuilder {
         let timestamp = timestamp_for_child(parent.timestamp);
         let difficulty = DifficultyRule { config: self.chain_config.clone() }
             .difficulty_for_child(parent, number, timestamp, ommers.len() as u64);
+        // rskj `GasLimitCalculator`: a target under the chain's minimum gas
+        // limit is the minimum, which a block may not go below.
+        let gas_limit_target = self
+            .mining_config
+            .gas_limit_target
+            .map(|target| target.max(U256::from(self.chain_config.min_gas_limit)));
         let gas_limit = next_gas_limit(
             parent,
-            self.mining_config.gas_limit_target,
+            gas_limit_target,
             self.chain_config.gas_limit_bound_divisor,
         );
         let minimum_gas_price = next_minimum_gas_price(

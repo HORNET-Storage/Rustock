@@ -1107,6 +1107,37 @@ fn the_gas_limit_steps_a_1024th_at_any_size() {
     assert_eq!(step(&(&top - 1u8), Some(U256::MAX)), top);
 }
 
+/// rskj `GasLimitCalculator` takes a target under the chain's minimum gas
+/// limit as the minimum: from a parent at 6,800,000 on a chain whose
+/// minimum is 6,799,000, a target of 1 steps down only to 6,799,000, not
+/// the 1024th that would leave a block below the minimum, which the
+/// miner's own block check then refuses.
+#[test]
+fn a_gas_limit_target_under_the_minimum_is_the_minimum() {
+    let mut config = (*test_chain_config()).clone();
+    config.min_gas_limit = 6_799_000;
+    let chain_config = Arc::new(config);
+    let fx = fixture_with(20, chain_config.clone(), U256::from(2));
+    let hardfork_cfg = RskHardforkConfig::all_active(33);
+    let processor = BlockProcessor::new(hardfork_cfg.clone(), fx.store.clone())
+        .with_chain_config(chain_config.clone());
+    let builder = BlockTemplateBuilder::new(
+        Arc::new(processor),
+        fx.trie_store.clone(),
+        chain_config,
+        hardfork_cfg,
+        MiningConfig {
+            gas_limit_target: Some(U256::from(1)),
+            ..Default::default()
+        },
+    );
+    let parent = std::slice::from_ref(&fx.parent);
+    let template = builder
+        .build(parent, Vec::new(), &NoPendingTransactions)
+        .unwrap();
+    assert_eq!(template.block.header.gas_limit, U256::from(6_799_000));
+}
+
 /// On a parent whose gas limit is past 256 bits, a template keeps the
 /// parent's value, as rskj's miner writes it, which the parent rule takes.
 /// The `U256::MAX` the typed field holds is no gas limit the chain allows
