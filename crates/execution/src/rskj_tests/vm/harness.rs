@@ -146,6 +146,15 @@ pub(crate) fn call(nonce: u64, to: Address, value: U256, gas: u64, data: &[u8]) 
     }
 }
 
+/// A transaction creating a contract of the init code `data`, at a gas
+/// price of 0.
+pub(crate) fn create(nonce: u64, gas: u64, data: &[u8]) -> Transaction {
+    Transaction {
+        to: Bytes::new(),
+        ..call(nonce, Address::ZERO, U256::ZERO, gas, data)
+    }
+}
+
 /// A chain on one network's rules: its state, and the number of the next
 /// block, which each block run moves on by one.
 pub(crate) struct Chain {
