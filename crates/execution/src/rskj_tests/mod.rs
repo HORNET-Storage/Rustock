@@ -15,6 +15,7 @@
 
 mod blocks;
 mod bridge_federation;
+mod bridge_federation_state;
 mod bridge_methods;
 mod bridge_pegins;
 mod bridge_pegouts;
