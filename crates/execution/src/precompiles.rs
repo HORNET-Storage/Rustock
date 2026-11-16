@@ -2054,6 +2054,59 @@ mod tests {
         assert!(!rsk_precompiles(&cfg, 8_804_200).contains(&kzg));
     }
 
+    /// rskj's `getContractForAddress`, upgrade by upgrade, on mainnet and on
+    /// testnet (each network's `hardforkActivationHeights`): the addresses it
+    /// serves on each side of wasabi100, papyrus200, iris300, arrowhead600 and
+    /// reed800, and no other. None of Ethereum's later ones is among them.
+    #[test]
+    fn the_set_is_rskjs_on_each_side_of_each_upgrade() {
+        let low = Address::with_last_byte;
+        let genesis = [
+            low(1),
+            low(2),
+            low(3),
+            low(4),
+            low(5),
+            BRIDGE_ADDR,
+            REMASC_ADDR,
+        ];
+        let added: [&[Address]; 5] = [
+            &[HD_WALLET_UTILS_ADDR, BLOCK_HEADER_ADDR],
+            &[low(6), low(7), low(8)],
+            &[low(9)],
+            &[ENVIRONMENT_ADDR],
+            &[SECP256K1_ADD_ADDR, SECP256K1_MUL_ADDR],
+        ];
+        let networks = [
+            (
+                RskHardforkConfig::mainnet(),
+                [1_591_000, 2_392_700, 3_614_800, 6_223_700, 8_052_200],
+            ),
+            (
+                RskHardforkConfig::testnet(),
+                [0, 863_000, 2_060_500, 4_927_100, 6_835_700],
+            ),
+        ];
+        let served = |cfg: &RskHardforkConfig, number: u64| {
+            let mut set: Vec<Address> = rsk_precompiles(cfg, number).addresses().copied().collect();
+            set.sort();
+            set
+        };
+        for (cfg, heights) in networks {
+            let mut expected = genesis.to_vec();
+            for (height, added) in heights.into_iter().zip(added) {
+                if height > 0 {
+                    expected.sort();
+                    assert_eq!(served(&cfg, height - 1), expected, "#{}", height - 1);
+                }
+                expected.extend_from_slice(added);
+                expected.sort();
+                assert_eq!(served(&cfg, height), expected, "#{height}");
+            }
+            assert_eq!(served(&cfg, 20_000_000), expected);
+        }
+    }
+
     /// Ported from rskj Blake2fNullDataTest (post-RSKIP552 semantics): calling
     /// Blake2F with empty input fails with an input-length error instead of
     /// crashing — revm's blake2 run() returns an error for non-213-byte input,
@@ -2349,6 +2402,20 @@ mod tests {
         input[32..64].copy_from_slice(&bad);
         input[64..96].copy_from_slice(&bad);
         assert!(secp256k1_mul_run(&input, 10_000).is_err());
+    }
+
+    /// rskj builds each point with BouncyCastle's `validatePoint`, whose field
+    /// element refuses a coordinate of p or more: 1 + p is no point's x though
+    /// it is 1 modulo p, and (1, V1Y) is a point.
+    #[test]
+    fn a_coordinate_of_p_or_more_is_no_point() {
+        let p = alloy_primitives::U256::from_str_radix(SECP256K1_P, 10).unwrap();
+        let one_plus_p = (p + alloy_primitives::U256::from(1)).to_string();
+        assert!(secp256k1_add_run(&build_add_input("1", V1Y, "0", "0"), 1_000).is_ok());
+        assert!(secp256k1_add_run(&build_add_input(&one_plus_p, V1Y, "0", "0"), 1_000).is_err());
+        assert!(secp256k1_add_run(&build_add_input("0", "0", &one_plus_p, V1Y), 1_000).is_err());
+        assert!(secp256k1_mul_run(&build_mul_input("1", V1Y, "1"), 10_000).is_ok());
+        assert!(secp256k1_mul_run(&build_mul_input(&one_plus_p, V1Y, "1"), 10_000).is_err());
     }
 
     #[test]
