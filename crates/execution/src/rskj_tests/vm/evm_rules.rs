@@ -450,3 +450,24 @@ fn code_that_starts_0xef01_runs_as_its_bytes() {
         }
     }
 }
+
+/// rskj refuses no transaction for code at its sender's address
+/// (`TransactionExecutor.init` reads the sender's nonce and balance, and
+/// nothing else of its account), where revm's EIP-3607 refuses one. The
+/// sender here holds code; its transaction runs, moves its value, and takes
+/// the sender's nonce on.
+#[test]
+fn a_transaction_from_an_address_with_code_runs() {
+    for number in [IRIS, LOVELL] {
+        let mut chain = Chain::mainnet(number);
+        chain.put(SENDER, 0, ONE_RBTC, &compile("STOP"));
+        let send = call(0, CALLEE, U256::from(5), GAS, &[]);
+        let ran = chain
+            .try_block(&[(send, SENDER)])
+            .unwrap_or_else(|e| panic!("#{number}: {e:?}"));
+        assert!(ran.tx_results[0].success, "#{number}");
+        assert_eq!(chain.balance(CALLEE), U256::from(5), "#{number}");
+        let nonce = chain.account(SENDER).map(|a| a.nonce);
+        assert_eq!(nonce, Some(U256::from(1)), "#{number}");
+    }
+}

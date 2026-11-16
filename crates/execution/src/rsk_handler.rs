@@ -474,6 +474,11 @@ where
         Ok(gas)
     }
 
+    /// A block's transaction is held to revm's checks of its sender, but for
+    /// EIP-3607's: rskj refuses no transaction for code at its sender's
+    /// address (`TransactionExecutor.init` reads the sender's nonce and
+    /// balance, and nothing else of its account).
+    ///
     /// A local call's sender (see `local_call`): its nonce and balance go
     /// unchecked, as does code at its address, which rskj never refuses
     /// (revm's EIP-3607). It's charged no gas and keeps its nonce
@@ -508,9 +513,27 @@ where
         evm: &mut Self::Evm,
     ) -> Result<(), Self::Error> {
         if !self.local_call {
-            return revm::handler::pre_execution::validate_against_state_and_deduct_caller(
-                evm.ctx(),
-            );
+            use revm::context_interface::{Cfg, Transaction};
+            use revm::handler::pre_execution::{
+                calculate_caller_fee, validate_account_nonce_and_code,
+            };
+            let (block, tx, cfg, journal, _, _) = evm.ctx().all_mut();
+            let mut caller = journal
+                .load_account_with_code_mut(tx.caller())
+                .map_err(|e| ERROR::from(e))?
+                .data;
+            validate_account_nonce_and_code(
+                &caller.account().info,
+                tx.nonce(),
+                true,
+                cfg.is_nonce_check_disabled(),
+            )?;
+            let balance = calculate_caller_fee(*caller.balance(), tx, block, cfg)?;
+            caller.set_balance(balance);
+            if tx.kind().is_call() {
+                caller.bump_nonce();
+            }
+            return Ok(());
         }
         use revm::context_interface::Transaction;
         use revm::primitives::TxKind;
