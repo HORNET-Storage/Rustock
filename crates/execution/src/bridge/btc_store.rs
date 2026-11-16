@@ -630,6 +630,38 @@ mod tests {
         );
     }
 
+    /// Bitcoin block 849,138, the one rskj's mainnet constants name
+    /// (`blockWithTooMuchChainWorkHeight`): its chain work, 849,137's plus one
+    /// block of work at the same bits, is the first at or above 2^95, so the
+    /// top bit of a 12-byte field is set and the field read as signed is
+    /// negative, where 849,137's is not. Unsigned it still fits the legacy 12
+    /// bytes, as it does the 32 of the second format.
+    #[test]
+    fn mainnet_849138_is_the_first_chain_work_to_set_the_top_bit_of_12_bytes() {
+        let cw_849137 = U256::from_str_radix("7fffdc6f043e4a69ea179a7a", 16).unwrap();
+        let cw_849138 = cw_849137 + compute_work(CompactTarget::from_consensus(0x17035d25));
+        assert_eq!(
+            cw_849138,
+            U256::from_str_radix("800028897aa1dce163ead2cf", 16).unwrap()
+        );
+        let top_bit = U256::from(1u8) << 95;
+        assert!(cw_849137 < top_bit);
+        assert!(cw_849138 >= top_bit && cw_849138 < top_bit << 1);
+        assert_eq!(
+            crate::bridge::constants::BridgeConstants::mainnet()
+                .block_with_too_much_chain_work_height,
+            849_138
+        );
+
+        // 849,137's header, carrying 849,138's work through both formats.
+        let block = StoredBlock::new(parse_mainnet_header(), 849_138, cw_849138);
+        let legacy =
+            StoredBlock::deserialize_compact_legacy(&block.serialize_compact_legacy()).unwrap();
+        assert_eq!(legacy.chain_work, cw_849138);
+        let v2 = StoredBlock::deserialize_compact_v2(&block.serialize_compact_v2()).unwrap();
+        assert_eq!(v2.chain_work, cw_849138);
+    }
+
     /// Verify auto-detect correctly identifies legacy vs V2 format for
     /// a real mainnet header.
     #[test]

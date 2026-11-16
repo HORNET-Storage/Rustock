@@ -948,6 +948,48 @@ fn update_collections_moves_one_confirmed_pegout_on_to_be_signed() {
     assert_eq!(after_a_call_at(4), (2, 1));
 }
 
+/// rskj's `getPegoutWaitingForSignatureKey`: a confirmed peg-out waits to be
+/// signed under the transaction that made it from RSKIP146, under the call
+/// that moves it on from RSKIP176 ("moving back to using the
+/// updateCollections related txHash"), and under the one that made it again
+/// from RSKIP375.
+#[test]
+fn from_rskip176_a_confirmed_pegout_waits_to_be_signed_under_the_call_that_moves_it() {
+    use crate::bridge::peg::{
+        deserialize_rsk_txs_waiting_for_signatures, store_pegout_confirmation_set,
+        PegoutWaitingForConfirmations,
+    };
+    let made_by = [0x55u8; 32];
+    let key_after_a_call_under = |last: RskNetworkUpgrade| {
+        let mut bridge = regtest_at(last, 10);
+        let minimum = bridge.constants.minimum_pegout_tx_value;
+        let pegout = PegoutWaitingForConfirmations {
+            btc_tx_raw: btc_tx(2, minimum),
+            rsk_block_height: 1,
+            rsk_tx_hash: Some(made_by),
+        };
+        store_pegout_confirmation_set(&mut bridge.ctx, &[pegout], true);
+        bridge.caller = genesis_federator(&bridge.constants);
+        assert!(null(bridge.execute(&selector_only("updateCollections()"))));
+        let signing = bridge_load_bytes_named(&mut bridge.ctx, PEGOUTS_WAITING_FOR_SIGNATURES_KEY);
+        let keys: Vec<[u8; 32]> = deserialize_rsk_txs_waiting_for_signatures(&signing)
+            .into_keys()
+            .collect();
+        keys
+    };
+    // The call's own hash is the default context's, all zeros.
+    assert_eq!(
+        key_after_a_call_under(RskNetworkUpgrade::Papyrus200),
+        vec![made_by]
+    );
+    assert_eq!(key_after_a_call_under(Iris300), vec![[0u8; 32]]);
+    assert_eq!(
+        key_after_a_call_under(RskNetworkUpgrade::Hop400),
+        vec![[0u8; 32]]
+    );
+    assert_eq!(key_after_a_call_under(Vetiver900), vec![made_by]);
+}
+
 /// A header of Bitcoin's regtest on its genesis block, mined to regtest's
 /// easiest target.
 fn header_on_genesis() -> Vec<u8> {
