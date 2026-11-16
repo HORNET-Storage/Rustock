@@ -124,8 +124,10 @@ impl Bridge {
 
     /// rskj's `bridge.execute(data)`, with all the gas it asks for. The call's
     /// writes are kept when it returns and dropped when it fails, as the
-    /// executor and the precompile frame keep and drop them.
+    /// executor and the precompile frame keep and drop them. What a test wrote
+    /// before the call is the state the call starts from, and stays.
     pub(super) fn execute(&mut self, data: &[u8]) -> Result<PrecompileOutput, PrecompileError> {
+        self.ctx.chain_mut().raw_storage.commit_call();
         let number = self.number();
         let tx = BridgeTxContext {
             rsk_sender: self.caller,
@@ -270,6 +272,27 @@ pub(super) fn bytes_of(answer: &[u8]) -> Vec<u8> {
     let offset = uint_of(&answer[..32]).to::<usize>();
     let len = uint_of(&answer[offset..offset + 32]).to::<usize>();
     answer[offset + 32..offset + 32 + len].to_vec()
+}
+
+/// A `string` answer.
+pub(super) fn string_of(answer: &[u8]) -> String {
+    String::from_utf8(bytes_of(answer)).expect("a string answer is UTF-8")
+}
+
+/// A `string[]` answer: where the array is, how many, where each string is
+/// from the first head, then each string.
+pub(super) fn strings_of(answer: &[u8]) -> Vec<String> {
+    let offset = uint_of(&answer[..32]).to::<usize>();
+    let count = uint_of(&answer[offset..offset + 32]).to::<usize>();
+    let heads = offset + 32;
+    (0..count)
+        .map(|i| {
+            let head = heads + 32 * i;
+            let at = heads + uint_of(&answer[head..head + 32]).to::<usize>();
+            let len = uint_of(&answer[at..at + 32]).to::<usize>();
+            String::from_utf8(answer[at + 32..at + 32 + len].to_vec()).unwrap()
+        })
+        .collect()
 }
 
 /// The RSK address of a public key, given in hex.
