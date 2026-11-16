@@ -131,7 +131,11 @@ fn submit(
     let mut raw = Vec::new();
     bitcoin::consensus::Encodable::consensus_encode(block, &mut raw)
         .map_err(|e| MineError::Encode(e.to_string()))?;
-    server.submit_bitcoin_block(&raw).map_err(MineError::Submit)
+    // The node's own miner reads a refused block as the rule's error, not
+    // as the `INVALID_BLOCK` answer a miner submitting over RPC gets.
+    server
+        .submit_bitcoin_block_as(&raw, crate::mining::server::Refused::Failed)
+        .map_err(MineError::Submit)
 }
 
 #[derive(Debug)]

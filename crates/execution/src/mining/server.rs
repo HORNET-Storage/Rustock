@@ -55,12 +55,15 @@ pub struct SubmittedBlockInfo {
 
 /// The outcomes rskj's `ImportResult` can report for a mined block. A miner
 /// reads this to tell "my block won" from "my block was valid but somebody
-/// else's arrived first".
+/// else's arrived first", and from "a rule refuses my block".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportResult {
     ImportedBest,
     ImportedNotBest,
     Exist,
+    /// rskj `BlockChainImpl.internalTryToConnect`: a block that passes its
+    /// proof of work and that a rule then refuses. Nothing is stored.
+    InvalidBlock,
 }
 
 impl ImportResult {
@@ -69,6 +72,7 @@ impl ImportResult {
             ImportResult::ImportedBest => "IMPORTED_BEST",
             ImportResult::ImportedNotBest => "IMPORTED_NOT_BEST",
             ImportResult::Exist => "EXIST",
+            ImportResult::InvalidBlock => "INVALID_BLOCK",
         }
     }
 }
@@ -107,6 +111,17 @@ pub enum SubmitError {
     Storage(String),
     #[error("building work: {0}")]
     Template(#[from] TemplateError),
+}
+
+/// How a submission answers a solved block whose proof of work holds and
+/// that a rule then refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refused {
+    /// As rskj answers a miner: OK, with `INVALID_BLOCK`
+    /// (`MinerServerImpl.processSolution`).
+    Answered,
+    /// As the node's own miner reads it: the rule's error.
+    Failed,
 }
 
 /// How the node's chain state is read and advanced. Split out so the server
@@ -709,6 +724,16 @@ impl MinerServer {
     /// A full Bitcoin block, from which everything else is derivable.
     /// rskj `mnr_submitBitcoinBlock`.
     pub fn submit_bitcoin_block(&self, raw_block: &[u8]) -> Result<SubmittedBlockInfo, SubmitError> {
+        self.submit_bitcoin_block_as(raw_block, Refused::Answered)
+    }
+
+    /// [`MinerServer::submit_bitcoin_block`], answering a block a rule refuses
+    /// as `refused` says.
+    pub(crate) fn submit_bitcoin_block_as(
+        &self,
+        raw_block: &[u8],
+        refused: Refused,
+    ) -> Result<SubmittedBlockInfo, SubmitError> {
         use bitcoin::consensus::Decodable;
 
         let mut reader = raw_block;
@@ -727,6 +752,7 @@ impl MinerServer {
             &coinbase::encode_header(&btc_block.header),
             &coinbase_bytes,
             proof,
+            refused,
         )
     }
 
@@ -741,7 +767,7 @@ impl MinerServer {
     ) -> Result<SubmittedBlockInfo, SubmitError> {
         let hashes = merkle::parse_wire_hashes(tx_hashes)?;
         let proof = merkle::proof_from_tx_hashes(&hashes)?;
-        self.complete_and_import(raw_header, raw_coinbase, proof)
+        self.complete_and_import(raw_header, raw_coinbase, proof, Refused::Answered)
     }
 
     /// Header, coinbase and the merkle branch itself -- the cheapest form, and
@@ -756,7 +782,7 @@ impl MinerServer {
     ) -> Result<SubmittedBlockInfo, SubmitError> {
         let hashes = merkle::parse_wire_hashes(merkle_hashes)?;
         let proof = merkle::proof_from_merkle_hashes(&hashes)?;
-        self.complete_and_import(raw_header, raw_coinbase, proof)
+        self.complete_and_import(raw_header, raw_coinbase, proof, Refused::Answered)
     }
 
     /// The common tail of all three submit paths: match the solution to the
@@ -767,6 +793,7 @@ impl MinerServer {
         raw_btc_header: &[u8],
         raw_coinbase: &[u8],
         merkle_proof: Vec<u8>,
+        refused: Refused,
     ) -> Result<SubmittedBlockInfo, SubmitError> {
         // The clock of the connect, rskj `internalTryToConnect`'s scope:
         // from matching the solution to its template to the block being best
@@ -820,17 +847,40 @@ impl MinerServer {
         }
         t.preamble = laps.lap();
 
+        // rskj connects a solution whose proof of work holds through
+        // `blockchain.tryToConnect` and answers OK with what that made of the
+        // block (`MinerServerImpl.processSolution`): one a rule refuses is
+        // `INVALID_BLOCK` (`BlockChainImpl.internalTryToConnect`), and is not
+        // stored. The node's own miner reads the rule's error instead.
+        let number = block.header.number;
+        let refuse = move |error: SubmitError| {
+            if refused == Refused::Failed {
+                return Err(error);
+            }
+            warn!(target: "rustock::mining", "Mined block #{number} {completed_hash} is invalid: {error}");
+            Ok(SubmittedBlockInfo {
+                block_imported_result: ImportResult::InvalidBlock,
+                block_hash: completed_hash,
+                block_included_height: number,
+            })
+        };
+
         // The same rule every peer will run. Failing here means the node built
         // something it would itself reject, which is worth catching before it
-        // is stored and announced rather than after.
+        // is stored and announced rather than after. rskj answers ERROR here
+        // (`processSolution`'s `ProofOfWorkRule`).
         MergedMiningRule { config: self.chain_config.clone() }
             .validate(&block.header)
             .map_err(SubmitError::SelfCheck)?;
         // RSKIP179: a solution found in a Bitcoin block timestamped five
         // minutes or more from the template is one every peer rejects.
-        rustock_core::validation::BitcoinTimestampRule { config: self.chain_config.clone() }
-            .validate(&block.header)
-            .map_err(SubmitError::SelfCheck)?;
+        if let Err(e) = (rustock_core::validation::BitcoinTimestampRule {
+            config: self.chain_config.clone(),
+        })
+        .validate(&block.header)
+        {
+            return refuse(SubmitError::SelfCheck(e));
+        }
         // rskj connects a mined block through `blockchain.tryToConnect`, which
         // holds it to every rule a peer's block is held to before running it
         // (`BlockValidatorImpl`): the header's own and against its parent, the
@@ -848,13 +898,15 @@ impl MinerServer {
                 parent: template.parent_hash(),
                 head,
             })?;
-        rustock_core::validation::HeaderVerifier::default_rsk(self.chain_config.clone())
-            .verify(&block.header, Some(&parent))
-            .map_err(SubmitError::SelfCheck)?;
-        self.builder
-            .processor()
-            .validate_block(&block)
-            .map_err(SubmitError::SelfCheck)?;
+        if let Err(e) =
+            rustock_core::validation::HeaderVerifier::default_rsk(self.chain_config.clone())
+                .verify(&block.header, Some(&parent))
+        {
+            return refuse(SubmitError::SelfCheck(e));
+        }
+        if let Err(e) = self.builder.processor().validate_block(&block) {
+            return refuse(SubmitError::SelfCheck(e));
+        }
         t.initial_validation = laps.lap();
 
         let state_root = self
@@ -871,8 +923,18 @@ impl MinerServer {
             processor.process_block_timed(&block, &state_root, trie_store, &mut process)
         } else {
             processor.process_block(&block, &state_root, trie_store)
-        }
-        .map_err(|e| SubmitError::Execution(e.to_string()))?;
+        };
+        let executed = match executed {
+            Ok(executed) => executed,
+            // A store that fails to read is the node's fault, not the block's.
+            Err(
+                e @ (crate::processor::ProcessError::Storage(_)
+                | crate::processor::ProcessError::Execution(
+                    crate::executor::ExecutionError::Database(_),
+                )),
+            ) => return Err(SubmitError::Execution(e.to_string())),
+            Err(e) => return refuse(SubmitError::Execution(e.to_string())),
+        };
         laps.lap();
         t.initial_validation += process.pre_validation;
         t.execute = process.execute;

@@ -3476,7 +3476,10 @@ mod own_block_rules {
     /// And to the header's rules against its parent, as rskj's
     /// `BlockValidatorImpl` holds it: here the minimum gas limit, which a
     /// miner keeping its parent's 6,800,000 falls below on a chain whose
-    /// minimum is 7,000,000.
+    /// minimum is 7,000,000. rskj answers the miner OK, with what
+    /// `tryToConnect` made of the block, `INVALID_BLOCK`
+    /// (`MinerServerImpl.processSolution`), and stores nothing; the node's
+    /// own miner reads the rule's error.
     #[test]
     fn a_mined_block_below_the_minimum_gas_limit_is_refused() {
         let mut config = (*test_chain_config()).clone();
@@ -3485,7 +3488,16 @@ mod own_block_rules {
         let work = fx.server.get_work().unwrap();
         let raw = bitcoin::consensus::serialize(&solve(&work));
 
-        let err = fx.server.submit_bitcoin_block(&raw).unwrap_err();
+        let info = fx.server.submit_bitcoin_block(&raw).unwrap();
+        assert_eq!(info.block_imported_result, ImportResult::InvalidBlock);
+        assert_eq!(info.block_imported_result.as_str(), "INVALID_BLOCK");
+        assert_eq!(info.block_included_height, fx.parent.number + 1);
+        assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+
+        let err = fx
+            .server
+            .submit_bitcoin_block_as(&raw, crate::mining::server::Refused::Failed)
+            .unwrap_err();
         assert!(
             matches!(
                 err,
