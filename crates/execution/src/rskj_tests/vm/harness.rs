@@ -1,5 +1,6 @@
-//! What the ported tests of the VM share: programs written as rskj's tests
-//! write them, and a chain of blocks for them to run in.
+//! What the ported tests share: programs written as rskj's VM tests write
+//! them, and a chain of blocks for them to run in. The tests of the
+//! precompiled contracts and of REMASC use it too.
 //!
 //! rskj's VM tests write a program as opcode names, compiled by their
 //! `BytecodeCompiler`, and step it on a mocked program or run it in blocks
@@ -14,23 +15,25 @@ use rustock_core::{Header, Transaction};
 use rustock_storage::BlockStore;
 use rustock_trie::{AccountState, MemoryTrieStore, TrieKeySlice, TrieNode};
 
-use crate::executor::{BlockExecutionResult, ExecutionError, RskExecutor, TxExecutionResult};
+use crate::executor::{
+    BlockExecutionResult, ExecutionError, MiningDrops, RskExecutor, TxExecutionResult,
+};
 use crate::hardfork::RskHardforkConfig;
 
 /// The account that sends the transactions of a test.
-pub(super) const SENDER: Address = Address::repeat_byte(0xa1);
+pub(crate) const SENDER: Address = Address::repeat_byte(0xa1);
 /// The contract a test's program runs as.
-pub(super) const CONTRACT: Address = Address::repeat_byte(0xc0);
+pub(crate) const CONTRACT: Address = Address::repeat_byte(0xc0);
 /// One RBTC, in wei.
-pub(super) const ONE_RBTC: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
+pub(crate) const ONE_RBTC: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
 /// The gas a test's transaction is given, unless it says otherwise.
-pub(super) const GAS: u64 = 1_000_000;
+pub(crate) const GAS: u64 = 1_000_000;
 /// What [`return_top`] of one word costs: two PUSH2s, an MSTORE and the
 /// word of memory it takes, and a PUSH1. RETURN costs nothing.
-pub(super) const RETURN_ONE_WORD_GAS: u64 = 15;
+pub(crate) const RETURN_ONE_WORD_GAS: u64 = 15;
 /// Code that logs the top word of the stack, and takes it off: an MSTORE of
 /// it at 0, and a LOG0 of those 32 bytes. [`logged`] reads it back.
-pub(super) const LOG_TOP: &str = "PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 LOG0";
+pub(crate) const LOG_TOP: &str = "PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 LOG0";
 
 /// Compiles `code` as rskj's `BytecodeCompiler` does: each word is an
 /// opcode's name, in any case, or `0x` and bytes in hex, which go in as
@@ -39,7 +42,7 @@ pub(super) const LOG_TOP: &str = "PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 LOG0";
 ///
 /// Two more words let a program branch: `name:` is a JUMPDEST, and `@name`
 /// pushes where that JUMPDEST is, with a PUSH2.
-pub(super) fn compile(code: &str) -> Vec<u8> {
+pub(crate) fn compile(code: &str) -> Vec<u8> {
     let tokens: Vec<String> = code
         .split_whitespace()
         .map(str::to_ascii_uppercase)
@@ -92,7 +95,7 @@ fn opcode(name: &str) -> Option<u8> {
 
 /// Code that ends a program by returning the top `words` words of its
 /// stack, the top one first.
-pub(super) fn return_top(words: usize) -> Vec<u8> {
+pub(crate) fn return_top(words: usize) -> Vec<u8> {
     let mut code = Vec::new();
     for word in 0..words {
         code.push(0x61); // PUSH2
@@ -106,29 +109,29 @@ pub(super) fn return_top(words: usize) -> Vec<u8> {
 }
 
 /// The words of a program's output.
-pub(super) fn words(output: &[u8]) -> Vec<U256> {
+pub(crate) fn words(output: &[u8]) -> Vec<U256> {
     output.chunks(32).map(U256::from_be_slice).collect()
 }
 
 /// The word each log of a transaction holds, in order: what [`LOG_TOP`]
 /// logged.
-pub(super) fn logged(result: &TxExecutionResult) -> Vec<U256> {
+pub(crate) fn logged(result: &TxExecutionResult) -> Vec<U256> {
     let data = result.logs.iter().map(|log| &log.data.data[..]);
     data.map(U256::from_be_slice).collect()
 }
 
 /// `value` as a word in hex, for a PUSH32: `0x` and 64 digits.
-pub(super) fn hex_word(value: U256) -> String {
+pub(crate) fn hex_word(value: U256) -> String {
     format!("0x{}", hex::encode(value.to_be_bytes::<32>()))
 }
 
 /// PUSH20 of `address`, for [`compile`].
-pub(super) fn push_address(address: Address) -> String {
+pub(crate) fn push_address(address: Address) -> String {
     format!("PUSH20 0x{}", hex::encode(address))
 }
 
 /// A transaction calling `to` with `data`, at a gas price of 0.
-pub(super) fn call(nonce: u64, to: Address, value: U256, gas: u64, data: &[u8]) -> Transaction {
+pub(crate) fn call(nonce: u64, to: Address, value: U256, gas: u64, data: &[u8]) -> Transaction {
     Transaction {
         nonce,
         gas_price: U256::ZERO,
@@ -145,17 +148,17 @@ pub(super) fn call(nonce: u64, to: Address, value: U256, gas: u64, data: &[u8]) 
 
 /// A chain on one network's rules: its state, and the number of the next
 /// block, which each block run moves on by one.
-pub(super) struct Chain {
+pub(crate) struct Chain {
     executor: RskExecutor,
     store: Arc<MemoryTrieStore>,
     root: TrieNode,
     /// The next block's number.
-    pub(super) number: u64,
+    pub(crate) number: u64,
     _blocks: tempfile::TempDir,
 }
 
 impl Chain {
-    pub(super) fn new(config: RskHardforkConfig, number: u64) -> Self {
+    pub(crate) fn new(config: RskHardforkConfig, number: u64) -> Self {
         let blocks = tempfile::tempdir().expect("a folder for the block store");
         let block_store = Arc::new(BlockStore::open(blocks.path()).expect("a block store"));
         Self {
@@ -168,13 +171,13 @@ impl Chain {
     }
 
     /// A chain on mainnet's rules whose next block is `number`.
-    pub(super) fn mainnet(number: u64) -> Self {
+    pub(crate) fn mainnet(number: u64) -> Self {
         Self::new(RskHardforkConfig::mainnet(), number)
     }
 
     /// Writes an account with `nonce` and `balance`, and `code` where it
     /// has any.
-    pub(super) fn put(&mut self, address: Address, nonce: u64, balance: U256, code: &[u8]) {
+    pub(crate) fn put(&mut self, address: Address, nonce: u64, balance: U256, code: &[u8]) {
         let store = self.store.as_ref();
         let account = AccountState::new(U256::from(nonce), balance).encode();
         let key = TrieKeySlice::from_key(&rustock_trie::account_key(&address));
@@ -186,7 +189,7 @@ impl Chain {
     }
 
     /// The next block's header.
-    pub(super) fn header(&self) -> Header {
+    pub(crate) fn header(&self) -> Header {
         Header {
             parent_hash: B256::ZERO,
             ommers_hash: B256::ZERO,
@@ -220,7 +223,7 @@ impl Chain {
 
     /// Runs `transactions` in the next block, or says what refuses the block.
     /// A block that runs leaves its state for the next.
-    pub(super) fn try_block(
+    pub(crate) fn try_block(
         &mut self,
         transactions: &[(Transaction, Address)],
     ) -> Result<BlockExecutionResult, ExecutionError> {
@@ -244,33 +247,44 @@ impl Chain {
     }
 
     /// Runs `transactions` in the next block.
-    pub(super) fn block(
+    pub(crate) fn block(
         &mut self,
         transactions: &[(Transaction, Address)],
     ) -> BlockExecutionResult {
         self.try_block(transactions).expect("the block runs")
     }
 
+    /// Runs `transactions` as the miner builds the next block from them,
+    /// leaving the chain as it was: what ran, and what the miner left out.
+    pub(crate) fn mine(
+        &self,
+        transactions: &[(Transaction, Address)],
+    ) -> Result<(BlockExecutionResult, MiningDrops), ExecutionError> {
+        let (header, store) = (self.header(), self.store.clone());
+        self.executor
+            .execute_block_for_mining(&header, transactions, &self.root, store)
+    }
+
     /// Runs `transaction` from `sender`, alone in the next block.
-    pub(super) fn run(&mut self, sender: Address, transaction: Transaction) -> TxExecutionResult {
+    pub(crate) fn run(&mut self, sender: Address, transaction: Transaction) -> TxExecutionResult {
         self.block(&[(transaction, sender)]).tx_results.remove(0)
     }
 
     /// The account at `address`, where there is one.
-    pub(super) fn account(&self, address: Address) -> Option<AccountState> {
+    pub(crate) fn account(&self, address: Address) -> Option<AccountState> {
         let key = TrieKeySlice::from_key(&rustock_trie::account_key(&address));
         let encoded = self.root.get(&key, self.store.as_ref())?;
         Some(AccountState::decode(&encoded).expect("an account"))
     }
 
     /// The balance at `address`: zero where there is no account.
-    pub(super) fn balance(&self, address: Address) -> U256 {
+    pub(crate) fn balance(&self, address: Address) -> U256 {
         self.account(address)
             .map_or(U256::ZERO, |account| account.balance)
     }
 
     /// The word at `slot` of `address`'s storage: zero where none is.
-    pub(super) fn storage(&self, address: Address, slot: u64) -> U256 {
+    pub(crate) fn storage(&self, address: Address, slot: u64) -> U256 {
         let slot = B256::from(U256::from(slot));
         let key = TrieKeySlice::from_key(&rustock_trie::storage_key(&address, &slot));
         let value = self.root.get(&key, self.store.as_ref());
@@ -280,7 +294,7 @@ impl Chain {
 
 /// What a transaction of [`GAS`] gets from calling a contract whose code is
 /// `code`, alone in block `number` of a chain on `config`'s rules.
-pub(super) fn run_code_on(
+pub(crate) fn run_code_on(
     config: RskHardforkConfig,
     number: u64,
     code: &[u8],
@@ -292,6 +306,6 @@ pub(super) fn run_code_on(
 }
 
 /// [`run_code_on`] mainnet's rules.
-pub(super) fn run_code(number: u64, code: &[u8]) -> TxExecutionResult {
+pub(crate) fn run_code(number: u64, code: &[u8]) -> TxExecutionResult {
     run_code_on(RskHardforkConfig::mainnet(), number, code)
 }
