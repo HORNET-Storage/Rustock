@@ -754,6 +754,9 @@ where
         // What a local call's first frame is that a transaction's isn't.
         let mut first_frame_input = first_frame_input;
         let lent = self.fit_local_call(&mut first_frame_input.frame_input);
+        // What a call asked for and left unopened, where a transaction failed
+        // before its frame opened, is no part of this one's.
+        crate::rsk_instructions::take_callee_past_an_address();
         // rskj builds a program's invocation only for a transaction that runs
         // code (`TransactionExecutor.call` and `create`); revm opens a frame
         // for a creation with no data too, which runs nothing.
@@ -862,6 +865,8 @@ where
 
             let mut result = match call_or_result {
                 ItemOrResult::Item(init) => {
+                    // Taken for every frame asked for, whatever it is.
+                    let past_an_address = crate::rsk_instructions::take_callee_past_an_address();
                     if *TRACE_FRAMES {
                         trace_frame_init(&init);
                     }
@@ -871,6 +876,12 @@ where
                         }
                         _ => None,
                     };
+                    // A callee named by a word with a bit set above its 20
+                    // bytes is no precompile to rskj (`VM.doCALL`), only the
+                    // account at those bytes (`call_without_code`).
+                    let to_account = past_an_address
+                        && callee.is_some_and(|c| self.active_precompiles.contains(&c));
+                    let callee = callee.filter(|_| !to_account);
                     let creates = matches!(
                         init.frame_input,
                         revm::interpreter::interpreter_action::FrameInput::Create(_)
@@ -942,8 +953,13 @@ where
                         let owner = evm.frame_stack().get().interpreter.input.target_address();
                         unpaid_by_debtor(evm, owner, &init.frame_input)
                     };
-                    let opened = match unpaid {
-                        Some(unpaid) => ItemOrResult::Result(D::refuse(evm, init, unpaid)),
+                    let made_here = match unpaid {
+                        Some(unpaid) => Some(unpaid),
+                        None if to_account => call_without_code(evm, &init),
+                        None => None,
+                    };
+                    let opened = match made_here {
+                        Some(result) => ItemOrResult::Result(D::refuse(evm, init, result)),
                         None => D::init(evm, init)?,
                     };
                     match opened {
@@ -1181,7 +1197,8 @@ trait FrameDriver<EVM: EvmTr<Frame = EthFrame<EthInterpreter>>> {
         empty_create_on_unpayable_deposit: bool,
     ) -> Result<FrameInitOrResult<EthFrame<EthInterpreter>>, ContextTrDbError<EVM::Context>>;
     /// A frame the loop refuses itself (RSKIP150's depth, a sender a local
-    /// call left below zero), with the result revm gives one it refuses.
+    /// call left below zero), with the result revm gives one it refuses; or a
+    /// call it makes itself that opens no frame (`call_without_code`).
     fn refuse(evm: &mut EVM, init: FrameInit, refused: FrameResult) -> FrameResult;
 }
 
@@ -1689,6 +1706,51 @@ fn refusal(
         ))),
         FrameInput::Empty => None,
     }
+}
+
+/// The call rskj makes where a word with a bit set above its 20 bytes named
+/// an active precompile's address: `VM.doCALL` finds no precompile for the
+/// whole word, and `Program.callToAddress` calls the account at those 20
+/// bytes, which no creation reaches and no genesis gives code, so the call
+/// runs nothing. revm would run the precompile, so the call is made here as
+/// revm's `make_call_frame` makes one to an account without code: refused
+/// past the depth; refused for a caller short of the value it moves, what
+/// the transfer touched taken back; else the value moves and the callee is
+/// touched, which creates it where it wasn't, as rskj's `addBalance` does,
+/// and all the gas comes back. `None` for a frame that is no call.
+fn call_without_code<EVM>(evm: &mut EVM, init: &FrameInit) -> Option<FrameResult>
+where
+    EVM: EvmTr<Context: ContextTr<Journal: JournalTr<State = EvmState>>>,
+{
+    use revm::interpreter::interpreter_action::{CallValue, FrameInput};
+    use revm::interpreter::InterpreterResult;
+    use revm::primitives::constants::CALL_STACK_LIMIT;
+    let FrameInput::Call(inputs) = &init.frame_input else {
+        return None;
+    };
+    let ran = |result: InstructionResult| {
+        FrameResult::Call(CallOutcome::new(
+            InterpreterResult {
+                result,
+                gas: Gas::new(inputs.gas_limit),
+                output: Bytes::new(),
+            },
+            inputs.return_memory_offset.clone(),
+        ))
+    };
+    if init.depth > CALL_STACK_LIMIT as usize {
+        return Some(ran(InstructionResult::CallTooDeep));
+    }
+    let journal = evm.ctx().journal_mut();
+    let checkpoint = journal.checkpoint();
+    if let CallValue::Transfer(value) = inputs.value {
+        if let Some(error) = journal.transfer_loaded(inputs.caller, inputs.target_address, value) {
+            journal.checkpoint_revert(checkpoint);
+            return Some(ran(error.into()));
+        }
+    }
+    journal.checkpoint_commit();
+    Some(ran(InstructionResult::Stop))
 }
 
 /// RSKIP-131, with RSKIP125: rskj's `Program.createContract` refuses a

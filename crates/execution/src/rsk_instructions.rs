@@ -506,10 +506,42 @@ pub(crate) const KECCAK_EMPTY: B256 = B256::new([
     0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
 ]);
 
+/// Whether a word that names an address holds more than one: a bit set above
+/// the address's 20 bytes. rskj looks for a precompile with the whole word
+/// (`PrecompiledContracts.getContractForAddress` compares it with each
+/// precompile's, in `VM.doCALL`, `doCODESIZE` and `doEXTCODEHASH`), where all
+/// else it reads of an address takes the word's last 20 bytes
+/// (`RskAddress(DataWord)`). Such a word names the account at those 20 bytes,
+/// never a precompile.
+fn past_an_address(word: U256) -> bool {
+    word.bit_len() > 160
+}
+
+thread_local! {
+    /// Whether the word that named the callee of the call a frame asks for
+    /// was [`past_an_address`]: set by each call opcode as it asks, taken
+    /// by the handler as it opens the frame.
+    static CALLEE_PAST_AN_ADDRESS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// A call opcode asks for its frame, its callee named by a word
+/// [`past_an_address`] or not.
+fn ask_for_call(past_an_address: bool) {
+    CALLEE_PAST_AN_ADDRESS.with(|past| past.set(past_an_address));
+}
+
+/// Whether the call whose frame is about to open had its callee named by a
+/// word [`past_an_address`]; what any other frame reads after it is `false`.
+pub(crate) fn take_callee_past_an_address() -> bool {
+    CALLEE_PAST_AN_ADDRESS.with(|past| past.replace(false))
+}
+
 /// EXTCODEHASH with rskj's `VM.doEXTCODEHASH` / `getCodeHashStandard`
 /// semantics, which key on TRIE EXISTENCE (RSK never adopted EIP-161/1052
 /// emptiness):
-///   - active precompile  -> `keccak256("")` (rskj special-cases precompiles);
+///   - active precompile  -> `keccak256("")` (rskj special-cases precompiles),
+///     named by its address alone: a word [`past_an_address`] names the
+///     account, whatever its last 20 bytes;
 ///   - account absent from the trie -> `0`;
 ///   - account present but not a contract (no code) -> `keccak256("")`;
 ///   - contract -> its code hash. One whose code key holds nothing answers
@@ -534,7 +566,7 @@ fn rsk_extcodehash<WIRE: InterpreterTypes, H: Host + ContractMarker + ?Sized>(
     let addr = Address::from_word(B256::from(*top));
 
     assert_configured("EXTCODEHASH_PRECOMPILES");
-    if EXTCODEHASH_PRECOMPILES.with(|p| p.borrow().contains(&addr)) {
+    if !past_an_address(*top) && EXTCODEHASH_PRECOMPILES.with(|p| p.borrow().contains(&addr)) {
         *top = KECCAK_EMPTY.into();
         return;
     }
@@ -1066,19 +1098,20 @@ fn rsk_gasprice<WIRE: InterpreterTypes, H: Host + LocalCallWords + ?Sized>(
 /// EXTCODESIZE with rskj's RSKIP90 quirk: the code size of an active precompile
 /// is reported as `2^256-1` (`VM.doCODESIZE` → `DataWord.MAX_VALUE`), so a proxy
 /// guarding `extcodesize(precompile) != 0` works. All other addresses fall
-/// through to revm's standard EXTCODESIZE.
+/// through to revm's standard EXTCODESIZE, a precompile's among them where
+/// the word that names it is [`past_an_address`].
 fn rsk_extcodesize<WIRE: InterpreterTypes, H: Host + ?Sized>(
     context: InstructionContext<'_, H, WIRE>,
 ) {
-    let addr = {
+    let (addr, past) = {
         let Some(([], top)) = context.interpreter.stack.popn_top::<0>() else {
             context.interpreter.halt_underflow();
             return;
         };
-        Address::from_word(B256::from(*top))
+        (Address::from_word(B256::from(*top)), past_an_address(*top))
     };
     assert_configured("EXTCODESIZE_MAX_PRECOMPILES");
-    let is_precompile = EXTCODESIZE_MAX_PRECOMPILES.with(|p| p.borrow().contains(&addr));
+    let is_precompile = !past && EXTCODESIZE_MAX_PRECOMPILES.with(|p| p.borrow().contains(&addr));
     if is_precompile {
         if let Some(([], top)) = context.interpreter.stack.popn_top::<0>() {
             *top = U256::MAX;
@@ -1379,6 +1412,7 @@ pub fn rsk_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         context.interpreter.halt_underflow();
         return;
     };
+    let past = past_an_address(to);
     let to = Address::from_word(B256::from(to));
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
     let has_transfer = !value.is_zero();
@@ -1402,6 +1436,7 @@ pub fn rsk_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     };
 
+    ask_for_call(past);
     context
         .interpreter
         .bytecode
@@ -1577,6 +1612,7 @@ pub fn rsk_call_code<WIRE: InterpreterTypes, H: Host + ?Sized>(
         context.interpreter.halt_underflow();
         return;
     };
+    let past = past_an_address(to);
     let to = Address::from_word(B256::from(to));
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
 
@@ -1592,6 +1628,7 @@ pub fn rsk_call_code<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     };
 
+    ask_for_call(past);
     context
         .interpreter
         .bytecode
@@ -1619,6 +1656,7 @@ pub fn rsk_delegate_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         context.interpreter.halt_underflow();
         return;
     };
+    let past = past_an_address(to);
     let to = Address::from_word(B256::from(to));
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
 
@@ -1634,6 +1672,7 @@ pub fn rsk_delegate_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     };
 
+    ask_for_call(past);
     context
         .interpreter
         .bytecode
@@ -1661,6 +1700,7 @@ pub fn rsk_static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         context.interpreter.halt_underflow();
         return;
     };
+    let past = past_an_address(to);
     let to = Address::from_word(B256::from(to));
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
 
@@ -1681,6 +1721,7 @@ pub fn rsk_static_call<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     };
 
+    ask_for_call(past);
     context
         .interpreter
         .bytecode
@@ -1715,6 +1756,7 @@ pub fn rsk_static_call_with_value<WIRE: InterpreterTypes, H: Host + ?Sized>(
         context.interpreter.halt_underflow();
         return;
     };
+    let past = past_an_address(to);
     let to = Address::from_word(B256::from(to));
     let local_gas_limit = u64::try_from(local_gas_limit).unwrap_or(u64::MAX);
 
@@ -1730,6 +1772,7 @@ pub fn rsk_static_call_with_value<WIRE: InterpreterTypes, H: Host + ?Sized>(
         return;
     };
 
+    ask_for_call(past);
     context
         .interpreter
         .bytecode
