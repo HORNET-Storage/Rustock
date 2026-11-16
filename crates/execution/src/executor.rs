@@ -12648,10 +12648,11 @@ mod tests {
         assert_eq!(unique.len(), 22);
     }
 
-    /// rskj's regtest, from a genesis file: its three federators and its five
-    /// authorizers (federation change, lock whitelist, fee per KB) send free
-    /// Bridge transactions while areBridgeTxsPaid is off
-    /// (`BridgeUtils.isFreeBridgeTx`). rustock's own regtest has no federators.
+    /// rskj's regtest, from a genesis file: its three federators and its seven
+    /// authorizers (five of federation changes, one of the lock whitelist, one
+    /// of the fee per KB) send free Bridge transactions while areBridgeTxsPaid
+    /// is off (`BridgeUtils.isFreeBridgeTx`). rustock's own regtest has no
+    /// federators, and three of the five federation change authorizers.
     #[test]
     fn rskj_regtests_free_bridge_senders() {
         use crate::bridge::constants::BridgeConstants;
@@ -12663,7 +12664,7 @@ mod tests {
             free_bridge_senders(&BridgeConstants::rskj_regtest())
                 .into_iter()
                 .collect();
-        assert_eq!(rskj.len(), 8);
+        assert_eq!(rskj.len(), 10);
         assert!(rskj.contains(&federator));
         let own: std::collections::HashSet<_> = free_bridge_senders(&BridgeConstants::regtest())
             .into_iter()

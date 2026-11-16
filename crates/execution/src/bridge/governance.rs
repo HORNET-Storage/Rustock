@@ -374,11 +374,11 @@ fn federation_change_code<CTX: crate::RskContextTr>(
             if function == "add" && multikey {
                 return -10; // "add" disabled post-RSKIP123
             }
-            let pending_data = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
-            if pending_data.is_empty() {
-                return -1; // FEDERATION_NON_EXISTENT
-            }
-            // BtcECKey/ECKey.fromPublicOnly failure -> BridgeIllegalArgumentException -> -10
+            // executeVoteFederationChangeFunction reads the keys before
+            // addFederatorPublicKeyMultikey looks for the pending federation:
+            // a key BtcECKey or ECKey.fromPublicOnly can't decode throws a
+            // BridgeIllegalArgumentException, which the vote answers -10 for,
+            // pending federation or not.
             let member = if function == "add" {
                 let Some(btc) = parse_key(&args[0]) else { return -10 };
                 StoredMember::from_btc(btc)
@@ -392,6 +392,10 @@ fn federation_change_code<CTX: crate::RskContextTr>(
                 };
                 StoredMember { btc, rsk, mst }
             };
+            let pending_data = bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY);
+            if pending_data.is_empty() {
+                return -1; // FEDERATION_NON_EXISTENT
+            }
             let mut members = deserialize_pending_federation(&pending_data);
             if members
                 .iter()
@@ -1730,8 +1734,9 @@ mod tests {
         );
     }
 
-    /// rskj `FederationRegTestConstants`: regtest's federation changes are
-    /// voted on by three authorizers ('auth-a' to 'auth-c'), so two decide.
+    /// rustock's own regtest has three federation-change authorizers, the first
+    /// three of rskj's regtest ('auth-a' to 'auth-c'), so two decide. rskj's
+    /// regtest has five, and three decide there (`BridgeConstants::rskj_regtest`).
     #[test]
     fn two_of_regtests_three_authorizers_decide_a_federation_change() {
         use revm::MainContext;
@@ -1758,6 +1763,84 @@ mod tests {
         assert!(pending(&mut ctx).is_empty(), "one vote waits");
         assert_eq!(create(&mut ctx, authorizers[1]), 1);
         assert!(!pending(&mut ctx).is_empty(), "two decide");
+    }
+
+    /// rskj's regtest has five federation-change authorizers, 'auth-a' to
+    /// 'auth-e' (`FederationRegTestConstants`), and a change takes three of
+    /// them (`AddressBasedAuthorizer`, MAJORITY): the last two vote as the
+    /// first three do.
+    #[test]
+    fn three_of_rskj_regtests_five_authorizers_decide_a_federation_change() {
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::rskj_regtest();
+        let hardforks = crate::hardfork::RskHardforkConfig::rskj_regtest();
+        let authorizers = federation_change_authorizers(&config);
+        assert_eq!(authorizers.len(), 5);
+        let mut ctx =
+            revm::Context::mainnet().with_chain(crate::raw_storage::RskChainExt::default());
+        let mut create = |sender: alloy_primitives::Address| {
+            let tx_ctx = crate::precompiles::BridgeTxContext {
+                rsk_sender: sender,
+                ..Default::default()
+            };
+            let out = create_federation(&mut ctx, 0, &config, &hardforks, &tx_ctx).unwrap();
+            let answer = i64::from_be_bytes(out.bytes[24..32].try_into().unwrap());
+            let pending = !bridge_load_bytes_named(&mut ctx, PENDING_FEDERATION_KEY).is_empty();
+            (answer, pending)
+        };
+        assert_eq!(create(authorizers[3]), (1, false), "one vote waits");
+        assert_eq!(create(authorizers[4]), (1, false), "two wait");
+        assert_eq!(create(authorizers[0]), (1, true), "three decide");
+    }
+
+    /// rskj reads a new member's keys before it looks for the pending
+    /// federation (`FederationSupportImpl.executeVoteFederationChangeFunction`,
+    /// then `addFederatorPublicKeyMultikey`): with no pending federation, a key
+    /// Bouncy Castle can't decode answers -10 and a readable one -1, before
+    /// RSKIP123 and after it.
+    #[test]
+    fn an_unreadable_key_answers_minus_10_with_no_pending_federation() {
+        use crate::abi::encode::{self, Arg};
+        use crate::precompiles::BridgeTxContext;
+        use revm::MainContext;
+        // The generator, compressed, and a prefix no encoding has.
+        let good = alloy_primitives::hex::decode(
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        )
+        .unwrap();
+        let mut bad = good.clone();
+        bad[0] = 0x05;
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let authorizer =
+            alloy_primitives::hex::decode(config.federation_change_authorizer_keys[0]).unwrap();
+        let authorized = BridgeTxContext {
+            rsk_sender: super::super::federation::rsk_address_from_public_key(&authorizer).unwrap(),
+            ..BridgeTxContext::default()
+        };
+        let add = |block: u64, keys: &[&[u8]]| {
+            let mut ctx = revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default());
+            let args: Vec<Arg> = keys.iter().map(|key| Arg::Bytes(key)).collect();
+            let args = encode::args(&args);
+            let out = if keys.len() == 1 {
+                add_federator_public_key(&mut ctx, &args, 0, &config, &cfg, &authorized)
+            } else {
+                add_federator_public_key_multikey(&mut ctx, &args, 0, &config, &cfg, &authorized)
+            }
+            .unwrap();
+            i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+        };
+        let (before, after) = (1_000_000u64, 2_000_000u64);
+        assert!(!cfg.has_rskip123(before) && cfg.has_rskip123(after));
+        assert_eq!(add(before, &[&bad]), -10);
+        assert_eq!(add(before, &[&good]), -1);
+        assert_eq!(add(after, &[&good, &good, &bad]), -10);
+        assert_eq!(add(after, &[&good, &good, &good]), -1);
     }
 
     /// rskj builds the genesis federation in the format its constants name

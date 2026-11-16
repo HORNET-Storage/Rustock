@@ -1438,9 +1438,10 @@ mod tests {
         let expected = rustock_execution::executor::free_bridge_senders(&rskj);
         let rules = regtest_rules().with_bridge_constants(&rskj);
         assert_eq!(rules.free_bridge_senders, expected);
-        // rskj's regtest adds its three federators to the five authorizers.
+        // rskj's regtest adds its three federators, and the two federation
+        // change authorizers rustock's own regtest leaves out, to its senders.
         assert_eq!(
-            regtest_rules().free_bridge_senders.len() + 3,
+            regtest_rules().free_bridge_senders.len() + 5,
             expected.len()
         );
     }
