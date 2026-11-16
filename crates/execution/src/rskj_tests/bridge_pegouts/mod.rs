@@ -1,1 +1,15 @@
 //! The Bridge's storage, peg-outs, signatures and events.
+
+mod bridge_event_logger_impl_test;
+mod bridge_event_logger_legacy_impl_test;
+mod bridge_storage_provider_test;
+mod bridge_support_add_signature_test;
+mod bridge_support_pegout_transaction_created_event_test;
+mod bridge_support_process_funds_migration_test;
+mod bridge_support_register_btc_transaction_test;
+mod bridge_support_sig_hash_test;
+mod peg_utils_all_utxos_to_fed_are_above_minimum_pegin_value_test;
+mod peg_utils_get_transaction_type_test;
+mod peg_utils_legacy_get_transaction_type_test;
+mod release_transaction_builder_test;
+mod support;
