@@ -4334,7 +4334,9 @@ impl SyncService {
     /// its parent too; and then relays it and queues it to be connected, best
     /// or not. Here the body is held to its header's commitments, the header is
     /// verified and stored as any header at the tip is (the same rules, the
-    /// extra data's size among them), the block is relayed, and it is executed
+    /// extra data's size among them), and held besides to the one rule rskj's
+    /// relay validator adds to them, its time later than its parent's
+    /// (`SyncManager::verify_for_relay`); the block is relayed, and it is executed
     /// on its own parent's state, best or not: on the chain as the canonical
     /// block at its height, or beside it (see `beside`). Its uncles are in
     /// hand, so it is weighed with them, as rskj weighs a block it connects. A
@@ -4379,6 +4381,25 @@ impl SyncService {
         } = block;
         if let Some(what) = crate::body_check::body_mismatch(&header, &transactions, &ommers) {
             self.charge_bad_body(peer, number, what);
+            return;
+        }
+        // rskj `AsyncNodeBlockProcessor.processBlock` (`isBlockValid`, the relay
+        // validator): a block that fails it is invalid to rskj, neither queued
+        // to be connected nor relayed, and its sender is scored for it
+        // (`MessageVisitor.apply`). Before the header is stored: rskj keeps
+        // nothing of such a block in its chain. It connects one with a
+        // descendant that arrives or through its sync, whose validator holds
+        // a block's time to the clock alone; this node takes one as the
+        // answer to a request, which a descendant's arrival sends.
+        if let Err(e) = self.manager.verify_for_relay(&header) {
+            debug!(
+                target: "rustock::sync",
+                "Block #{number} from {:?} is not one to relay: {e}",
+                &peer.0[..4]
+            );
+            if let Some(scoring) = &self.scoring {
+                scoring.record_peer(peer, rustock_networking::scoring::EventType::InvalidBlock);
+            }
             return;
         }
         self.manager.note_whole_block_difficulty(&header, &ommers);

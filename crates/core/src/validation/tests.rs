@@ -1298,6 +1298,26 @@ fn a_zero_period_turns_the_timestamp_rule_off() {
     assert!(rule.validate_with_parent_at(NOW, &at(NOW), &at(NOW + 1_000)).is_ok());
 }
 
+/// rskj's relay validator runs the parent form, which its `BlockValidatorImpl`
+/// doesn't (`RskContext.getBlockRelayValidator`, `getBlockValidationRule`):
+/// the default verifier's relay rules refuse a header no later than its
+/// parent on mainnet, and regtest's zero period turns them off. The headers
+/// are long past, so the clock refuses none of them.
+#[test]
+fn the_relay_rules_hold_a_header_to_its_parents_time() {
+    let verifier =
+        |config: crate::config::ChainConfig| HeaderVerifier::default_rsk(Arc::new(config));
+    let (parent, same, later) = (at(1_000), at(1_000), at(1_001));
+    let mainnet = verifier(crate::config::ChainConfig::mainnet());
+    assert!(matches!(
+        mainnet.verify_for_relay(&same, &parent),
+        Err(ValidationError::TimestampOlderThanParent { .. })
+    ));
+    assert!(mainnet.verify_for_relay(&later, &parent).is_ok());
+    let regtest = verifier(crate::config::ChainConfig::regtest());
+    assert!(regtest.verify_for_relay(&same, &parent).is_ok());
+}
+
 /// rskj `Constants`: `newBlockMaxSecondsInTheFuture` per network, and
 /// `getMinGasLimit()` on all of them.
 #[test]

@@ -197,6 +197,10 @@ pub struct HeaderVerifier {
     /// its uncle rule lists of its own.
     uncle_rules: Vec<Box<dyn HeaderValidator>>,
     uncle_parent_rules: Vec<Box<dyn ParentHeaderValidator>>,
+    /// The rules a block a peer sent whole meets against its parent before
+    /// it is taken and relayed, past a trunk header's: see
+    /// [`Self::verify_for_relay`].
+    relay_parent_rules: Vec<Box<dyn ParentHeaderValidator>>,
 }
 
 impl Default for HeaderVerifier {
@@ -212,6 +216,7 @@ impl HeaderVerifier {
             parent_rules: Vec::new(),
             uncle_rules: Vec::new(),
             uncle_parent_rules: Vec::new(),
+            relay_parent_rules: Vec::new(),
         }
     }
 
@@ -243,6 +248,8 @@ impl HeaderVerifier {
             .with_parent_rule(block_rules::PrevMinGasPriceRule)
             .with_parent_rule(DifficultyRule { config: config.clone() });
         verifier.uncle_rules = uncles::rsk_header_rules(config.clone());
+        verifier.relay_parent_rules =
+            vec![Box::new(TimestampRule::new(config.max_future_block_time))];
         verifier.uncle_parent_rules = uncles::rsk_parent_rules(config);
         verifier
     }
@@ -298,6 +305,29 @@ impl HeaderVerifier {
     pub fn with_parent_rule(mut self, rule: impl ParentHeaderValidator + 'static) -> Self {
         self.parent_rules.push(Box::new(rule));
         self
+    }
+
+    pub fn with_relay_parent_rule(mut self, rule: impl ParentHeaderValidator + 'static) -> Self {
+        self.relay_parent_rules.push(Box::new(rule));
+        self
+    }
+
+    /// What rskj's relay validator holds a block to against its parent, past
+    /// the rules every trunk header meets (`RskContext.getBlockRelayValidator`):
+    /// its time later than its parent's, the parent form of
+    /// `BlockTimeStampValidationRule`.
+    ///
+    /// rskj runs that validator on a block a peer sends whole
+    /// (`AsyncNodeBlockProcessor.processBlock`, its default): one that fails
+    /// is an invalid block to it, neither queued to be connected nor relayed.
+    /// `BlockValidatorImpl` doesn't run it, so the same block is still one
+    /// rskj connects, with a descendant that arrives or through its sync, and
+    /// [`Self::verify`] doesn't run it either.
+    pub fn verify_for_relay(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
+        for rule in &self.relay_parent_rules {
+            rule.validate_with_parent(header, parent)?;
+        }
+        Ok(())
     }
 
     /// Runs only the rules that relate a header to its parent.

@@ -3741,6 +3741,75 @@ async fn what_a_node_cannot_use_is_neither_taken_nor_relayed() {
     }
 }
 
+/// rskj's relay validator (`RskContext.getBlockRelayValidator`) holds a block
+/// a peer sends whole to one rule a trunk header doesn't meet: its time later
+/// than its parent's. One that is no later is neither taken nor relayed
+/// (`AsyncNodeBlockProcessor.processBlock`), where its header is still stored
+/// as the answer to a request, as rskj connects such a block then
+/// (`BlockValidatorImpl` doesn't run the rule). A second later than its
+/// parent, the block is taken and relayed; and on a parent this node lacks
+/// the rule has nothing to judge by, and the block's headers are asked for.
+#[tokio::test]
+async fn a_whole_block_no_later_than_its_parent_is_neither_taken_nor_relayed() {
+    let relay_rule = || {
+        HeaderVerifier::new()
+            .with_relay_parent_rule(rustock_core::validation::TimestampRule::new(60))
+    };
+    let sender = B512::repeat_byte(1);
+    let at = |parent: B256, timestamp: u64| Header {
+        timestamp,
+        ..dummy_header(1, parent, U256::from(1))
+    };
+
+    let mut node = tip_node_verifying(2, relay_rule()).await;
+    let same_time = at(node.genesis, 0);
+    let hash = same_time.hash();
+    node.service
+        .on_new_block(sender, whole(same_time.clone()))
+        .await;
+    assert!(node.store.header(hash).unwrap().is_none(), "stored");
+    assert!(node.store.body(hash).unwrap().is_none(), "its body stored");
+    for (id, inbox) in &mut node.inboxes {
+        assert!(sent(inbox).is_empty(), "{id:?} was sent something");
+    }
+    let ingested = node
+        .manager
+        .handle_headers_response(vec![same_time], sender)
+        .unwrap();
+    assert_eq!(
+        (ingested.stored, ingested.rejected),
+        (1, 0),
+        "as the answer to a request"
+    );
+
+    let mut node = tip_node_verifying(2, relay_rule()).await;
+    let later = at(node.genesis, 1);
+    let hash = later.hash();
+    node.service.on_new_block(sender, whole(later)).await;
+    assert!(node.store.header(hash).unwrap().is_some());
+    assert!(node.store.body(hash).unwrap().is_some());
+    for (id, inbox) in &mut node.inboxes {
+        let told = told_of(inbox);
+        if *id == sender {
+            assert!(told.is_empty(), "the sender was told of its own block");
+        } else {
+            assert_eq!(told, vec![BlockIdentifier { hash, number: 1 }], "{id:?}");
+        }
+    }
+
+    let mut node = tip_node_verifying(2, relay_rule()).await;
+    let orphan = at(B256::repeat_byte(0x55), 0);
+    node.service.on_new_block(sender, whole(orphan)).await;
+    let (_, inbox) = &mut node.inboxes[0];
+    assert!(
+        matches!(
+            sent(inbox).as_slice(),
+            [rustock_networking::protocol::RskSubMessage::BlockHeadersRequest(_)]
+        ),
+        "its headers are asked of the sender"
+    );
+}
+
 /// A block that builds on the executed head goes on to execution, as a
 /// fetched body does (`drain_follow_buffer`).
 #[tokio::test]

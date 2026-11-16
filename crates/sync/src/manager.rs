@@ -85,6 +85,20 @@ impl SyncManager {
         self.ingest_headers(headers, Some(peer))
     }
 
+    /// rskj's relay validator, past the rules every header meets
+    /// ([`HeaderVerifier::verify_for_relay`]), against the parent this node
+    /// holds. A header whose parent it lacks passes: rskj judges a block so
+    /// only once its ancestors are in hand.
+    pub fn verify_for_relay(
+        &self,
+        header: &Header,
+    ) -> std::result::Result<(), rustock_core::validation::ValidationError> {
+        match self.store.header(header.parent_hash) {
+            Ok(Some(parent)) => self.verifier.verify_for_relay(header, &parent),
+            _ => Ok(()),
+        }
+    }
+
     /// Record the cumulative difficulties proved by `entries`, and hand back
     /// the bare headers for the ordinary ingest path.
     ///

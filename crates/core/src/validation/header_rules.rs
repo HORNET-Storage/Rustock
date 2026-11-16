@@ -45,7 +45,9 @@ impl ParentHeaderValidator for ParentHashRule {
 /// chain, runs the rule on the header alone, as its header sync does: a
 /// block no later than its parent is one rskj imports. So
 /// [`HeaderVerifier::default_rsk`](super::HeaderVerifier::default_rsk) holds
-/// a trunk header to the clock alone, and an uncle to its parent too.
+/// a trunk header to the clock alone, and an uncle to its parent too, as it
+/// holds a block a peer sent whole before that block is taken and relayed
+/// ([`HeaderVerifier::verify_for_relay`](super::HeaderVerifier::verify_for_relay)).
 pub struct TimestampRule {
     max_future_offset: u64,
 }
