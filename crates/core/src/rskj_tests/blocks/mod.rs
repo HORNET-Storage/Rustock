@@ -4,6 +4,9 @@ mod support;
 
 mod block_difficulty_rule_test;
 mod block_difficulty_validation_rule_test;
+mod block_factory_test;
+mod block_header_builder_test;
+mod block_header_test;
 mod block_parent_number_rule_test;
 mod block_uncles_validation_rule_test;
 mod fork_detection_data_rule_test;

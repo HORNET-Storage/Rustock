@@ -119,7 +119,10 @@ pub(super) fn mine(btc: &mut bitcoin::block::Header, difficulty: U256) {
 }
 
 /// A mined Bitcoin header holding `wire_root` as its merkle root.
-pub(super) fn bitcoin_header_with_root(wire_root: [u8; 32], difficulty: U256) -> bitcoin::block::Header {
+pub(super) fn bitcoin_header_with_root(
+    wire_root: [u8; 32],
+    difficulty: U256,
+) -> bitcoin::block::Header {
     let mut btc = bitcoin::block::Header {
         version: bitcoin::block::Version::from_consensus(1),
         prev_blockhash: bitcoin::BlockHash::all_zeros(),
@@ -157,7 +160,11 @@ pub(super) fn folded_root(coinbase_hash: [u8; 32], siblings: &[[u8; 32]]) -> [u8
 
 /// `header` merge-mined through `coinbase` and an RSKIP92 proof of
 /// `siblings`, by a Bitcoin header holding the root they fold to.
-pub(super) fn mined_with_siblings(header: Header, coinbase: Vec<u8>, siblings: &[[u8; 32]]) -> Header {
+pub(super) fn mined_with_siblings(
+    header: Header,
+    coinbase: Vec<u8>,
+    siblings: &[[u8; 32]],
+) -> Header {
     let root = folded_root(merged_mining::compute_coinbase_hash(&coinbase), siblings);
     mined_through(header, coinbase, siblings.concat(), wire(root))
 }

@@ -10,7 +10,7 @@
 
 use super::support::{
     bitcoin_header_with_root, coinbase_committing_to, compressed_coinbase, header,
-    merged_mining_rule, mined_with_siblings, minable_header, regtest_with_iris300_at,
+    merged_mining_rule, minable_header, mined_with_siblings, regtest_with_iris300_at,
     tail_committing_to,
 };
 use crate::config::{ActivationHeights, ChainConfig};
@@ -48,10 +48,7 @@ fn mined_in_a_whole_block(mut header: Header) -> (Header, Vec<u8>) {
     let coinbase = bitcoin_coinbase(&committed);
     let coinbase_bytes = bitcoin::consensus::serialize(&coinbase);
     // A one-transaction block's merkle root is its coinbase's id.
-    let btc = bitcoin_header_with_root(
-        coinbase.compute_txid().to_byte_array(),
-        header.difficulty,
-    );
+    let btc = bitcoin_header_with_root(coinbase.compute_txid().to_byte_array(), header.difficulty);
     let header_bytes = bitcoin::consensus::serialize(&btc);
     header.bitcoin_merged_mining_header = Some(Bytes::from(header_bytes.clone()));
     header.bitcoin_merged_mining_coinbase_transaction =
@@ -111,7 +108,10 @@ fn a_coinbase_without_the_rsk_tag_is_refused() {
     );
 
     let tagged = coinbase_committing_to(&header, 30);
-    assert_eq!(rule.validate(&mined_with_siblings(header, tagged, &[])), Ok(()));
+    assert_eq!(
+        rule.validate(&mined_with_siblings(header, tagged, &[])),
+        Ok(())
+    );
 }
 
 /// rskj `test_RSKTagInCoinbaseTransactionTooFar`: the tag must start within

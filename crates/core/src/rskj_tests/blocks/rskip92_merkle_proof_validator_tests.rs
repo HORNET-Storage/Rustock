@@ -11,8 +11,8 @@
 //! [`MergedMiningRule`]: crate::validation::MergedMiningRule
 
 use super::support::{
-    coinbase_committing_to, folded_root, hashes, merged_mining_rule, mined_through,
-    mined_with_siblings, minable_header, regtest_with_iris300_at, wire,
+    coinbase_committing_to, folded_root, hashes, merged_mining_rule, minable_header, mined_through,
+    mined_with_siblings, regtest_with_iris300_at, wire,
 };
 use crate::validation::merged_mining::{self, MAX_MERGED_MINING_MERKLE_PROOF_LENGTH};
 use crate::validation::{HeaderValidator, ValidationError};
@@ -48,9 +48,14 @@ fn a_proof_folds_the_coinbase_hash_with_each_hash_in_turn() {
     let list = hashes(5);
     let proof = list.concat();
     let coinbase = list[0];
-    let root = list.iter().fold(coinbase, |node, hash| combine(&node, hash));
+    let root = list
+        .iter()
+        .fold(coinbase, |node, hash| combine(&node, hash));
 
-    assert_eq!(merged_mining::rskip92_merkle_root(&coinbase, &proof), Some(root));
+    assert_eq!(
+        merged_mining::rskip92_merkle_root(&coinbase, &proof),
+        Some(root)
+    );
     assert_ne!(
         merged_mining::rskip92_merkle_root(&[0; 32], &proof),
         Some(root),
@@ -69,13 +74,9 @@ fn a_proof_folds_the_coinbase_hash_with_each_hash_in_turn() {
     assert_eq!(rule.validate(&mined), Ok(()));
 
     let mut wrong_root = mined.clone();
-    wrong_root.bitcoin_merged_mining_header = mined_through(
-        header.clone(),
-        coinbase.clone(),
-        list.concat(),
-        [0; 32],
-    )
-    .bitcoin_merged_mining_header;
+    wrong_root.bitcoin_merged_mining_header =
+        mined_through(header.clone(), coinbase.clone(), list.concat(), [0; 32])
+            .bitcoin_merged_mining_header;
     assert_eq!(
         rule.validate(&wrong_root),
         Err(ValidationError::BitcoinMerkleProofInvalid)
@@ -104,7 +105,11 @@ fn a_header_without_a_merkle_proof_is_refused_with_or_without_rskip180() {
         let header = minable_header(number);
         let coinbase = coinbase_committing_to(&header, 30);
         let mut mined = mined_with_siblings(header, coinbase, &[]);
-        assert_eq!(rule.validate(&mined), Ok(()), "block {number}, with its proof");
+        assert_eq!(
+            rule.validate(&mined),
+            Ok(()),
+            "block {number}, with its proof"
+        );
         mined.bitcoin_merged_mining_merkle_proof = None;
         assert_eq!(
             rule.validate(&mined),
@@ -146,7 +151,11 @@ fn from_rskip180_a_proof_over_960_bytes_is_refused() {
     // before its form, and for its form below it.
     let malformed = |number: u64| {
         let mut header = mined(number, 30);
-        let mut proof = header.bitcoin_merged_mining_merkle_proof.take().unwrap().to_vec();
+        let mut proof = header
+            .bitcoin_merged_mining_merkle_proof
+            .take()
+            .unwrap()
+            .to_vec();
         proof.push(0);
         header.bitcoin_merged_mining_merkle_proof = Some(Bytes::from(proof));
         rule.validate(&header)
