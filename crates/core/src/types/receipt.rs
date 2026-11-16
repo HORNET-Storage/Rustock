@@ -578,4 +578,87 @@ mod tests {
         long_bloom.extend(payload);
         assert!(Receipt::decode(&mut long_bloom.as_slice()).is_err());
     }
+
+    /// A receipt that spent no gas writes both gas counts empty, as rskj's
+    /// do: `TransactionReceipt.setGasUsed` and `setCumulativeGas` take the
+    /// count through BouncyCastle 1.59's `BigIntegers.asUnsignedByteArray`,
+    /// which makes zero the empty array (rskj's own `ByteUtil.bigIntegerToBytes`
+    /// says so, being written to avoid it), and `RLP.encodeElement` writes that
+    /// as `0x80`. A REMASC transaction spends none, so every block whose only
+    /// transaction is REMASC's carries the root of this one receipt: mainnet's
+    /// #1 under the Orchid hash, and #1,591,001, past RSKIP-126 at #1,591,000,
+    /// under the Unitrie's (`BlockHashesHelper.calculateReceiptsTrieRoot`).
+    #[test]
+    fn a_receipt_that_spent_no_gas_writes_it_empty_and_hashes_to_mainnets_root() {
+        let receipt = Receipt::new(true, 0, 0, Bloom::ZERO, vec![]);
+        let encoded = receipt.rlp_encode();
+        // [postTxState 01, cumulativeGas 80, bloom, logs c0, gasUsed 80, status 01]
+        assert_eq!(&encoded[..5], &[0xf9, 0x01, 0x08, 0x01, 0x80]);
+        assert_eq!(&encoded[encoded.len() - 3..], &[0xc0, 0x80, 0x01]);
+        let orchid: B256 = "0xa70fc9a7d692ac80a46b23dcf81d5928dbdebc8ac097cfdbce2c03301d9e9406"
+            .parse()
+            .unwrap();
+        let unitrie: B256 = "0x66cfdb731f620cd96e2c2cb0f7d3c3a2879c29b40014aa27efbbf3cf9cd3b0f6"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            ordered_trie_root(std::slice::from_ref(&receipt), false),
+            orchid
+        );
+        assert_eq!(ordered_trie_root(&[receipt], true), unitrie);
+    }
+
+    /// A receipt's logs and bloom, held to a real block: mainnet #1,590,872's
+    /// only transaction is REMASC's, paying two miners and logging each
+    /// payment (`RemascFeesPayer.logPayment`). Each log is written
+    /// `[address, [topics], data]` (`LogInfo.getEncoded`), the receipt's bloom
+    /// is the union of its logs' (`TransactionReceipt.setLogInfoList`,
+    /// `LogInfo.getBloom`), and the block carries that bloom and the root.
+    #[test]
+    fn a_receipts_logs_and_bloom_hash_to_mainnets_root() {
+        let remasc: Address = "0x0000000000000000000000000000000001000008"
+            .parse()
+            .unwrap();
+        let topic: B256 = "0x000000000000000000000000000000006d696e696e675f6665655f746f706963"
+            .parse()
+            .unwrap();
+        let paid = |to: &str, data: &str| Log {
+            address: remasc,
+            topics: vec![topic, to.parse().unwrap()],
+            data: Bytes::from(hex_to_bytes(data)),
+        };
+        let logs = vec![
+            paid(
+                "0x00000000000000000000000014d3065c8eb89895f4df12450ec6b130049f8034",
+                "e8a029e5929235c79467fe3b7e2e1742607c8fa55450c89560557226ec022566418d8602384fb8b07a",
+            ),
+            paid(
+                "0x00000000000000000000000012d3178a62ef1f520944534ed04504609f7307a1",
+                "e8a029e5929235c79467fe3b7e2e1742607c8fa55450c89560557226ec022566418d8608ca83607d69",
+            ),
+        ];
+        let mut bloom = Bloom::ZERO;
+        for log in &logs {
+            crate::bloom::accrue_log(&mut bloom, log);
+        }
+        let carried: Bloom = concat!(
+            "0x",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000020000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000001000200000000000000000000000000000000010000000000000",
+            "0000000100000000000000000000000000002000010000040020000010000000",
+            "0000000000000000000004000000000000020000000000000000000000000000",
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(bloom, carried);
+        let receipt = Receipt::new(true, 0, 0, bloom, logs);
+        let root: B256 = "0xac2a5ff23a9f7cc1b6dc9ddd310d9d9f86dcf56a3ffa28715600d63e419dd15a"
+            .parse()
+            .unwrap();
+        assert_eq!(ordered_trie_root(&[receipt], false), root);
+    }
 }
