@@ -2,4 +2,6 @@
 //! and `org.ethereum.vm`).
 
 mod harness;
+mod transient_storage_dsl_test;
+mod transient_storage_test;
 mod vm_execution_test;

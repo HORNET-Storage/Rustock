@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
+use alloy_primitives::{hex, Address, Bloom, Bytes, B256, U256};
 use rustock_core::{Header, Transaction};
 use rustock_storage::BlockStore;
 use rustock_trie::{AccountState, MemoryTrieStore, TrieKeySlice, TrieNode};
@@ -28,18 +28,51 @@ pub(super) const GAS: u64 = 1_000_000;
 /// What [`return_top`] of one word costs: two PUSH2s, an MSTORE and the
 /// word of memory it takes, and a PUSH1. RETURN costs nothing.
 pub(super) const RETURN_ONE_WORD_GAS: u64 = 15;
+/// Code that logs the top word of the stack, and takes it off: an MSTORE of
+/// it at 0, and a LOG0 of those 32 bytes. [`logged`] reads it back.
+pub(super) const LOG_TOP: &str = "PUSH1 0x00 MSTORE PUSH1 0x20 PUSH1 0x00 LOG0";
 
 /// Compiles `code` as rskj's `BytecodeCompiler` does: each word is an
 /// opcode's name, in any case, or `0x` and bytes in hex, which go in as
 /// they are. rskj's names are read as rskj reads them: DUPN, SWAPN and
 /// TXINDEX are its own opcodes (0xa8 to 0xaa), not EIP-8024's.
+///
+/// Two more words let a program branch: `name:` is a JUMPDEST, and `@name`
+/// pushes where that JUMPDEST is, with a PUSH2.
 pub(super) fn compile(code: &str) -> Vec<u8> {
+    let tokens: Vec<String> = code
+        .split_whitespace()
+        .map(str::to_ascii_uppercase)
+        .collect();
+    let mut labels = std::collections::HashMap::new();
+    let mut at = 0;
+    for token in &tokens {
+        if let Some(label) = token.strip_suffix(':') {
+            labels.insert(label.to_string(), at);
+        }
+        at += if token.starts_with('@') {
+            3
+        } else if let Some(hex) = token.strip_prefix("0X") {
+            hex.len() / 2
+        } else {
+            1
+        };
+    }
     let mut bytes = Vec::new();
-    for token in code.split_whitespace() {
-        let token = token.to_ascii_uppercase();
-        match token.strip_prefix("0X") {
-            Some(hex) => bytes.extend(alloy_primitives::hex::decode(hex).expect("hex bytes")),
-            None => bytes.push(opcode(&token).unwrap_or_else(|| panic!("no opcode {token}"))),
+    for token in &tokens {
+        if token.ends_with(':') {
+            bytes.push(0x5b); // JUMPDEST
+        } else if let Some(label) = token.strip_prefix('@') {
+            let Some(at) = labels.get(label) else {
+                panic!("no label {label}");
+            };
+            let at = u16::try_from(*at).expect("a label within 64 KB");
+            bytes.push(0x61); // PUSH2
+            bytes.extend(at.to_be_bytes());
+        } else if let Some(hex) = token.strip_prefix("0X") {
+            bytes.extend(hex::decode(hex).expect("hex bytes"));
+        } else {
+            bytes.push(opcode(token).unwrap_or_else(|| panic!("no opcode {token}")));
         }
     }
     bytes
@@ -75,6 +108,18 @@ pub(super) fn return_top(words: usize) -> Vec<u8> {
 /// The words of a program's output.
 pub(super) fn words(output: &[u8]) -> Vec<U256> {
     output.chunks(32).map(U256::from_be_slice).collect()
+}
+
+/// The word each log of a transaction holds, in order: what [`LOG_TOP`]
+/// logged.
+pub(super) fn logged(result: &TxExecutionResult) -> Vec<U256> {
+    let data = result.logs.iter().map(|log| &log.data.data[..]);
+    data.map(U256::from_be_slice).collect()
+}
+
+/// `value` as a word in hex, for a PUSH32: `0x` and 64 digits.
+pub(super) fn hex_word(value: U256) -> String {
+    format!("0x{}", hex::encode(value.to_be_bytes::<32>()))
 }
 
 /// A transaction calling `to` with `data`, at a gas price of 0.
@@ -217,6 +262,14 @@ impl Chain {
     pub(super) fn balance(&self, address: Address) -> U256 {
         self.account(address)
             .map_or(U256::ZERO, |account| account.balance)
+    }
+
+    /// The word at `slot` of `address`'s storage: zero where none is.
+    pub(super) fn storage(&self, address: Address, slot: u64) -> U256 {
+        let slot = B256::from(U256::from(slot));
+        let key = TrieKeySlice::from_key(&rustock_trie::storage_key(&address, &slot));
+        let value = self.root.get(&key, self.store.as_ref());
+        value.map_or(U256::ZERO, |value| U256::from_be_slice(&value))
     }
 }
 
