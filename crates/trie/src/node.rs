@@ -557,6 +557,11 @@ impl TrieNode {
             if val.as_ref().is_some_and(|v| v.len() != vlen as usize) {
                 return None;
             }
+            // rskj `fromMessageRskip107`: "The message had more data than
+            // expected" -- nothing may follow the value's length.
+            if r.pos < data.len() {
+                return None;
+            }
             long_value_len = Some(vlen);
             (val, Some(vh))
         } else if r.pos < data.len() {

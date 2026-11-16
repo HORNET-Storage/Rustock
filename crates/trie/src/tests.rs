@@ -420,6 +420,28 @@ mod unit {
         assert_eq!(TrieNode::from_message(&message, &store).children_size, 71);
     }
 
+    /// rskj `Trie.fromMessageRskip107` refuses a message with bytes after a
+    /// kept-apart value's hash and 3-byte length ("The message had more data
+    /// than expected"), alone or embedded in its parent's.
+    #[test]
+    fn a_message_with_bytes_after_a_long_values_length_is_refused() {
+        let store = MemoryTrieStore::new();
+        let leaf = TrieNode::new_leaf(TrieKeySlice::empty(), make_value(33));
+        let message = leaf.to_message(&store);
+        assert_eq!(message.len(), 36);
+        assert!(TrieNode::try_from_message(&message, &store).is_some());
+        let mut longer = message.clone();
+        longer.push(0);
+        assert!(TrieNode::try_from_message(&longer, &store).is_none());
+
+        // A left child embedded (flags 0b0000_1010), its length, its
+        // message, and the children's size, a VarInt of one byte.
+        let parent =
+            |child: &[u8]| [&[0b0000_1010, child.len() as u8][..], child, &[33 + 36]].concat();
+        assert!(TrieNode::try_from_message(&parent(&message), &store).is_some());
+        assert!(TrieNode::try_from_message(&parent(&longer), &store).is_none());
+    }
+
     /// rskj embeds a child in its parent's message when the child has no
     /// children and its own message is at most 44 bytes (`Trie.isEmbeddable`),
     /// and refers to it by its hash otherwise. A node without children records
