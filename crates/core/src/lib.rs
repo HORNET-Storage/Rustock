@@ -15,6 +15,9 @@ pub mod selection_rule;
 #[cfg(test)]
 mod mutate;
 
+#[cfg(test)]
+mod rskj_tests;
+
 pub use types::block::Block;
 pub use types::header::Header;
 pub use types::receipt::{Log, Receipt, ordered_trie_root, ordered_tx_trie_root};

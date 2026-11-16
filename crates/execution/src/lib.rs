@@ -46,6 +46,9 @@ pub mod tracer;
 pub mod supply;
 pub use state::apply_state_changes;
 
+#[cfg(test)]
+mod rskj_tests;
+
 /// A context for reading Bridge state at a committed state root.
 ///
 /// Read-only by construction: it carries no database and no journal, so the
