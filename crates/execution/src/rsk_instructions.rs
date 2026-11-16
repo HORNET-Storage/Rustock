@@ -1407,8 +1407,9 @@ where
     // rskj charges NEW_ACCT_CALL for op CALL whenever the callee does not
     // exist, regardless of value: passing transfers_value=true makes revm's
     // new_account_cost unconditional on emptiness.
-    // (Approximation: revm reports EIP-161 emptiness, rskj checks trie
-    // existence; they differ only for existing-but-empty accounts.)
+    // The journal keeps HOMESTEAD's account rules (`load_accounts` in
+    // rsk_handler), under which revm's `is_empty` is an account the trie
+    // doesn't hold and the transaction hasn't touched: rskj's `!isExist`.
     let (cost, bytecode, code_hash) =
         load_account_delegated_handle_error(context, to, true, charge_new_account)?;
     if !context.interpreter.gas.record_cost(cost) {

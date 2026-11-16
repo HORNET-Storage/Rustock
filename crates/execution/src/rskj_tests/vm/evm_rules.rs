@@ -7,14 +7,16 @@ use alloy_primitives::{keccak256, Address, B256, U256};
 use rustock_core::Transaction;
 
 use super::harness::{
-    call, compile, create, push_address, return_top, run_code, words, Chain, CONTRACT, GAS,
-    ONE_RBTC, SENDER,
+    call, compile, create, hex_word, push_address, return_top, run_code, words, Chain, CONTRACT,
+    GAS, ONE_RBTC, SENDER,
 };
 
 /// orchid on mainnet: RSKIP91.
 const ORCHID: u64 = 729_000;
 /// wasabi100 on mainnet: RSKIP125.
 const WASABI: u64 = 1_591_000;
+/// twoToThree on mainnet: RSKIP150.
+const TWO_TO_THREE: u64 = 2_018_000;
 /// papyrus200 on mainnet: RSKIP140.
 const PAPYRUS: u64 = 2_392_700;
 /// iris300 on mainnet.
@@ -470,4 +472,49 @@ fn a_transaction_from_an_address_with_code_runs() {
         let nonce = chain.account(SENDER).map(|a| a.nonce);
         assert_eq!(nonce, Some(U256::from(1)), "#{number}");
     }
+}
+
+/// Before RSKIP150 (twoToThree) a precompile's whole output is written at
+/// the call's output offset, whatever size the call gave it, and the memory
+/// that takes is charged for nothing (`Program.saveOutAfterExecution`). Here
+/// the identity precompile's word lands past the 0 bytes asked for, and the
+/// MLOAD that reads it then expands nothing. From RSKIP150 nothing is written
+/// past what was asked for, and the MLOAD pays 6 gas for 2 more words. (Not
+/// at wasabi100's own block, where rskj makes each precompile's account
+/// before the block runs, and the call's new-account charge falls away.)
+#[test]
+fn before_rskip150_a_precompiles_whole_output_is_written_for_nothing() {
+    let word = U256::from_be_bytes([0x11; 32]);
+    let code = compile(&format!(
+        "PUSH32 {} PUSH1 0x00 MSTORE \
+         PUSH1 0x00 PUSH1 0x40 PUSH1 0x20 PUSH1 0x00 PUSH1 0x00 {IDENTITY} PUSH3 0x030d40 \
+         CALL POP MSIZE PUSH1 0x40 MLOAD",
+        hex_word(word)
+    ));
+    let run = |number| {
+        let mut chain = Chain::mainnet(number);
+        chain.put(SENDER, 0, ONE_RBTC, &[]);
+        chain.put(
+            CONTRACT,
+            1,
+            U256::ZERO,
+            &[code.clone(), return_top(2)].concat(),
+        );
+        let ran = chain.run(SENDER, call(0, CONTRACT, U256::ZERO, GAS, &[]));
+        assert!(ran.success, "#{number}");
+        (words(&ran.output), ran.gas_used)
+    };
+    let (before, before_gas) = run(TWO_TO_THREE - 1);
+    let (from, from_gas) = run(TWO_TO_THREE);
+    assert_eq!(
+        before,
+        [word, U256::from(96)],
+        "before RSKIP150: the word, and 3 words"
+    );
+    assert_eq!(
+        from,
+        [U256::ZERO, U256::from(32)],
+        "from RSKIP150: nothing, and 1 word"
+    );
+    assert_eq!(from_gas - before_gas, 6);
 }

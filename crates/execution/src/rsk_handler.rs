@@ -1866,9 +1866,6 @@ where
     )))
 }
 
-/// If the top (just-initialized) frame is a CREATE frame, reset the created
-/// account's nonce to 0. On revert the AccountCreated journal entry discards
-/// the account wholesale, so no extra journaling is needed.
 /// Pre-RSKIP150 `Program.memorySave(outOffs, out)`: write a successful
 /// precompile's FULL output into the caller's memory, extending it
 /// word-aligned WITHOUT charging gas (rskj `Memory.extend` grows the
@@ -1898,6 +1895,9 @@ where
     interpreter.memory.set(mem_start, output);
 }
 
+/// If the top (just-initialized) frame is a CREATE frame, reset the created
+/// account's nonce to 0. On revert the AccountCreated journal entry discards
+/// the account wholesale, so no extra journaling is needed.
 fn set_created_contract_nonce<EVM>(evm: &mut EVM, nonce: u64)
 where
     EVM: EvmTr<

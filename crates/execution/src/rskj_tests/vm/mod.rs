@@ -8,6 +8,7 @@ mod evm_rules;
 mod ext_code_hash_test;
 pub(super) mod harness;
 mod initcode_cost_calculator_test;
+mod mcopy_test;
 mod nested_calls_stack_depth_test;
 mod rskip544_test;
 mod transaction_executor_init_code_size_dsl_test;
