@@ -6531,6 +6531,32 @@ async fn a_retreat_after_a_failed_snapshot_sync_leaves_it_free_to_try_again() {
     );
 }
 
+/// A snapshot's blocks are kept without being run, so the session that takes
+/// them is given the node's rules for what a block carries
+/// (`SnapSession::with_block_rules`), as rskj gives its snapshot client its
+/// two block validators (`RskContext.getSnapshotProcessor`). A node with no
+/// block processor has none to give.
+#[tokio::test]
+async fn a_snapshot_session_is_given_the_nodes_rules_for_the_blocks_it_keeps() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let started = |mut service: SyncService| {
+        service.start_snap_sync(
+            crate::snap::SnapConfig::default(),
+            Arc::new(HeaderVerifier::new()),
+        );
+        service.snap_holds_blocks_to_rules_for_test()
+    };
+
+    assert_eq!(started(service_with_state(store.clone())), Some(true));
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    assert_eq!(
+        started(service_over(store).with_trie_store_for_test(trie)),
+        Some(false)
+    );
+}
+
 /// What a node holds when its snapshot sync failed the final check: a linked
 /// chain, nothing executed, and in the trie store the root of the checkpoint's
 /// state -- downloaded, never verified, perhaps full of holes. No other block's

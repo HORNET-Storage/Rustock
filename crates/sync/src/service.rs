@@ -1328,12 +1328,17 @@ impl SyncService {
     ) {
         self.snap_attempts += 1;
         self.suspend_ordinary_sync();
-        let session = crate::snap::session::SnapSession::new(
+        let mut session = crate::snap::session::SnapSession::new(
             config,
             self.manager.store.clone(),
             trie_store,
             verifier,
         );
+        // The blocks a snapshot brings are kept without being run, so the
+        // session holds them to this node's rules for what a block carries.
+        if let Some(processor) = &self.block_processor {
+            session = session.with_block_rules(processor.clone());
+        }
         self.snap = Some(
             crate::snap::driver::SnapDriver::new(session).avoiding(self.snap_avoid.clone()),
         );
@@ -1349,6 +1354,13 @@ impl SyncService {
     #[cfg(test)]
     pub(crate) fn snap_request_id_for_test(&self) -> Option<u64> {
         self.snap.as_ref()?.outstanding_ids().first().copied()
+    }
+
+    /// Whether the snapshot session was given this node's rules for the
+    /// blocks it keeps, for a test of how one is opened.
+    #[cfg(test)]
+    pub(crate) fn snap_holds_blocks_to_rules_for_test(&self) -> Option<bool> {
+        Some(self.snap.as_ref()?.session().holds_blocks_to_rules())
     }
 
     /// Whether ordinary sync is standing down for a snapshot session.

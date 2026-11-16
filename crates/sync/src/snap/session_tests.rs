@@ -797,6 +797,280 @@ fn the_blocks_below_the_checkpoint_complete_the_walks_compressed_headers() {
     }
 }
 
+/// The blocks a status brings are kept too, bodies and all, once the walk
+/// vouches for their chain, and are never executed either. Each is held to
+/// its header as it arrives, as rskj holds it
+/// (`SnapshotProcessor.validateAndSaveBlocks`, `BlockRootValidationRule`).
+#[test]
+fn a_status_block_whose_body_is_not_its_headers_is_refused() {
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (mut blocks, tds) = chain(1, 3, genesis, 100, f.state_root);
+    blocks[1]
+        .transactions
+        .push(rustock_core::Transaction::default());
+
+    let mut session = f.session(HeaderVerifier::new());
+    session.on_status(&blocks, &tds, 5_000, 0);
+    assert_eq!(session.phase(), Phase::Failed);
+    assert_eq!(
+        session.failure(),
+        Some(&SnapFailure::BadBody {
+            number: 2,
+            what: "transactions"
+        })
+    );
+}
+
+/// Three blocks on `genesis`, each with the transactions `body` gives its
+/// number and a header that commits to them, at a minimum gas price of 1,
+/// which is as far as block 1 may raise it from block 0's none.
+fn chain_carrying(
+    genesis: B256,
+    state_root: B256,
+    body: impl Fn(u64) -> Vec<rustock_core::Transaction>,
+) -> (Vec<Block>, Vec<U256>) {
+    let (mut blocks, mut tds) = (Vec::new(), Vec::new());
+    let mut parent = genesis;
+    for number in 1..=3u64 {
+        let transactions = body(number);
+        let mut h = header(number, parent, state_root, 100);
+        h.minimum_gas_price = U256::from(1);
+        h.transactions_root = rustock_core::ordered_tx_trie_root(&transactions, true);
+        parent = h.hash();
+        tds.push(U256::from(100 + 100 * number));
+        blocks.push(Block {
+            header: h,
+            transactions,
+            ommers: Vec::new(),
+        });
+    }
+    (blocks, tds)
+}
+
+/// A transaction signed for `chain_id`, at the gas price given.
+fn signed_for(chain_id: u64, gas_price: u64) -> rustock_core::Transaction {
+    use k256::ecdsa::{RecoveryId, Signature, SigningKey};
+
+    let mut tx = rustock_core::Transaction {
+        gas_price: U256::from(gas_price),
+        gas_limit: U256::from(21_000),
+        to: vec![0xbb; 20].into(),
+        ..Default::default()
+    };
+    let key = SigningKey::from_slice(&[7u8; 32]).expect("a key");
+    let (signature, recovery_id): (Signature, RecoveryId) = key
+        .sign_prehash_recoverable(tx.signing_hash_eip155(chain_id).as_slice())
+        .expect("signs");
+    let bytes = signature.to_bytes();
+    tx.r = U256::from_be_slice(&bytes[..32]);
+    tx.s = U256::from_be_slice(&bytes[32..]);
+    tx.v = chain_id * 2 + 35 + u64::from(recovery_id.to_byte());
+    tx
+}
+
+/// A session that holds a snapshot's blocks to the rules of rskj's regtest.
+fn session_with_rules(f: &Fixture) -> SnapSession {
+    f.session(HeaderVerifier::new())
+        .with_block_rules(Arc::new(rustock_execution::BlockProcessor::new(
+            rustock_execution::hardfork::RskHardforkConfig::regtest(),
+            f.store.clone(),
+        )))
+}
+
+/// rskj holds each block of a snapshot to the rules that read its contents
+/// (`RskContext.getSnapBlockValidationRule` and
+/// `getSnapBlockParentDependantValidationRule`): here REMASC's place, the gas
+/// price floor and a signature the network takes. A session given the node's
+/// rules refuses a status block that breaks one, with its body the one its
+/// header commits to; a chain that keeps them goes on, and so does any chain
+/// in a session given none.
+#[test]
+fn a_status_block_that_breaks_a_rule_of_its_contents_is_refused() {
+    use rustock_core::validation::block_rules::{RemascValidationRule, TxsMinGasPriceRule};
+    use rustock_core::validation::BlockValidator;
+    use rustock_core::Transaction;
+    use rustock_execution::hardfork::{RSK_MAINNET_CHAIN_ID, RSK_REGTEST_CHAIN_ID};
+    use rustock_execution::ProcessError;
+
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    // A chain whose block 2 holds `second`, the others REMASC alone, and
+    // what a session makes of it as a status.
+    let offered = |second: Vec<Transaction>, mut session: SnapSession| {
+        let (blocks, tds) = chain_carrying(genesis, f.state_root, |number| match number {
+            2 => second.clone(),
+            _ => vec![Transaction::remasc(number)],
+        });
+        session.on_status(&blocks, &tds, 5_000, 0);
+        (session.failure().cloned(), blocks)
+    };
+    let refused = |why: ProcessError| {
+        Some(SnapFailure::InvalidBlock {
+            number: 2,
+            reason: why.to_string(),
+        })
+    };
+
+    let (failure, blocks) = offered(Vec::new(), session_with_rules(&f));
+    let no_remasc = RemascValidationRule
+        .validate_block(&blocks[1])
+        .expect_err("no REMASC transaction");
+    assert_eq!(failure, refused(no_remasc.into()));
+    let (failure, _) = offered(Vec::new(), f.session(HeaderVerifier::new()));
+    assert_eq!(failure, None, "a session given no rules");
+
+    let cheap = vec![signed_for(RSK_REGTEST_CHAIN_ID, 0), Transaction::remasc(2)];
+    let (failure, blocks) = offered(cheap, session_with_rules(&f));
+    let below_the_floor = TxsMinGasPriceRule
+        .validate_block(&blocks[1])
+        .expect_err("a price below the block's minimum");
+    assert_eq!(failure, refused(below_the_floor.into()));
+
+    let for_mainnet = signed_for(RSK_MAINNET_CHAIN_ID, 1);
+    let another_chains = for_mainnet
+        .recover_sender(RSK_REGTEST_CHAIN_ID)
+        .expect_err("signed for another chain");
+    let (failure, _) = offered(
+        vec![for_mainnet, Transaction::remasc(2)],
+        session_with_rules(&f),
+    );
+    assert_eq!(
+        failure,
+        refused(ProcessError::SenderRecovery {
+            index: 0,
+            source: another_chains
+        })
+    );
+
+    let kept = vec![signed_for(RSK_REGTEST_CHAIN_ID, 1), Transaction::remasc(2)];
+    let (failure, _) = offered(kept, session_with_rules(&f));
+    assert_eq!(failure, None, "a chain that keeps the rules");
+}
+
+/// A session given the rules, where it takes the blocks below its
+/// checkpoint: the status brought block 3 alone, the walk its headers, and a
+/// peer the state.
+fn session_awaiting_blocks(f: &Fixture, blocks: &[Block], tds: &[U256]) -> SnapSession {
+    let mut session = session_with_rules(f);
+    session.on_status(std::slice::from_ref(&blocks[2]), &tds[2..], 5_000, 0);
+    let mut actions = session.on_headers(3, &headers_for(blocks, 3, 3));
+    assert_eq!(
+        session.phase(),
+        Phase::DownloadingState,
+        "{:?}",
+        session.failure()
+    );
+
+    let peer_dir = tempfile::tempdir().expect("tempdir");
+    let peer_store = Arc::new(BlockStore::open(peer_dir.path()).expect("open"));
+    for (b, td) in blocks.iter().zip(tds.iter()) {
+        let hash = b.header.hash();
+        peer_store
+            .put_header_with_hash(hash, &b.header)
+            .expect("header");
+        peer_store
+            .put_canonical_hash(b.header.number, hash)
+            .expect("index");
+        peer_store.put_total_difficulty(hash, *td).expect("td");
+    }
+    let server = SnapServer::new(
+        peer_store,
+        f.trie.clone() as Arc<dyn TrieStore>,
+        SnapConfig {
+            server_enabled: true,
+            ..SnapConfig::default()
+        },
+    );
+    let mut guard = 0;
+    while session.phase() == Phase::DownloadingState {
+        guard += 1;
+        assert!(guard < 1000, "state download stalled");
+        if actions.is_empty() {
+            actions = session.poll();
+            assert!(!actions.is_empty(), "no work and not finished");
+        }
+        if let Action::RequestChunk { from, budget, .. } = actions.remove(0) {
+            let response = server
+                .chunk(&SnapChunkRequest {
+                    id: 1,
+                    block_number: 3,
+                    from,
+                    chunk_size: budget,
+                    state_root: Some(f.state_root),
+                })
+                .expect("server answers");
+            actions.extend(session.on_chunk(from, &response.payload, Refusal::None));
+        }
+    }
+    assert_eq!(
+        session.phase(),
+        Phase::DownloadingBlocks,
+        "{:?}",
+        session.failure()
+    );
+    session
+}
+
+/// And each block below the checkpoint, which comes after the state
+/// (`SnapshotProcessor.processSnapBlocksResponse`): block 1, whose body its
+/// header commits to, carries no REMASC transaction, and nothing of it is
+/// kept.
+#[test]
+fn a_block_below_the_checkpoint_that_breaks_a_rule_of_its_contents_is_refused() {
+    use rustock_core::validation::block_rules::RemascValidationRule;
+    use rustock_core::validation::BlockValidator;
+    use rustock_core::Transaction;
+    use rustock_execution::ProcessError;
+
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain_carrying(genesis, f.state_root, |number| match number {
+        1 => Vec::new(),
+        _ => vec![Transaction::remasc(number)],
+    });
+    let mut session = session_awaiting_blocks(&f, &blocks, &tds);
+
+    session.on_blocks(&blocks[..2], &tds[..2]);
+    assert_eq!(session.phase(), Phase::Failed);
+    let no_remasc = RemascValidationRule
+        .validate_block(&blocks[0])
+        .expect_err("no REMASC transaction");
+    assert_eq!(
+        session.failure(),
+        Some(&SnapFailure::InvalidBlock {
+            number: 1,
+            reason: ProcessError::from(no_remasc).to_string(),
+        })
+    );
+    assert!(
+        f.store.body(blocks[0].header.hash()).unwrap().is_none(),
+        "its body was kept"
+    );
+}
+
+/// Block 0 is held to none of them. It carries no REMASC transaction, and a
+/// peer's answer on a short chain reaches down to it: rskj's own client
+/// stops at the first block whose parent it holds
+/// (`SnapshotProcessor.validateAndSaveBlocks`), so it never judges block 0.
+#[test]
+fn block_0_in_an_answer_is_held_to_no_rule_of_a_blocks_contents() {
+    use rustock_core::Transaction;
+
+    let f = fixture(20);
+    let genesis = f.with_genesis();
+    let (blocks, tds) = chain_carrying(genesis, f.state_root, |number| {
+        vec![Transaction::remasc(number)]
+    });
+    let mut session = session_awaiting_blocks(&f, &blocks, &tds);
+
+    let block_0 = block(header(0, B256::ZERO, B256::ZERO, 100));
+    assert_eq!(block_0.header.hash(), genesis);
+    let answer = [block_0, blocks[0].clone(), blocks[1].clone()];
+    session.on_blocks(&answer, &[U256::from(100), tds[0], tds[1]]);
+    assert_eq!(session.phase(), Phase::Done, "{:?}", session.failure());
+}
+
 // ------------------------------------------------------- blaming the peer
 
 use alloy_primitives::B512;

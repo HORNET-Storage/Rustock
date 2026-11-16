@@ -120,6 +120,8 @@ pub enum SnapFailure {
     ImplausibleHeight { window: u64, most: u64 },
     #[error("block #{number}: the {what} are not the ones its header commits to")]
     BadBody { number: u64, what: &'static str },
+    #[error("block #{number} breaks a rule every block is held to: {reason}")]
+    InvalidBlock { number: u64, reason: String },
 }
 
 /// What an answer revealed about the peer that sent it.
@@ -236,6 +238,10 @@ pub struct SnapSession {
     last_report: Instant,
     /// Block answers in a row that added nothing.
     fruitless_blocks: u32,
+    /// The rules that read a block alone, which each block this session
+    /// keeps is held to: see [`Self::check_block`]. `None` holds a block to
+    /// its header's commitments only.
+    block_rules: Option<Arc<rustock_execution::BlockProcessor>>,
 }
 
 impl SnapSession {
@@ -273,7 +279,48 @@ impl SnapSession {
             phase_started: Instant::now(),
             last_report: Instant::now(),
             fruitless_blocks: 0,
+            block_rules: None,
         }
+    }
+
+    /// Hold every block this session keeps to the rules `processor` has for
+    /// a snapshot's blocks: see [`Self::check_block`].
+    pub fn with_block_rules(mut self, processor: Arc<rustock_execution::BlockProcessor>) -> Self {
+        self.block_rules = Some(processor);
+        self
+    }
+
+    /// Whether this session was given the node's rules for a snapshot's
+    /// blocks, for a test of the service that opens it.
+    #[cfg(test)]
+    pub(crate) fn holds_blocks_to_rules(&self) -> bool {
+        self.block_rules.is_some()
+    }
+
+    /// What rskj holds each block of a snapshot to before it keeps it
+    /// (`SnapshotProcessor.areBlockPairsValid`), past its header's own rules
+    /// and those against its parent, which are the walk's: the body its
+    /// header commits to, and, with the node's rules in hand
+    /// ([`Self::with_block_rules`]), those that read a block's contents --
+    /// its transactions' gas prices and signatures, REMASC's place, the
+    /// sublist edges (`BlockProcessor::validate_snapshot_block`).
+    ///
+    /// The body is its transactions, as rskj's `BlockRootValidationRule` has
+    /// it, and its uncles too, whose difficulty the totals count.
+    ///
+    /// These blocks are never executed -- they are fetched because contracts
+    /// can read them -- so nothing downstream would ever check them.
+    fn check_block(&self, block: &Block, parent: Option<&Header>) -> Result<(), SnapFailure> {
+        check_body_matches_header(block)?;
+        if let Some(rules) = &self.block_rules {
+            rules
+                .validate_snapshot_block(block, parent)
+                .map_err(|e| SnapFailure::InvalidBlock {
+                    number: block.header.number,
+                    reason: e.to_string(),
+                })?;
+        }
+        Ok(())
     }
 
     pub fn phase(&self) -> Phase {
@@ -591,9 +638,11 @@ impl SnapSession {
 
     /// A peer's offer of a state it can serve.
     ///
-    /// The blocks are checked for shape only -- that they form a chain, that
-    /// difficulty rises along it. Whether this chain is *the* chain is settled
-    /// by the header walk that follows, not here.
+    /// The blocks are checked for shape -- that they form a chain, that
+    /// difficulty rises along it -- and each for what a block is held to on
+    /// its own ([`Self::check_block`]): they are kept, bodies and all, once
+    /// the walk vouches for the chain. Whether this chain is *the* chain is
+    /// settled by the header walk that follows, not here.
     pub fn on_status(
         &mut self,
         blocks: &[Block],
@@ -612,6 +661,13 @@ impl SnapSession {
         }
         if let Err(why) = check_chain_shape(blocks, difficulties) {
             return self.fail(why);
+        }
+
+        for (i, block) in blocks.iter().enumerate() {
+            let parent = i.checked_sub(1).map(|below| &blocks[below].header);
+            if let Err(why) = self.check_block(block, parent) {
+                return self.fail(why);
+            }
         }
 
         let header = checkpoint.header.clone();
@@ -1402,18 +1458,21 @@ impl SnapSession {
         }
 
         let mut oldest = self.blocks_cursor;
-        for (block, td) in blocks.iter().zip(difficulties.iter()) {
+        for (i, (block, td)) in blocks.iter().zip(difficulties.iter()).enumerate() {
             let hash = block.header.hash();
 
-            // These blocks are never executed -- they are fetched because
-            // contracts can read them -- so nothing downstream would ever
-            // check them. Bind each body to the header this node verified for
-            // itself during the walk: the right chain, and the right contents
-            // for that chain.
+            // Bind each block to the header this node verified for itself
+            // during the walk -- the right chain -- and hold it to what a
+            // block is held to on its own: the right contents for that
+            // chain, under the rules a block's body meets.
             if !self.is_ours(block.header.number, hash) {
                 return self.fail(SnapFailure::BrokenChain);
             }
-            if let Err(why) = check_body_matches_header(block) {
+            let parent = match i.checked_sub(1) {
+                Some(below) => Some(blocks[below].header.clone()),
+                None => self.store.header(block.header.parent_hash).ok().flatten(),
+            };
+            if let Err(why) = self.check_block(block, parent.as_ref()) {
                 return self.fail(why);
             }
 

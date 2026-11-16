@@ -146,7 +146,10 @@ pub struct Blame {
 fn blame_for(failure: &SnapFailure) -> Option<EventType> {
     match failure {
         SnapFailure::InvalidHeader { .. } => Some(EventType::InvalidHeader),
-        SnapFailure::BadBody { .. } => Some(EventType::InvalidBlock),
+        // rskj `SnapshotProcessor.validateAndSaveBlocks`: `INVALID_BLOCK`.
+        SnapFailure::BadBody { .. } | SnapFailure::InvalidBlock { .. } => {
+            Some(EventType::InvalidBlock)
+        }
         SnapFailure::NoCheckpoint
         | SnapFailure::BrokenChain
         | SnapFailure::BadDifficulty

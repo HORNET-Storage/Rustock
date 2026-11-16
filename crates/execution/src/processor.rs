@@ -879,6 +879,34 @@ impl BlockProcessor {
         Ok(())
     }
 
+    /// What rskj holds each block of a snapshot to, past the rules its header
+    /// meets alone and against its parent, and the body its header commits to
+    /// (`RskContext.getSnapBlockValidationRule` and
+    /// `getSnapBlockParentDependantValidationRule`): the rules of
+    /// [`Self::validate_block_body_rules`], and `BlockTxsFieldsValidationRule`,
+    /// a signature the network takes on every transaction but REMASC.
+    ///
+    /// A block that is executed meets that last rule where its senders are
+    /// recovered. A snapshot's blocks are kept without being run, so nothing
+    /// else holds them to it.
+    ///
+    /// Block 0 passes: rskj reads it from its genesis file and holds it to no
+    /// rule, and its snapshot client stops at the first block whose parent it
+    /// holds (`SnapshotProcessor.validateAndSaveBlocks`), which block 1 is at
+    /// the latest.
+    pub fn validate_snapshot_block(
+        &self,
+        block: &Block,
+        parent: Option<&rustock_core::Header>,
+    ) -> Result<(), ProcessError> {
+        if block.header.number == 0 {
+            return Ok(());
+        }
+        self.validate_block_body_rules(block, parent)?;
+        self.recover_senders(&block.transactions, self.hardfork_cfg.chain_id)?;
+        Ok(())
+    }
+
     /// `validate_block_rules` with the parent resolved from the block store —
     /// the shape the sync path wants, mirroring rskj `BlockValidatorImpl`,
     /// which looks the parent up the same way and returns invalid when it is
