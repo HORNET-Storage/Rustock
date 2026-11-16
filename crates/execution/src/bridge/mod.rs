@@ -23,11 +23,13 @@ pub mod getters;
 pub mod legacy_events;
 pub mod governance;
 pub mod peg;
+pub mod peg_legacy;
 pub mod pegin_instructions;
 pub mod pmt;
 pub mod release_tx;
 /// rskj-compatible peg-in sender detection, isolated so it can be removed.
 pub mod rskj_sender_compat;
+pub mod script_spend;
 pub mod serialization;
 pub mod storage;
 pub mod tx;

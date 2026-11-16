@@ -559,6 +559,117 @@ fn positive_m(m: &JChunk) -> Verdict {
     }
 }
 
+// --- the standard part of a redeem script -----------------------------------
+
+/// A script's program as bitcoinj writes it from its chunks, which it does
+/// only when the program is asked for: `Err` is the `IllegalStateException`
+/// `ScriptChunk.write` throws then for an `OP_PUSHDATA4` push of more than 520
+/// bytes, which nothing between it and `Bridge.execute` catches.
+pub type Written = Result<Vec<u8>, &'static str>;
+
+/// `RedeemScriptParserFactory.get(chunks).extractStandardRedeemScriptChunks()`,
+/// built back into a script (`new ScriptBuilder().addChunks(..).build()`), as
+/// rskj's `PegUtilsLegacy` reads an input's redeem script from RSKIP201 and an
+/// ERP federation's default one (`ErpFederation.getDefaultRedeemScript`): a
+/// standard multisig as it is, the default multisig of a P2SH ERP script, that
+/// of a non-standard ERP script with the `OP_CHECKMULTISIG` the two branches
+/// share appended, and whatever a Flyover prefix wraps. Each chunk is written
+/// back as it was read, so the script is the bytes of the chunks it keeps.
+///
+/// `Ok(None)` is the `ScriptException` rskj catches: a script bitcoinj can't
+/// parse, one of fewer than four chunks, one no parser knows, and the
+/// hard-coded testnet script, whose parser has no standard part. `Err` is the
+/// index error a validator raises, which nothing catches.
+pub fn standard_redeem_script(redeem_script: &[u8]) -> Result<Option<Written>, &'static str> {
+    let Some(chunks) = parse_script_program(redeem_script) else {
+        return Ok(None);
+    };
+    Ok(standard_chunks(&chunks, 0)?.map(|chunks| program_of(&chunks)))
+}
+
+/// The parser `dispatch` picks, asked for its standard chunks.
+fn standard_chunks(chunks: &[JChunk], depth: usize) -> Result<Option<Vec<JChunk>>, &'static str> {
+    if depth > MAX_FLYOVER_DEPTH {
+        return Ok(None);
+    }
+    if depth == 0 {
+        let hardcoded = parse_script_program(&hex_decode(NON_STANDARD_ERP_TESTNET_REDEEM_SCRIPT));
+        if hardcoded.is_some_and(|hardcoded| chunks == hardcoded.as_slice()) {
+            return Ok(None);
+        }
+    }
+    if chunks.len() < 4 {
+        return Ok(None);
+    }
+    if has_flyover_structure(chunks) {
+        return standard_chunks(&chunks[2..], depth + 1);
+    }
+    match has_standard_structure(chunks) {
+        Err(()) => return Err("ArrayIndexOutOfBoundsException decoding M or N from an empty push"),
+        Ok(true) => return Ok(Some(chunks.to_vec())),
+        Ok(false) => {}
+    }
+    // An ERP script's default multisig runs from after its OP_NOTIF to its
+    // first OP_ELSE (`extractDefaultRedeemScriptChunks`), where the validators
+    // found it.
+    let default_multisig = || {
+        let else_index = (1..chunks.len())
+            .find(|&i| chunks[i].equals_op_code(OP_ELSE))
+            .unwrap_or(chunks.len());
+        chunks[1..else_index].to_vec()
+    };
+    if has_p2sh_erp_structure(chunks)? {
+        return Ok(Some(default_multisig()));
+    }
+    if has_non_standard_erp_structure(chunks)? {
+        let mut default = default_multisig();
+        default.push(JChunk {
+            opcode: OP_CHECKMULTISIG,
+            data: None,
+        });
+        return Ok(Some(default));
+    }
+    Ok(None)
+}
+
+/// `new ScriptBuilder().addChunks(script.getChunks()).build()`, the script
+/// bitcoinj's `PegUtilsLegacy.isPegOutTx` builds of an input's redeem script
+/// before RSKIP201: `None` for one bitcoinj can't parse.
+pub fn written_back(script: &[u8]) -> Option<Written> {
+    parse_script_program(script).map(|chunks| program_of(&chunks))
+}
+
+/// `Script.getProgram()` of a script built from `chunks`.
+fn program_of(chunks: &[JChunk]) -> Written {
+    let mut program = Vec::new();
+    for chunk in chunks {
+        program.extend(write_chunk(chunk)?);
+    }
+    Ok(program)
+}
+
+/// `ScriptChunk.write`: the opcode, then for a push its length as the opcode
+/// writes it and its data. An `OP_PUSHDATA4` push of more than 520 bytes
+/// fails its `checkState`.
+fn write_chunk(chunk: &JChunk) -> Written {
+    let mut out = vec![chunk.opcode];
+    if let (false, Some(data)) = (chunk.is_op_code(), &chunk.data) {
+        match chunk.opcode {
+            OP_PUSHDATA1 => out.push(data.len() as u8),
+            OP_PUSHDATA2 => out.extend_from_slice(&(data.len() as u16).to_le_bytes()),
+            OP_PUSHDATA4 if data.len() > 520 => {
+                return Err(
+                    "IllegalStateException writing an OP_PUSHDATA4 push of more than 520 bytes",
+                )
+            }
+            OP_PUSHDATA4 => out.extend_from_slice(&(data.len() as u32).to_le_bytes()),
+            _ => {}
+        }
+        out.extend_from_slice(data);
+    }
+    Ok(out)
+}
+
 // --- signature stripping ----------------------------------------------------
 
 /// `BitcoinUtils.extractRedeemScriptFromInput`: the last push of an input's
@@ -1071,5 +1182,30 @@ mod tests {
     #[test]
     fn the_switch_defaults_to_on() {
         assert!(enabled(), "rskj has not changed, so emulation must be on by default");
+    }
+
+    /// bitcoinj builds a script back from the chunks it read, and
+    /// `ScriptChunk.write` refuses an `OP_PUSHDATA4` push of more than 520
+    /// bytes, which its parser reads. A push of 520 is written back as it was.
+    #[test]
+    fn a_pushdata4_of_more_than_520_bytes_is_not_written_back() {
+        let multisig_of = |len: usize| {
+            [
+                &[0x51, OP_PUSHDATA4][..],
+                &(len as u32).to_le_bytes(),
+                &vec![0x02; len],
+                &[0x51, OP_CHECKMULTISIG],
+            ]
+            .concat()
+        };
+        let fits = multisig_of(520);
+        assert_eq!(written_back(&fits), Some(Ok(fits.clone())));
+        assert_eq!(standard_redeem_script(&fits), Ok(Some(Ok(fits.clone()))));
+        let too_long = multisig_of(521);
+        assert!(matches!(written_back(&too_long), Some(Err(_))));
+        assert!(matches!(
+            standard_redeem_script(&too_long),
+            Ok(Some(Err(_)))
+        ));
     }
 }
