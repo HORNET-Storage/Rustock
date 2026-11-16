@@ -455,7 +455,12 @@ impl RskExecutor {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
         let (tx_env, whole_gas_price) = self.tx_env_for(tx, sender, local_call)?;
-        let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
+        let db = RskDatabase::new(
+            state_root.clone(),
+            trie_store.clone(),
+            self.block_store.clone(),
+        )
+        .for_block(header);
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
 
@@ -602,7 +607,12 @@ impl RskExecutor {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
         let (tx_env, whole_gas_price) = self.tx_env_for(tx, sender, local_call)?;
-        let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
+        let db = RskDatabase::new(
+            state_root.clone(),
+            trie_store.clone(),
+            self.block_store.clone(),
+        )
+        .for_block(header);
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
 
@@ -806,7 +816,12 @@ impl RskExecutor {
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
         let (tx_env, whole_gas_price) = self.tx_env_for(tx, sender, local_call)?;
         let gas_limit = tx_env.gas_limit;
-        let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
+        let db = RskDatabase::new(
+            state_root.clone(),
+            trie_store.clone(),
+            self.block_store.clone(),
+        )
+        .for_block(header);
 
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
 
@@ -1495,7 +1510,13 @@ impl RskExecutor {
     > {
         let spec_id = self.hardfork_cfg.spec_id(header.number);
         let block_env = block_env_from_header(header, &self.hardfork_cfg);
-        let db = RskDatabase::new(state_root.clone(), trie_store.clone(), self.block_store.clone());
+        // BLOCKHASH reads the block's own ancestors, beside the main chain too.
+        let db = RskDatabase::new(
+            state_root.clone(),
+            trie_store.clone(),
+            self.block_store.clone(),
+        )
+        .for_block(header);
         let cfg = make_cfg_env(spec_id, self.hardfork_cfg.chain_id, self.hardfork_cfg.has_rskip544(header.number));
 
         let mut chain_ext = crate::raw_storage::RskChainExt::default();
@@ -4051,6 +4072,111 @@ mod tests {
                 "an estimate at #{number}"
             );
         }
+    }
+
+    /// rskj's BLOCKHASH answers the block at that height among the run
+    /// block's own ancestors: `Program.getBlockHash` asks
+    /// `IndexedBlockStore.getBlockHashByNumber` with the block's parent, which
+    /// walks back from it (Program.java:1133-1136). A block run beside the
+    /// main chain reads its fork's blocks, and the main chain's below where
+    /// the fork leaves it, in a block's run, a local call, a trace and an
+    /// estimate alike. Here the fork is longer than the main chain, so the
+    /// main chain has no block at its last height.
+    #[test]
+    fn blockhash_answers_from_the_run_blocks_own_ancestors() {
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        // Blocks 0 to 3 of the main chain, and blocks 2 to 4 of a fork from
+        // block 1, each with a beneficiary of its own.
+        let child = |parent: &Header, beneficiary: u8| Header {
+            parent_hash: parent.hash(),
+            beneficiary: Address::repeat_byte(beneficiary),
+            ..dummy_header(parent.number + 1)
+        };
+        let mut main = vec![dummy_header(0)];
+        for _ in 1..4 {
+            let next = child(main.last().unwrap(), 0x01);
+            main.push(next);
+        }
+        let mut fork = vec![child(&main[1], 0xF0)];
+        for _ in 3..5 {
+            let next = child(fork.last().unwrap(), 0xF0);
+            fork.push(next);
+        }
+        for header in main.iter().chain(&fork) {
+            block_store.put_header(header).unwrap();
+        }
+        for header in &main {
+            block_store
+                .put_canonical_hash(header.number, header.hash())
+                .unwrap();
+        }
+        // CALLDATALOAD(0) BLOCKHASH, returned.
+        let code = [
+            0x60, 0x00, 0x35, 0x40, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ];
+        let store = Arc::new(MemoryTrieStore::new());
+        let (sender, contract) = (Address::repeat_byte(0xAA), Address::repeat_byte(0xBB));
+        let ether = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, ether);
+        let root = put_account_with_code(&root, store.as_ref(), &contract, 1, U256::ZERO, &code);
+        let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+        // What BLOCKHASH(number) answers in the block after `parent`, each way.
+        let ask = |parent: &Header, number: u64| -> Vec<B256> {
+            let header = child(parent, 0x02);
+            let input = U256::from(number).to_be_bytes::<32>().to_vec();
+            let tx = unsigned_tx(0, Some(contract), 0, 100_000, input);
+            let block = executor
+                .execute_block(&header, &[(tx.clone(), sender)], &root, store.clone())
+                .unwrap();
+            let local = executor
+                .execute_local_call(&header, &tx, sender, &root, store.clone())
+                .unwrap();
+            let (traced, _) = executor
+                .execute_tx_traced(&header, &tx, sender, &root, store.clone(), true, 0)
+                .unwrap();
+            let (estimated, _) = executor
+                .execute_tx_for_estimate(&header, &tx, sender, &root, store.clone(), true)
+                .unwrap();
+            [
+                &block.tx_results[0].output,
+                &local.output,
+                &traced.output,
+                &estimated.output,
+            ]
+            .map(|output| B256::from_slice(output))
+            .to_vec()
+        };
+        for number in 0..4 {
+            let on_main = main[number as usize].hash();
+            assert_eq!(
+                ask(&main[3], number),
+                vec![on_main; 4],
+                "block {number} on the main chain"
+            );
+        }
+        let (one, two, three, four) = (
+            main[1].hash(),
+            fork[0].hash(),
+            fork[1].hash(),
+            fork[2].hash(),
+        );
+        assert_eq!(
+            ask(&fork[2], 4),
+            vec![four; 4],
+            "the parent, where the main chain has none"
+        );
+        assert_eq!(
+            ask(&fork[2], 3),
+            vec![three; 4],
+            "the fork's, past the main chain's"
+        );
+        assert_eq!(ask(&fork[2], 2), vec![two; 4], "the fork's first");
+        assert_eq!(
+            ask(&fork[2], 1),
+            vec![one; 4],
+            "where the fork leaves the main chain"
+        );
+        assert_eq!(ask(&fork[2], 0), vec![main[0].hash(); 4], "below it");
     }
 
     /// A local call leaves its sender's nonce as it found it (`execute()`,
