@@ -48,7 +48,7 @@ pub(super) fn sibling_coinbase(index: usize) -> Address {
 /// runner's minimum of 10 every reward would be.
 pub(super) fn without_rskip85() -> RemascConfig {
     let mut remasc = RemascConfig::regtest();
-    remasc.rskip85_activation_height = u64::MAX;
+    remasc.rskip85_activation_height = Some(u64::MAX);
     remasc
 }
 

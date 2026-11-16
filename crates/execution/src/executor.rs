@@ -1809,14 +1809,21 @@ impl RskExecutor {
                     let _ = evm.ctx.journal_mut().load_account(REMASC_ADDR);
                     evm.ctx.journal_mut().touch_account(REMASC_ADDR);
                 }
+                // What REMASC reads that fails is the node's store, never the
+                // block: rskj holds every block it runs a block on.
                 crate::remasc::process_miners_fees(
                     &mut evm.ctx,
                     &self.remasc_config,
                     &self.bridge_constants,
                     &self.hardfork_cfg,
                     Some(&self.block_store),
+                    header,
                 )
-                .map_err(|e| ExecutionError::Evm(format!("REMASC: {e:?}")))?;
+                .map_err(|e| {
+                    ExecutionError::Database(crate::database::RskDbError::BlockStore(format!(
+                        "REMASC: {e:?}"
+                    )))
+                })?;
                 let transfers = {
                     use revm::context_interface::ContextTr;
                     std::mem::take(&mut evm.ctx.chain_mut().precompile_transfers)
@@ -12961,13 +12968,26 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let root = TrieNode::empty();
         let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
 
-        // The processing block (#1) whose fees REMASC distributes at #4001.
-        let processing = dummy_header(1);
-        let processing_hash = processing.hash();
-        block_store.put_header(&processing).unwrap();
-        block_store.put_canonical_hash(1, processing_hash).unwrap();
+        // The processing block (#1) whose fees REMASC distributes at #4001,
+        // and the seven after it whose uncles could be its siblings, each on
+        // its parent; and #4,000, the parent of the block that runs, which
+        // the main chain's index takes down to them.
+        let mut parent_hash = B256::ZERO;
+        for number in 1..=8 {
+            let mut block = dummy_header(number);
+            block.parent_hash = parent_hash;
+            parent_hash = block.hash();
+            block_store.put_header(&block).unwrap();
+            block_store.put_canonical_hash(number, parent_hash).unwrap();
+        }
+        let parent = dummy_header(4_000);
+        block_store.put_header(&parent).unwrap();
+        block_store
+            .put_canonical_hash(4_000, parent.hash())
+            .unwrap();
 
-        let header = dummy_header(4_001);
+        let mut header = dummy_header(4_001);
+        header.parent_hash = parent.hash();
         let remasc_tx = rustock_core::Transaction::remasc(header.number);
 
         let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
@@ -13939,6 +13959,12 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         };
 
         let mut header = dummy_header(block_number);
+        // On the chain the store holds: REMASC reads the blocks before the
+        // one it runs in up from its parent.
+        header.parent_hash = block_store
+            .canonical_hash(block_number.saturating_sub(1))
+            .unwrap()
+            .unwrap_or_default();
         header.beneficiary = Address::repeat_byte(0x99); // actual miner (not used for fee routing)
 
         // The REMASC system tx: unsigned, zero gas (rskj RemascTransaction).
@@ -14145,6 +14171,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
 
         let mut header = dummy_header(15);
         header.beneficiary = Address::repeat_byte(0x99);
+        header.parent_hash = bs.canonical_hash(14).unwrap().unwrap();
 
         // The REMASC system tx: unsigned, zero gas (rskj RemascTransaction).
         let remasc_tx = rustock_core::Transaction::remasc(header.number);
@@ -14470,6 +14497,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
 
         let mut header = dummy_header(15);
         header.beneficiary = Address::repeat_byte(0x99);
+        header.parent_hash = bs.canonical_hash(14).unwrap().unwrap();
 
         // The REMASC system tx: unsigned, zero gas (rskj RemascTransaction).
         let remasc_tx = rustock_core::Transaction::remasc(header.number);
@@ -14647,7 +14675,8 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
         let ether = U256::from(10u64).pow(U256::from(18));
         let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, ether);
         let root = put_account(&root, store.as_ref(), &REMASC_ADDR, 0, balance);
-        let header = dummy_header(chain.len() as u64);
+        let mut header = dummy_header(chain.len() as u64);
+        header.parent_hash = parent_hash;
         let remasc = rustock_core::Transaction::remasc(header.number);
         let result = RskExecutor::new(RskHardforkConfig::all_active(33), blocks)
             .with_remasc_config(config)
@@ -14709,7 +14738,8 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             let store = Arc::new(MemoryTrieStore::new());
             let sender = Address::repeat_byte(0xAA);
             let root = put_account(&TrieNode::empty(), store.as_ref(), &REMASC_ADDR, 0, fees);
-            let header = dummy_header(chain.len() as u64);
+            let mut header = dummy_header(chain.len() as u64);
+            header.parent_hash = parent_hash;
             let remasc = rustock_core::Transaction::remasc(header.number);
             let (result, traces) = RskExecutor::new(RskHardforkConfig::all_active(33), blocks)
                 .with_remasc_config(crate::remasc::RemascConfig::regtest())
@@ -14897,7 +14927,7 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
     fn remasc_creates_the_null_account_even_for_nothing() {
         let mut config = crate::remasc::RemascConfig::regtest();
         // Before RSKIP85, nothing is not too little to pay.
-        config.rskip85_activation_height = u64::MAX;
+        config.rskip85_activation_height = Some(u64::MAX);
         let chain: Vec<(Header, Vec<Header>)> = (0..15)
             .map(|number| {
                 let block = dummy_header(number);

@@ -680,6 +680,8 @@ fn a_template_is_never_timestamped_at_or_before_its_parent() {
     // the rule on its own.
     let mut fx = fixture(20);
     fx.parent.timestamp = u64::MAX / 2;
+    // A miner builds on a head its store holds: REMASC reads up from it.
+    fx.store.put_header(&fx.parent).unwrap();
     let header = fx.build_on(&fx.parent).unwrap().block.header;
     assert!(header.timestamp > fx.parent.timestamp);
 }
@@ -1115,6 +1117,7 @@ fn a_template_on_a_gas_limit_past_256_bits_keeps_its_value() {
     let mut fx = fixture(20);
     let value = BigUint::from(2u8).pow(300);
     fx.parent.set_gas_limit(&value);
+    fx.store.put_header(&fx.parent).unwrap();
     let header = fx.build_on(&fx.parent).unwrap().block.header;
     assert_eq!(header.gas_limit_value(), value);
     assert_eq!(header.gas_limit, U256::MAX);
@@ -1166,6 +1169,7 @@ fn a_template_on_a_minimum_gas_price_past_256_bits_keeps_its_value() {
     let mut fx = fixture(20);
     let value = BigUint::from(2u8).pow(300);
     fx.parent.set_minimum_gas_price(&value);
+    fx.store.put_header(&fx.parent).unwrap();
     let header = fx.build_on(&fx.parent).unwrap().block.header;
     assert_eq!(header.minimum_gas_price_value(), value);
     assert_eq!(header.minimum_gas_price, U256::MAX);
@@ -2581,9 +2585,11 @@ mod partitioned_templates {
     /// `isLowGasPriced` has it.
     #[test]
     fn past_256_bits_the_minimum_leaves_every_transaction_out() {
-        let (builder, mut parent, keys, _, _) =
+        let (builder, mut parent, keys, _, blocks) =
             fixture_with_forks(1, RskHardforkConfig::all_active(33));
         parent.set_minimum_gas_price(&BigUint::from(2u8).pow(300));
+        // A miner builds on a head its store holds: REMASC reads up from it.
+        blocks.put_header(&parent).unwrap();
         let affordable = transfer_with(
             &keys[0],
             Address::repeat_byte(0xE7),

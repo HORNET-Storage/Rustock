@@ -645,6 +645,14 @@ impl RskHardforkConfig {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Orchid
     }
 
+    /// RSKIP85 (orchid): REMASC holds back a reward, and a federator's share,
+    /// that comes to less than the executing block's minimum gas price times
+    /// its minimum payable gas. rskj reads it at the executing block
+    /// (`Remasc.activations`).
+    pub fn has_rskip85(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Orchid
+    }
+
     /// RSKIP123: multikey federation members; disables the single-key "add"
     /// federation-change function (Wasabi100).
     pub fn has_rskip123(&self, block_number: u64) -> bool {
@@ -743,6 +751,12 @@ impl RskHardforkConfig {
 
     /// RSKIP219: updated minimum peg-in tx value (Iris300).
     pub fn has_rskip219(&self, block_number: u64) -> bool {
+        self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
+    }
+
+    /// RSKIP218 (iris300): REMASC pays the Core Developers Fund at its new
+    /// address (`Remasc.getRskLabsAddress`), read at the executing block.
+    pub fn has_rskip218(&self, block_number: u64) -> bool {
         self.active_upgrade(block_number) >= RskNetworkUpgrade::Iris300
     }
 

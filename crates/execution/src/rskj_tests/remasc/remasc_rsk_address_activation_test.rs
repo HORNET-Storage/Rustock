@@ -18,7 +18,7 @@ fn rsk_labs_cut_goes_to_its_rskip218_address_from_rskip218() {
     let mut remasc = without_rskip85();
     remasc.rsk_labs_address = BEFORE;
     remasc.rsk_labs_address_rskip218 = FROM;
-    remasc.rskip218_activation_height = LAST;
+    remasc.rskip218_activation_height = Some(LAST);
     let chain = run(RskHardforkConfig::rskj_regtest(), remasc, 1, &[], |_| {});
     assert_eq!(chain.balance(BEFORE), U256::from(4_200), "testActivation");
     assert_eq!(chain.balance(FROM), U256::from(4_200), "testActivation");
