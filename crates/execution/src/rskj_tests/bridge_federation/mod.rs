@@ -5,3 +5,4 @@ mod support;
 
 mod bridge_utils_legacy_test;
 mod bridge_utils_test;
+mod non_standard_erp_federations_test;

@@ -397,23 +397,7 @@ fn the_regular_pegout_size_sets_releasebtcs_minimum() {
         minimum > config.minimum_pegout_tx_value,
         "the fee is what binds"
     );
-    let queued = |satoshis: u64| {
-        let mut ctx = support::ctx_at(6_000_000);
-        support::store_federation(&mut ctx, NEW_FEDERATION, &keys, 1, 1000);
-        storage::bridge_store_u256(&mut ctx, storage::FEE_PER_KB_KEY, U256::from(fee_per_kb));
-        peg::release_btc(
-            &mut ctx,
-            0,
-            &config,
-            &cfg,
-            &BridgeTxContext::default(),
-            RskAddress::repeat_byte(0x33),
-            1,
-            U256::from(satoshis) * U256::from(WEI_PER_SATOSHI),
-        )
-        .expect("releaseBtc answers");
-        peg::load_release_request_queue(&mut ctx, true).len()
-    };
+    let queued = |satoshis| support::release_queued((&config, &cfg), 6_000_000, &keys, fee_per_kb, satoshis);
     assert_eq!(queued(minimum), 1);
     assert_eq!(queued(minimum - 1), 0);
 }

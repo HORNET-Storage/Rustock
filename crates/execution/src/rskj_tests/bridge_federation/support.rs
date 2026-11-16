@@ -89,6 +89,52 @@ pub(super) fn standard_redeem(keys: &[[u8; 33]]) -> Vec<u8> {
     multisig(keys, keys.len() / 2 + 1)
 }
 
+/// A compressed public key written in hex.
+pub(super) fn key(hex: &str) -> [u8; 33] {
+    hex::decode(hex)
+        .expect("a key in hex")
+        .try_into()
+        .expect("a compressed key")
+}
+
+/// The emergency keys of a network's Bridge constants.
+pub(super) fn erp_keys_of(config: &BridgeConstants) -> Vec<[u8; 33]> {
+    config.erp_fed_pubkeys.iter().map(|hex| key(hex)).collect()
+}
+
+/// `network`'s Bridge constants with the emergency keys `erp` and the delay
+/// `delay` in place of its own.
+pub(super) fn with_erp(network: BridgeConstants, erp: &[[u8; 33]], delay: i64) -> BridgeConstants {
+    let hexes: Vec<&'static str> = erp
+        .iter()
+        .map(|key| &*Box::leak(hex::encode(key).into_boxed_str()))
+        .collect();
+    BridgeConstants {
+        erp_fed_pubkeys: Box::leak(hexes.into_boxed_slice()),
+        erp_fed_activation_delay: delay,
+        ..network
+    }
+}
+
+/// A non-standard ERP federation's redeem script as rskj's builders write
+/// it and its tests read it (`NonStandardErpFederationsTest
+/// .validateErpRedeemScript`): the members' multisig and the emergency
+/// multisig, each without its `OP_CHECKMULTISIG`, in `OP_NOTIF <members>
+/// OP_ELSE <delay> OP_CHECKSEQUENCEVERIFY OP_DROP <emergency> OP_ENDIF
+/// OP_CHECKMULTISIG`. `delay` is the bytes the delay is pushed as.
+pub(super) fn non_standard_erp_redeem(members: &[[u8; 33]], emergency: &[[u8; 33]], delay: &[u8]) -> Vec<u8> {
+    let members = standard_redeem(members);
+    let emergency = standard_redeem(emergency);
+    let mut script = vec![0x64];
+    script.extend_from_slice(&members[..members.len() - 1]);
+    script.extend_from_slice(&[0x67, delay.len() as u8]);
+    script.extend_from_slice(delay);
+    script.extend_from_slice(&[0xb2, 0x75]);
+    script.extend_from_slice(&emergency[..emergency.len() - 1]);
+    script.extend_from_slice(&[0x68, 0xae]);
+    script
+}
+
 /// RIPEMD160(SHA256(data)).
 pub(super) fn hash160(data: &[u8]) -> [u8; 20] {
     ripemd::Ripemd160::digest(sha2::Sha256::digest(data)).into()
@@ -275,6 +321,33 @@ pub(super) fn fund_bridge<CTX: crate::RskContextTr>(ctx: &mut CTX) {
         .load_account_mut(BRIDGE_ADDR)
         .expect("the Bridge's account")
         .set_balance(all_rbtc);
+}
+
+/// How many requests the peg-out queue holds once `releaseBtc` is asked for
+/// `satoshis` at `block` of `network`, with the federation of `keys` active
+/// and a fee per KB of `fee_per_kb`.
+pub(super) fn release_queued(
+    network: (&BridgeConstants, &RskHardforkConfig),
+    block: u64,
+    keys: &[[u8; 33]],
+    fee_per_kb: u64,
+    satoshis: u64,
+) -> usize {
+    let mut ctx = ctx_at(block);
+    store_federation(&mut ctx, NEW_FEDERATION, keys, 1, 1000);
+    storage::bridge_store_u256(&mut ctx, storage::FEE_PER_KB_KEY, U256::from(fee_per_kb));
+    peg::release_btc(
+        &mut ctx,
+        0,
+        network.0,
+        network.1,
+        &BridgeTxContext::default(),
+        RskAddress::repeat_byte(0x33),
+        1,
+        U256::from(satoshis) * U256::from(WEI_PER_SATOSHI),
+    )
+    .expect("releaseBtc answers");
+    peg::load_release_request_queue(&mut ctx, true).len()
 }
 
 /// An `int256` result, which here always fits an `i128`.

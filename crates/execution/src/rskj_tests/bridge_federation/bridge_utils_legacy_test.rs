@@ -1,5 +1,5 @@
 //! rskj `co.rsk.peg.BridgeUtilsLegacyTest`: the utilities rskj ran before
-//! RSKIP284, RSKIP293 and RSKIP271, through the Bridge method that reaches
+//! RSKIP284, RSKIP293 and RSKIP271, through the Bridge methods that reach
 //! them.
 
 use alloy_primitives::Address as RskAddress;
@@ -7,6 +7,37 @@ use alloy_primitives::Address as RskAddress;
 use super::support::{self, flyover_code, FlyoverCall};
 use crate::bridge::constants::BridgeConstants;
 use crate::hardfork::RskHardforkConfig;
+
+/// Mainnet's first block with RSKIP271 (hop400).
+const MAINNET_RSKIP271: u64 = 4_598_500;
+
+/// rskj `BridgeUtilsLegacy.calculatePegoutTxSize`, the size of the regular
+/// peg-out (two inputs, two outputs) from RSKIP219 until RSKIP271
+/// (BridgeUtilsLegacy.java:42-55): for each input its signatures at 72 bytes
+/// each, its redeem script and 41 bytes; 35 bytes for each output, and 4. For
+/// 13 members it is 2,054 bytes, where from RSKIP271 bitcoinj's serialization
+/// gives 2,058. `releaseBtc` asks a peg-out to be worth the fee per KB times
+/// that size, with the network's percentage on top (BridgeSupport.java:
+/// 958-983): what the legacy size asks is queued at the last block before
+/// RSKIP271, and is short at its first.
+#[test]
+fn before_rskip271_the_legacy_pegout_size_sets_releasebtcs_minimum() {
+    let (config, cfg) = (BridgeConstants::mainnet(), RskHardforkConfig::mainnet());
+    let keys = support::keys(1, 13);
+    let redeem = support::standard_redeem(&keys);
+    let legacy_size = 4 + 2 * (7 * 72 + redeem.len() + 1 + 40) + 2 * (25 + 1 + 9);
+    assert_eq!(legacy_size, 2054);
+    let fee_per_kb = 1_000_000u64;
+    let minimum = |size: u64| {
+        let fee = fee_per_kb * size / 1000;
+        fee + fee * config.minimum_pegout_value_percentage_to_receive_after_fee / 100
+    };
+    let queued = |block, satoshis| support::release_queued((&config, &cfg), block, &keys, fee_per_kb, satoshis);
+    assert_eq!(queued(MAINNET_RSKIP271 - 1, minimum(2054)), 1);
+    assert_eq!(queued(MAINNET_RSKIP271 - 1, minimum(2054) - 1), 0);
+    assert_eq!(queued(MAINNET_RSKIP271, minimum(2054)), 0);
+    assert_eq!(queued(MAINNET_RSKIP271, minimum(2058)), 1);
+}
 
 /// What `registerFastBridgeBtcTransaction` answers for the two Bitcoin
 /// addresses `user` and `lp`, with a transaction it never gets to.
