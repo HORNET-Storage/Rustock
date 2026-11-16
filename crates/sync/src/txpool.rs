@@ -2483,6 +2483,68 @@ mod tests {
         assert!(matches!(err, PoolError::GasPriceAboveCap), "got {err}");
     }
 
+    /// rskj's pool reads RSKIP252 at its best block (`TxPendingValidator.isValid`
+    /// hands the validator `bestBlock.getNumber()`): on mainnet, with the head
+    /// at fingerroot500's first block the cap holds, and with the head a block
+    /// lower it does not.
+    #[test]
+    fn the_pool_caps_prices_from_a_head_at_rskip252() {
+        let cap = 59_240_000 * TX_GAS_PRICE_CAP_MULTIPLIER;
+        for (head, capped) in [(5_467_999, false), (5_468_000, true)] {
+            let rules = ChainRules::for_chain(
+                rustock_execution::hardfork::RskHardforkConfig::mainnet(),
+                10_000_000,
+            );
+            // A mainnet header this high carries a UMM root, empty, as the
+            // store reads it back.
+            let header = Header {
+                number: head,
+                umm_root: Some(Bytes::new()),
+                ..test_header()
+            };
+            let (pool, key, _) = setup_pool_on(
+                header,
+                U256::from(10u64).pow(U256::from(20)),
+                0,
+                test_config(),
+                Some(rules),
+            );
+            let mut tx = make_tx(0, cap + 1);
+            sign_tx(&mut tx, &key, 33);
+            let added = pool.add_transaction(&encode_tx(&tx));
+            if capped {
+                assert!(
+                    matches!(added, Err(PoolError::GasPriceAboveCap)),
+                    "capped with the head at #{head}"
+                );
+            } else {
+                added.expect("no cap with the head below fingerroot500");
+            }
+        }
+    }
+
+    /// `TxGasPriceCap.isSurpassed` answers no where the minimum is zero, so on
+    /// a head whose minimum gas price is zero the pool takes any price, with
+    /// RSKIP252 active.
+    #[test]
+    fn the_pool_caps_no_price_on_a_head_whose_minimum_is_zero() {
+        let header = Header {
+            minimum_gas_price: U256::ZERO,
+            ..test_header()
+        };
+        let (pool, key, _) = setup_pool_on(
+            header,
+            U256::from(10u64).pow(U256::from(20)),
+            0,
+            test_config(),
+            Some(regtest_rules()),
+        );
+        let mut tx = make_tx(0, 1_000_000_000_000);
+        sign_tx(&mut tx, &key, 33);
+        pool.add_transaction(&encode_tx(&tx))
+            .expect("no cap at a zero minimum");
+    }
+
     /// rskj `TxValidatorNonceEncodingValidatorTest.validateNonceEncoding`,
     /// case for case (the null nonce has no Rust counterpart).
     #[test]

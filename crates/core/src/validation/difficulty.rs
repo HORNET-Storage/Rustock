@@ -312,4 +312,18 @@ mod rskip290_tests {
             assert_eq!(late, floor);
         }
     }
+
+    /// rskj's testnet2 (chain 34) has testnet's floor and testnet's
+    /// RSKIP290 one: `getMinimumDifficulty` asks the chain ID for either.
+    #[test]
+    fn testnet2_has_rskip290s_floor_as_testnet_does() {
+        let mut config = ChainConfig::testnet();
+        config.chain_id = 34;
+        let rule = DifficultyRule {
+            config: Arc::new(config),
+        };
+        let parent = header_at(2_581_799, 1_000_000, U256::from(550_000_000u64));
+        let late = rule.difficulty_for_child(&parent, 2_581_800, 1_000_000 + 60, 0);
+        assert_eq!(late, U256::from(550_000_000u64));
+    }
 }

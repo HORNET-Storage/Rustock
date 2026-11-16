@@ -280,13 +280,47 @@ mod tests {
             Err(ValidationError::TxGasPriceAboveCap { .. })
         ));
 
-        // One block before fingerroot500 the rule does not apply.
+        // One block before fingerroot500 the rule does not apply, and from
+        // its first block it does.
         let pre = block_at(5_467_999, 100, vec![user_tx(10_001), remasc_tx()]);
         assert!(rule.validate_block(&pre).is_ok());
+        let first = block_at(5_468_000, 100, vec![user_tx(10_001), remasc_tx()]);
+        assert!(matches!(
+            rule.validate_block(&first),
+            Err(ValidationError::TxGasPriceAboveCap { .. })
+        ));
 
         // `isSurpassed` short-circuits when the block's minimum is zero.
         let zero_min = block_at(9_000_000, 0, vec![user_tx(u64::MAX), remasc_tx()]);
         assert!(rule.validate_block(&zero_min).is_ok());
+    }
+
+    /// The body rules a chain runs hold it to RSKIP252 from its own
+    /// fingerroot500 (`reference.conf`): mainnet's #5,468,000 and testnet's
+    /// #4,015,800, and not a block sooner.
+    #[test]
+    fn the_default_body_rules_cap_prices_from_each_chains_fingerroot500() {
+        use crate::config::ChainConfig;
+        use crate::validation::BlockVerifier;
+        let over = |number| block_at(number, 100, vec![user_tx(10_001), remasc_tx()]);
+        for (config, first) in [
+            (ChainConfig::mainnet(), 5_468_000),
+            (ChainConfig::testnet(), 4_015_800),
+        ] {
+            let verifier = BlockVerifier::default_rsk(&config);
+            assert!(
+                verifier.verify(&over(first - 1)).is_ok(),
+                "no cap at #{}",
+                first - 1
+            );
+            assert!(
+                matches!(
+                    verifier.verify(&over(first)),
+                    Err(ValidationError::TxGasPriceAboveCap { .. })
+                ),
+                "the cap from #{first}"
+            );
+        }
     }
 
     /// rskj `RemascValidationRule`.

@@ -2426,6 +2426,46 @@ mod partitioned_templates {
             .expect("and executes");
     }
 
+    /// rskj `BlockToMineBuilder.getTransactions` reads RSKIP252 at the height
+    /// of the block it builds, the parent's plus one: a template for
+    /// fingerroot500's first block leaves a transaction over the cap out, and
+    /// one for the block before it mines it. The ladder ends at fingerroot500,
+    /// every later upgrade left out, as rskj's schedule would have it.
+    #[test]
+    fn the_miner_caps_prices_from_the_block_rskip252_starts_at() {
+        use crate::hardfork::RskNetworkUpgrade;
+        let ending_at_fingerroot = |height: u64| {
+            RskHardforkConfig::all_active(33)
+                .with_hardfork(RskNetworkUpgrade::Arrowhead631, None)
+                .with_hardfork(RskNetworkUpgrade::Vetiver900, None)
+                .with_hardfork(RskNetworkUpgrade::Hop400, Some(0))
+                .with_hardfork(RskNetworkUpgrade::Fingerroot500, Some(height))
+        };
+        // The fixture builds on #20, so every template here is #21.
+        for (fingerroot, mined) in [(21, false), (22, true)] {
+            let ladder = ending_at_fingerroot(fingerroot);
+            assert_eq!(ladder.rskip252_height(), fingerroot);
+            let (builder, parent, keys, _, _) = fixture_with_forks_priced(1, ladder, 100);
+            let pool = Pool(vec![transfer_with(
+                &keys[0],
+                Address::repeat_byte(0xF1),
+                0,
+                33,
+                10_001,
+                21_000,
+            )]);
+            let template = builder
+                .build(std::slice::from_ref(&parent), Vec::new(), &pool)
+                .expect("the template builds");
+            assert_eq!(template.block.header.number, 21);
+            assert_eq!(
+                but_remasc(&template.block.transactions).len(),
+                usize::from(mined),
+                "with fingerroot500 at #{fingerroot}, a price over the cap is mined: {mined}"
+            );
+        }
+    }
+
 
     // ── invalid pending transactions: dropped and evicted ────────────
 
