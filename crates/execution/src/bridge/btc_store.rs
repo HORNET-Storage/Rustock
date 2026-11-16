@@ -206,19 +206,39 @@ pub fn put_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, block: &StoredB
     store_raw_bytes(ctx, key, &data);
 }
 
-/// Load a StoredBlock by its hash.
+/// Load a StoredBlock by its hash: rskj `RepositoryBtcBlockStoreWithCache.get`,
+/// which reads storage alone, never its cache.
 ///
-/// Three layers, in this order, and the order is the correctness argument:
-///
-/// 1. **This block's own writes.** Always authoritative, never cached -- they
-///    are not committed yet and may still be discarded.
-/// 2. **The cache**, when one is installed. Safe to consult here because the
-///    key is the block's own hash and the value at that key never changes.
-/// 3. **The parent trie.** A value found here is what the cache records. A
-///    value *not* found here records nothing: see
-///    [`crate::bridge::btc_block_cache`] for why negative caching would turn a
-///    missing trie node into a wrong consensus answer.
+/// This block's own writes come first: they are not committed yet and may
+/// still be discarded. Then the parent trie. The cache is the node's, not the
+/// chain's: it keeps the blocks the node read on whatever RSK chain it ran,
+/// and after the node follows another chain it can hold a block this one never
+/// stored. Answered from the cache, a header naming such a block as its parent
+/// would be taken where rskj finds no parent, and a block known by its hash
+/// where rskj knows none. A block read from the trie is recorded in the cache
+/// for the main-chain walk ([`get_stored_block_walking_the_main_chain`]); a
+/// block not found records nothing (see [`crate::bridge::btc_block_cache`]).
 pub fn get_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, hash: &BlockHash) -> Option<StoredBlock> {
+    stored_block(ctx, hash, false)
+}
+
+/// A step of the walk down the main chain from its head: rskj
+/// `getStoredBlockAtMainChainDepth`, which asks its cache before storage
+/// (`getFromCache`, then `get`). Only that walk may: every block it reaches
+/// from the head this chain stored, and a block's hash fixes its header, so
+/// its height and chain work too, whichever chain stored it.
+pub fn get_stored_block_walking_the_main_chain<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hash: &BlockHash,
+) -> Option<StoredBlock> {
+    stored_block(ctx, hash, true)
+}
+
+fn stored_block<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    hash: &BlockHash,
+    cache_first: bool,
+) -> Option<StoredBlock> {
     let key = btc_hash_to_storage_key(hash);
 
     // 1. The overlay wins over everything.
@@ -230,15 +250,15 @@ pub fn get_stored_block<CTX: crate::RskContextTr>(ctx: &mut CTX, hash: &BlockHas
         return StoredBlock::deserialize_compact(&data);
     }
 
-    // 2. The cache, if the node installed one.
+    // 2. The cache, if the node installed one, on the main-chain walk alone.
     let cache = ctx.chain_mut().btc_block_cache.clone();
-    if let Some(cache) = &cache {
+    if let Some(cache) = cache.as_ref().filter(|_| cache_first) {
         if let Some(block) = cache.get(hash) {
             return Some(block);
         }
     }
 
-    // 3. The parent trie -- the only read a cache stands in front of.
+    // 3. The parent trie.
     let data = ctx.chain_mut().raw_storage.get_from_trie(BRIDGE_ADDR, key).unwrap_or_default();
     if data.is_empty() {
         // Deliberately not recorded. An absence here may be a genuinely

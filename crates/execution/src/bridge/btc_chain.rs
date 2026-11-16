@@ -407,15 +407,17 @@ pub fn main_chain_block_at_height<CTX: crate::RskContextTr>(
     }
 
     // Walk `depth` parents down from the head (getStoredBlockAtMainChainDepth,
-    // l.271-310). A missing block returns null; a height mismatch throws.
+    // l.271-310), each block from the cache before storage, as rskj takes it.
+    // A missing block returns null; a height mismatch throws.
+    use super::btc_store::get_stored_block_walking_the_main_chain as walking;
     let mut block_hash = head.header.block_hash();
     for _ in 0..depth {
-        match get_stored_block(ctx, &block_hash) {
+        match walking(ctx, &block_hash) {
             Some(b) => block_hash = b.header.prev_blockhash,
             None => return MainChainLookup::Absent,
         }
     }
-    match get_stored_block(ctx, &block_hash) {
+    match walking(ctx, &block_hash) {
         None => MainChainLookup::Absent,
         Some(block) if block.height == height => MainChainLookup::Found(block),
         Some(_) => MainChainLookup::StoreError,
