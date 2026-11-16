@@ -406,11 +406,6 @@ fn send_to_any_address(
 /// for any but P2PKH and P2SH. The Bridge's method answers the throw with
 /// GENERIC_ERROR.
 #[test]
-#[ignore = "rskj, before RSKIP293, reads each output of a Flyover payment as an address \
-            (BridgeUtilsLegacy.getAmountSentToAddress), bitcoinj throws for a bech32 output, \
-            and Bridge.registerFlyoverBtcTransaction answers GENERIC_ERROR (-900); rustock's \
-            register_fast_bridge_btc_transaction (bridge/peg.rs) compares output scripts, \
-            throws for none, and answers the amount or VALUE_ZERO"]
 fn before_rskip293_an_output_bitcoinj_cannot_read_as_an_address_is_a_generic_error() {
     for net in [Net::Regtest, Net::Mainnet] {
         let [p2pkh, p2sh, bech32] = net.other_outputs();

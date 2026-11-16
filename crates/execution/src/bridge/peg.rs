@@ -2211,6 +2211,21 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
         None
     };
 
+    // Before RSKIP293 `getAmountSentToAddresses` is
+    // `BridgeUtilsLegacy.getAmountSentToAddress`, which reads every output as an
+    // address with bitcoinj's `Script.getToAddress`. That throws for one that is
+    // neither P2PKH nor P2SH -- a native segwit output, an OP_RETURN, a script it
+    // can't parse -- and `Bridge.registerFlyoverBtcTransaction` answers the throw
+    // with GENERIC_ERROR, nothing transferred or registered.
+    if !hardfork_cfg.has_rskip293(block_number)
+        && btc_tx
+            .output
+            .iter()
+            .any(|o| !bitcoinj_reads_as_address(o.script_pubkey.as_bytes()))
+    {
+        return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
+    }
+
     // validateFlyoverPeginValue: the amount sent to the flyover address(es) must
     // be non-zero (getAmountSentToAddresses sums outputs paying any flyover
     // address — under RSKIP293 both active and retiring). Under RSKIP293 it then
@@ -2387,6 +2402,25 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
 
     // Returns the locked amount in wei (co.rsk.core.Coin.fromBitcoin.asBigInteger).
     ok(Bytes::copy_from_slice(&rbtc_amount.to_be_bytes::<32>()))
+}
+
+/// Whether bitcoinj's `Script.getToAddress` reads `script` as an address rather
+/// than throwing: the script parses, and is P2PKH by its chunks
+/// (`isSentToAddress`, a push of 20 bytes between `OP_DUP OP_HASH160` and
+/// `OP_EQUALVERIFY OP_CHECKSIG`, however the push is written) or P2SH by its
+/// bytes (`isPayToScriptHash`, the 23-byte template).
+fn bitcoinj_reads_as_address(script: &[u8]) -> bool {
+    use super::release_tx::{parse_chunks, Chunk};
+    let Some(chunks) = parse_chunks(script) else {
+        return false;
+    };
+    let p2pkh = matches!(
+        chunks.as_slice(),
+        [Chunk::Op(0x76), Chunk::Op(0xa9), Chunk::Data(hash), Chunk::Op(0x88), Chunk::Op(0xac)]
+            if hash.len() == 20
+    );
+    let p2sh = script.len() == 23 && script[0] == 0xa9 && script[1] == 0x14 && script[22] == 0x87;
+    p2pkh || p2sh
 }
 
 /// Flyover federation information for one federation (active or retiring): the
@@ -10309,6 +10343,35 @@ mod tests {
         let cfg = rskj_regtest_until(Papyrus200);
         let tx = paying(&native_segwit(), &cfg);
         assert_eq!(registration(&tx, &cfg), (true, false, vec![], 0));
+    }
+
+    /// bitcoinj's `Script.getToAddress` reads P2PKH by its chunks, so a 20-byte
+    /// hash pushed with OP_PUSHDATA1 is still an address, and P2SH by its exact
+    /// bytes, so the same hash pushed that way is not.
+    #[test]
+    fn bitcoinj_reads_only_p2pkh_and_p2sh_as_addresses() {
+        let hash = [0x11u8; 20];
+        let p2pkh = [&[0x76, 0xa9, 0x14][..], &hash, &[0x88, 0xac]].concat();
+        let p2pkh_pushdata1 = [&[0x76, 0xa9, 0x4c, 0x14][..], &hash, &[0x88, 0xac]].concat();
+        let p2sh = [&[0xa9, 0x14][..], &hash, &[0x87]].concat();
+        let p2sh_pushdata1 = [&[0xa9, 0x4c, 0x14][..], &hash, &[0x87]].concat();
+        let p2wpkh = [&[0x00, 0x14][..], &hash].concat();
+        let short_hash = [&[0x76, 0xa9, 0x13][..], &hash[..19], &[0x88, 0xac]].concat();
+        for (script, address) in [
+            (p2pkh, true),
+            (p2pkh_pushdata1, true),
+            (p2sh, true),
+            (p2sh_pushdata1, false),
+            (p2wpkh, false),
+            (short_hash, false),
+            (vec![0x6a, 0x01, 0x01], false),
+            // An opcode where the hash goes.
+            (vec![0x76, 0xa9, 0x61, 0x88, 0xac], false),
+            (vec![0x4c], false),
+            (vec![], false),
+        ] {
+            assert_eq!(bitcoinj_reads_as_address(&script), address, "{script:02x?}");
+        }
     }
 
     /// A v1 peg-in over the locking cap, from no sender, with no refund

@@ -646,9 +646,6 @@ fn from_rskip293_each_federation_keeps_the_flyover_utxos_it_is_sent() {
 /// answers the throw with GENERIC_ERROR (Bridge.java:1382-1385): nothing is
 /// transferred or registered.
 #[test]
-#[ignore = "rskj, before RSKIP293, reads each output of a Flyover payment as an address and \
-            answers GENERIC_ERROR for one that is neither P2PKH nor P2SH; rustock takes the \
-            outputs to the flyover address and passes over the rest"]
 fn before_rskip293_a_flyover_payment_with_an_output_that_is_no_address_is_a_generic_error() {
     let cfg = before_rskip293();
     let op_return = bitcoin::ScriptBuf::from_bytes(vec![0x6a, 4, 1, 2, 3, 4]);
