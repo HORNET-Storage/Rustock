@@ -127,8 +127,13 @@ impl DatabaseRef for RskDatabase {
             None => revm::primitives::KECCAK_EMPTY,
         };
 
+        // Code is the bytes saved, and runs as they are. rskj has no EIP-7702,
+        // so code that starts 0xEF01 names no other account's code to run: its
+        // 0xEF is no opcode, and a call to it fails there. Such code could be
+        // deployed until RSKIP544 (vetiver900). `Bytecode::new_raw` would read
+        // it as a designation, and panic where it isn't one.
         let bytecode = match code {
-            Some(c) => Bytecode::new_raw(c.into()),
+            Some(c) => Bytecode::new_legacy(c.into()),
             None => Bytecode::default(),
         };
 

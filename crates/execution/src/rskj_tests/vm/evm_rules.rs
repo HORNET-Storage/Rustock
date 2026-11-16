@@ -19,6 +19,8 @@ const WASABI: u64 = 1_591_000;
 const PAPYRUS: u64 = 2_392_700;
 /// iris300 on mainnet.
 const IRIS: u64 = 3_614_800;
+/// lovell700 on mainnet.
+const LOVELL: u64 = 7_338_024;
 /// The contract a case's contract calls.
 const CALLEE: Address = Address::repeat_byte(0xce);
 
@@ -409,5 +411,42 @@ fn before_rskip174_a_failed_deployment_leaves_the_balance_already_at_the_address
             U256::from(left),
             "{case}: what it leaves"
         );
+    }
+}
+
+/// Code is the bytes it was saved as, and runs as they are. rskj has no
+/// EIP-7702: code that starts 0xEF01 names no other account's code to run,
+/// and a call to it fails at its first byte, which is no opcode. Code like
+/// that could be deployed until RSKIP544 (vetiver900). One of the two here
+/// has the shape of a designation, 0xEF0100 and an address, and names an
+/// account whose code returns a word; the other is two bytes long. The
+/// call to each pushes 0 and leaves no return data.
+#[test]
+fn code_that_starts_0xef01_runs_as_its_bytes() {
+    let odd = Address::repeat_byte(0xef);
+    let probe = compile(&format!(
+        "PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 {} PUSH3 0x030d40 CALL \
+         RETURNDATASIZE",
+        push_address(odd)
+    ));
+    let designation = [&[0xef, 0x01, 0x00][..], CALLEE.as_slice()].concat();
+    for number in [IRIS, LOVELL] {
+        for code in [designation.clone(), vec![0xef, 0x01]] {
+            let mut chain = Chain::mainnet(number);
+            chain.put(SENDER, 0, ONE_RBTC, &[]);
+            let word = [compile("PUSH1 0x01"), return_top(1)].concat();
+            chain.put(CALLEE, 1, U256::ZERO, &word);
+            chain.put(odd, 1, U256::ZERO, &code);
+            chain.put(
+                CONTRACT,
+                1,
+                U256::ZERO,
+                &[probe.clone(), return_top(2)].concat(),
+            );
+            let ran = chain.run(SENDER, call(0, CONTRACT, U256::ZERO, GAS, &[]));
+            let case = format!("{} #{number}", alloy_primitives::hex::encode(&code));
+            assert!(ran.success, "{case}");
+            assert_eq!(words(&ran.output), [U256::ZERO, U256::ZERO], "{case}");
+        }
     }
 }
