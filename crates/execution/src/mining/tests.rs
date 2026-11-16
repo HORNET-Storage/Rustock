@@ -243,7 +243,12 @@ fn fixture_on(
 
     let hardfork_cfg = RskHardforkConfig::all_active(33);
     let builder = BlockTemplateBuilder::new(
-        Arc::new(BlockProcessor::new(hardfork_cfg.clone(), store.clone())),
+        // With the chain's configuration, as a node wires its miner's
+        // processor: the uncles a template names are held to its rules.
+        Arc::new(
+            BlockProcessor::new(hardfork_cfg.clone(), store.clone())
+                .with_chain_config(chain_config.clone()),
+        ),
         trie_store.clone(),
         chain_config.clone(),
         hardfork_cfg,
@@ -2430,14 +2435,16 @@ mod partitioned_templates {
     /// of the block it builds, the parent's plus one: a template for
     /// fingerroot500's first block leaves a transaction over the cap out, and
     /// one for the block before it mines it. The ladder ends at fingerroot500,
-    /// every later upgrade left out, as rskj's schedule would have it.
+    /// every later upgrade left out, and vetiver900's RSKIP536 with it, as
+    /// rskj's schedule would have it.
     #[test]
     fn the_miner_caps_prices_from_the_block_rskip252_starts_at() {
-        use crate::hardfork::RskNetworkUpgrade;
+        use crate::hardfork::{ConsensusRule, RskNetworkUpgrade};
         let ending_at_fingerroot = |height: u64| {
             RskHardforkConfig::all_active(33)
                 .with_hardfork(RskNetworkUpgrade::Arrowhead631, None)
                 .with_hardfork(RskNetworkUpgrade::Vetiver900, None)
+                .with_consensus_rule(ConsensusRule::Rskip536, None)
                 .with_hardfork(RskNetworkUpgrade::Hop400, Some(0))
                 .with_hardfork(RskNetworkUpgrade::Fingerroot500, Some(height))
         };
@@ -2815,10 +2822,22 @@ mod mining_with_uncles {
             .with_chain_config(Arc::new(config))
     }
 
+    /// `builder` with [`processor_without_pow`], as a miner on a chain that
+    /// skips proof of work is wired: a builder whose processor checks the
+    /// work leaves those uncles out, as rskj's `BlockToMineBuilder` leaves
+    /// out any the uncle rule refuses.
+    fn builder_without_pow(
+        builder: BlockTemplateBuilder,
+        store: &Arc<BlockStore>,
+    ) -> BlockTemplateBuilder {
+        builder.with_processor_for_test(Arc::new(processor_without_pow(store.clone())))
+    }
+
     #[test]
     fn a_block_sealed_with_an_uncle_is_one_the_importer_accepts() {
         let (builder, parent, _keys, trie_store, store) =
             super::partitioned_templates::fixture_for_cap_test(1);
+        let builder = builder_without_pow(builder, &store);
 
         let orphan = orphan_sibling_of_head(&store, &parent, 0xAA);
         assert_ne!(
@@ -2866,23 +2885,29 @@ mod mining_with_uncles {
     /// The RSKIP-252 lesson is that a validator run over a fixture it has
     /// nothing to say about looks exactly like a validator that approves.
     /// So: hand the miner an uncle that is plainly inadmissible -- the
-    /// canonical parent, which is an ancestor and never an uncle -- and
-    /// require the importer to refuse the result. If this passes, the
-    /// positive test above is evidence of something.
+    /// canonical parent, which is an ancestor and never an uncle. The miner
+    /// builds the block without it, as rskj's `BlockToMineBuilder.createBlock`
+    /// does; and the importer refuses a block that carries it anyway. If
+    /// both hold, the positive test above is evidence of something.
     #[test]
     fn the_importer_rejects_a_block_whose_uncle_is_inadmissible() {
         let (builder, parent, _keys, trie_store, store) =
             super::partitioned_templates::fixture_for_cap_test(1);
+        let builder = builder_without_pow(builder, &store);
 
         // An ancestor, not a sibling. `select_uncles` would never offer it.
         let template = builder
             .build(std::slice::from_ref(&parent), vec![parent.clone()], &NoTransactions)
-            .expect("the miner builds whatever it is handed");
-        assert_eq!(template.block.ommers.len(), 1, "the premise: the block carries it");
+            .expect("the miner builds, without the uncle it was handed");
+        assert!(template.block.ommers.is_empty(), "the miner leaves it out");
 
+        let mut carrying = template.block.clone();
+        carrying.ommers = vec![parent.clone()];
+        carrying.header.uncle_count = 1;
+        carrying.header.ommers_hash = crate::processor::compute_ommers_hash(&carrying.ommers);
         let processor = processor_without_pow(store);
         let _ = trie_store;
-        let outcome = processor.validate_block(&template.block);
+        let outcome = processor.validate_block(&carrying);
         assert!(
             matches!(outcome, Err(ValidationError::UncleIsAncestor { .. })),
             "an ancestor offered as an uncle must be refused as one -- if this is \
@@ -2898,6 +2923,7 @@ mod mining_with_uncles {
     fn the_header_commits_to_the_uncles_it_carries() {
         let (builder, parent, _keys, _trie_store, store) =
             super::partitioned_templates::fixture_for_cap_test(1);
+        let builder = builder_without_pow(builder, &store);
         let _ = orphan_sibling_of_head(&store, &parent, 0xBB);
         let offered = select_uncles(&store, parent.number + 1, parent.hash());
 
@@ -3321,4 +3347,115 @@ fn cumulative_difficulty_counts_the_uncles() {
     assert_eq!(cumulative_difficulty(&block), U256::from(1_320));
     let alone = rustock_core::Block { header, transactions: Vec::new(), ommers: Vec::new() };
     assert_eq!(cumulative_difficulty(&alone), U256::from(1_000));
+}
+
+// ── the rules a mined block meets ─────────────────────────────────────
+
+mod own_block_rules {
+    use super::*;
+
+    /// A block that lost to the fixture's head, on the head's parent. Mined
+    /// 100 s after that parent, it keeps the parent's difficulty where that
+    /// is the floor, as the difficulty rule wants, and so meets every rule an
+    /// uncle meets but proof of work.
+    fn losing_sibling(fx: &MiningFixture) -> Header {
+        let grandparent = fx.store.header(fx.parent.parent_hash).unwrap().unwrap();
+        let mut sibling = header_at(
+            fx.parent.number,
+            fx.parent.parent_hash,
+            fx.parent.state_root,
+        );
+        sibling.beneficiary = Address::repeat_byte(0xAA);
+        sibling.difficulty = grandparent.difficulty;
+        sibling.timestamp = grandparent.timestamp + 100;
+        fx.store
+            .put_header_with_hash(sibling.hash(), &sibling)
+            .unwrap();
+        sibling
+    }
+
+    fn template_naming(fx: &MiningFixture, uncles: Vec<Header>) -> BlockTemplate {
+        fx.server
+            .builder_for_test()
+            .build(
+                std::slice::from_ref(&fx.parent),
+                uncles,
+                &NoPendingTransactions,
+            )
+            .unwrap()
+    }
+
+    /// rskj `BlockToMineBuilder.createBlock`: a block whose uncles fail the
+    /// uncle rule is built again without them. Where proof of work goes
+    /// unchecked the sibling is an uncle and stays; where it is checked, the
+    /// sibling, never mined, is none, and the block is built without it.
+    #[test]
+    fn a_template_leaves_out_uncles_the_rule_refuses() {
+        let unchecked = fixture_without_pow(20, 1, Arc::new(MemoryTrieStore::new()));
+        let sibling = losing_sibling(&unchecked);
+        let template = template_naming(&unchecked, vec![sibling.clone()]);
+        let named: Vec<B256> = template.block.ommers.iter().map(Header::hash).collect();
+        assert_eq!(named, vec![sibling.hash()]);
+        assert_eq!(template.block.header.uncle_count, 1);
+
+        let checked = fixture(20);
+        let sibling = losing_sibling(&checked);
+        let template = template_naming(&checked, vec![sibling]);
+        assert!(template.block.ommers.is_empty());
+        assert_eq!(template.block.header.uncle_count, 0);
+        assert_eq!(
+            template.block.header.ommers_hash,
+            crate::processor::compute_ommers_hash(&[])
+        );
+    }
+
+    /// rskj connects a mined block through `blockchain.tryToConnect`, which
+    /// holds it to the uncle rule as it holds a peer's block. An uncle the
+    /// block's parent turns out to have named already is used, and a block
+    /// naming it again is refused, not stored and made the best block.
+    #[test]
+    fn a_mined_block_naming_an_uncle_already_used_is_refused() {
+        let fx = fixture_without_pow(20, 1, Arc::new(MemoryTrieStore::new()));
+        let sibling = losing_sibling(&fx);
+        let work = fx.server.build_work().unwrap();
+        // The work names the sibling; now the parent has named it too.
+        fx.store
+            .put_body(fx.parent.hash(), &[], std::slice::from_ref(&sibling))
+            .unwrap();
+
+        let err = dev::submit_unsolved(&fx.server, &work).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                dev::MineError::Submit(SubmitError::SelfCheck(
+                    ValidationError::UncleAlreadyUsed { .. }
+                ))
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+    }
+
+    /// And to the header's rules against its parent, as rskj's
+    /// `BlockValidatorImpl` holds it: here the minimum gas limit, which a
+    /// miner keeping its parent's 6,800,000 falls below on a chain whose
+    /// minimum is 7,000,000.
+    #[test]
+    fn a_mined_block_below_the_minimum_gas_limit_is_refused() {
+        let mut config = (*test_chain_config()).clone();
+        config.min_gas_limit = 7_000_000;
+        let fx = fixture_with(20, Arc::new(config), U256::from(2));
+        let work = fx.server.get_work().unwrap();
+        let raw = bitcoin::consensus::serialize(&solve(&work));
+
+        let err = fx.server.submit_bitcoin_block(&raw).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SubmitError::SelfCheck(ValidationError::GasLimitBelowMinimum { .. })
+            ),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+    }
 }

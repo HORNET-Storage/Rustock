@@ -176,6 +176,14 @@ impl BlockTemplateBuilder {
         &self.processor
     }
 
+    /// This builder with `processor` in place of its own, for a test whose
+    /// chain the processor's configuration has to match.
+    #[cfg(test)]
+    pub(crate) fn with_processor_for_test(mut self, processor: Arc<BlockProcessor>) -> Self {
+        self.processor = processor;
+        self
+    }
+
     pub fn trie_store(&self) -> Arc<dyn TrieStore> {
         self.trie_store.clone()
     }
@@ -204,6 +212,7 @@ impl BlockTemplateBuilder {
         let state_root = self.load_state_root(parent_state_root)?;
 
         let number = parent.number + 1;
+        let ommers = self.admissible_uncles(parent, number, ommers);
         let timestamp = timestamp_for_child(parent.timestamp);
         let difficulty = DifficultyRule { config: self.chain_config.clone() }
             .difficulty_for_child(parent, number, timestamp, ommers.len() as u64);
@@ -406,6 +415,44 @@ impl BlockTemplateBuilder {
             fees_paid_to_miner: executed.paid_fees,
             parent_state_root,
         })
+    }
+
+    /// `uncles`, if a block at `number` on `parent` may name them, and none
+    /// otherwise: rskj's `BlockToMineBuilder.createBlock` builds a block
+    /// whose uncles fail the uncle rule again without them, rather than hand
+    /// out work on a block every node refuses. The rule is the one a block is
+    /// held to on import ([`BlockProcessor::validate_uncles`]), which the
+    /// mined block meets again before it is stored
+    /// (`MinerServer::complete_and_import`), so no work is offered on a block
+    /// this node would refuse.
+    fn admissible_uncles(&self, parent: &Header, number: u64, uncles: Vec<Header>) -> Vec<Header> {
+        if uncles.is_empty() {
+            return uncles;
+        }
+        // The rule reads the block's number, its parent's hash and its
+        // uncles, and nothing else of its header.
+        let block = Block {
+            header: Header {
+                number,
+                parent_hash: parent.hash(),
+                cached_hash: None,
+                cached_hash_for_merged_mining: None,
+                ..parent.clone()
+            },
+            transactions: Vec::new(),
+            ommers: uncles,
+        };
+        match self.processor.validate_uncles(&block) {
+            Ok(()) => block.ommers,
+            Err(e) => {
+                tracing::warn!(
+                    target: "rustock::mining",
+                    "Building the block at #{number} without its {} uncle(s), which the uncle rule refuses: {e}",
+                    block.ommers.len()
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Execute the candidates once, keep the ones that fit, and where the

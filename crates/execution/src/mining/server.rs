@@ -99,7 +99,7 @@ pub enum SubmitError {
     Compression(#[from] CoinbaseCompressionError),
     #[error("building the merkle proof: {0}")]
     MerkleProof(#[from] MerkleProofError),
-    #[error("the completed block does not satisfy the merged-mining rule: {0}")]
+    #[error("the completed block fails a rule every node holds it to: {0}")]
     SelfCheck(rustock_core::validation::ValidationError),
     #[error("re-executing the completed block: {0}")]
     Execution(String),
@@ -830,6 +830,30 @@ impl MinerServer {
         // minutes or more from the template is one every peer rejects.
         rustock_core::validation::BitcoinTimestampRule { config: self.chain_config.clone() }
             .validate(&block.header)
+            .map_err(SubmitError::SelfCheck)?;
+        // rskj connects a mined block through `blockchain.tryToConnect`, which
+        // holds it to every rule a peer's block is held to before running it
+        // (`BlockValidatorImpl`): the header's own and against its parent, the
+        // body's, the uncles' and fork detection. A block that fails one is
+        // `INVALID_BLOCK` there, and is not stored here either, to be made a
+        // best block that every other node refuses.
+        let parent = self
+            .chain
+            .mainchain(1)
+            .map_err(SubmitError::Storage)?
+            .into_iter()
+            .next()
+            .filter(|parent| parent.hash() == template.parent_hash())
+            .ok_or(SubmitError::ParentNoLongerHead {
+                parent: template.parent_hash(),
+                head,
+            })?;
+        rustock_core::validation::HeaderVerifier::default_rsk(self.chain_config.clone())
+            .verify(&block.header, Some(&parent))
+            .map_err(SubmitError::SelfCheck)?;
+        self.builder
+            .processor()
+            .validate_block(&block)
             .map_err(SubmitError::SelfCheck)?;
         t.initial_validation = laps.lap();
 

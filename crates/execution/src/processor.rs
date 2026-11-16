@@ -761,11 +761,6 @@ impl BlockProcessor {
         block: &Block,
         parent: Option<&rustock_core::Header>,
     ) -> Result<(), ValidationError> {
-        use rustock_core::validation::uncles::{
-            rsk_header_rules, rsk_parent_rules, UncleForkDetection, UnclesValidationRule,
-            UNCLE_GENERATION_LIMIT, UNCLE_LIST_LIMIT,
-        };
-
         let number = block.header.number;
 
         // rskj `BlockValidatorImpl.isValid` refuses genesis outright: it is
@@ -777,14 +772,38 @@ impl BlockProcessor {
         }
 
         self.validate_block_body_rules(block, parent)?;
+        self.validate_uncles(block)?;
 
-        // rskj BlockUnclesValidationRule. The ommers HASH is checked in
-        // process_block; this decides whether the uncles are admissible, each
-        // put through the rules rskj gives the rule: its own proof of work,
-        // timestamps and gas used, and against its own parent the minimum gas
-        // price, number, timestamp, difficulty and gas limit. An uncle's
-        // difficulty counts toward the chain's work, so one checked less hard
-        // than a trunk block is work credited that nobody did.
+        // rskj ForkDetectionDataRule -- RSKIP110 (wasabi100).
+        if self.validate_fork_detection_data {
+            let actual =
+                rustock_core::validation::merged_mining::extract_fork_detection_data(&block.header);
+            rustock_core::validation::fork_detection::validate(
+                &block.header,
+                actual,
+                &self.ancestry(),
+                self.rskip110_height(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// rskj `BlockUnclesValidationRule`, as a block is held to it on import.
+    /// The ommers HASH is checked in `process_block`; this decides whether
+    /// the uncles are admissible, each put through the rules rskj gives the
+    /// rule: its own proof of work, timestamps and gas used, and against its
+    /// own parent the minimum gas price, number, timestamp, difficulty and gas
+    /// limit. An uncle's difficulty counts toward the chain's work, so one
+    /// checked less hard than a trunk block is work credited that nobody did.
+    ///
+    /// Reads only the block's number, its parent's hash and its uncles, so
+    /// the miner holds the uncles it picked to it before building on them.
+    pub fn validate_uncles(&self, block: &Block) -> Result<(), ValidationError> {
+        use rustock_core::validation::uncles::{
+            rsk_header_rules, rsk_parent_rules, UncleForkDetection, UnclesValidationRule,
+            UNCLE_GENERATION_LIMIT, UNCLE_LIST_LIMIT,
+        };
+
         let ancestry = self.ancestry();
         let header_rules = rsk_header_rules(self.chain_config.clone());
         let parent_rules = rsk_parent_rules(self.chain_config.clone());
@@ -794,8 +813,8 @@ impl BlockProcessor {
             uncle_generation_limit: UNCLE_GENERATION_LIMIT,
             header_rules: &header_rules,
             parent_rules: &parent_rules,
-            // Under the same switch as the block's own fork-detection check
-            // below, and for the same cost: 449 headers per uncle.
+            // Under the same switch as the block's own fork-detection check,
+            // and for the same cost: 449 headers per uncle.
             fork_detection: self
                 .validate_fork_detection_data
                 .then_some(UncleForkDetection {
@@ -803,21 +822,7 @@ impl BlockProcessor {
                     rskip110_height: self.rskip110_height(),
                 }),
         }
-        .validate(block)?;
-
-        // rskj ForkDetectionDataRule -- RSKIP110 (wasabi100).
-        if self.validate_fork_detection_data {
-            let actual =
-                rustock_core::validation::merged_mining::extract_fork_detection_data(&block.header);
-            rustock_core::validation::fork_detection::validate(
-                &block.header,
-                actual,
-                &ancestry,
-                self.rskip110_height(),
-            )?;
-        }
-        let _ = number;
-        Ok(())
+        .validate(block)
     }
 
     /// The rules of [`Self::validate_block_rules`] that read only the block
