@@ -22,11 +22,19 @@ use crate::hardfork::RskHardforkConfig;
 type Network = (BridgeConstants, RskHardforkConfig, bitcoin::Network);
 
 fn mainnet() -> Network {
-    (BridgeConstants::mainnet(), RskHardforkConfig::mainnet(), bitcoin::Network::Bitcoin)
+    (
+        BridgeConstants::mainnet(),
+        RskHardforkConfig::mainnet(),
+        bitcoin::Network::Bitcoin,
+    )
 }
 
 fn testnet() -> Network {
-    (BridgeConstants::testnet(), RskHardforkConfig::testnet(), bitcoin::Network::Testnet)
+    (
+        BridgeConstants::testnet(),
+        RskHardforkConfig::testnet(),
+        bitcoin::Network::Testnet,
+    )
 }
 
 /// A block of each era a commit builds in. Mainnet: before RSKIP201
@@ -71,7 +79,9 @@ fn abi_string(data: &[u8], index: usize) -> String {
 fn commit(network: &Network, block: u64, members: &[[u8; 33]]) -> (Option<i128>, Option<String>) {
     let mut ctx = support::ctx_at(block);
     let answer = support::elect_federation(&mut ctx, (&network.0, &network.1), members);
-    let topic = B256::from_slice(&Keccak256::digest(b"commit_federation(bytes,string,bytes,string,int256)"));
+    let topic = B256::from_slice(&Keccak256::digest(
+        b"commit_federation(bytes,string,bytes,string,int256)",
+    ));
     let address = ctx
         .journal_mut()
         .take_logs()
@@ -105,12 +115,22 @@ enum Built {
 }
 
 /// The address rskj gives the federation of `members` built as `built`.
-fn address_of(built: Built, members: &[[u8; 33]], emergency: &[[u8; 33]], net: bitcoin::Network) -> String {
+fn address_of(
+    built: Built,
+    members: &[[u8; 33]],
+    emergency: &[[u8; 33]],
+    net: bitcoin::Network,
+) -> String {
     match built {
         Built::Standard => p2sh(&support::standard_redeem(members), net),
-        Built::NonStandardErp(delay) => p2sh(&support::non_standard_erp_redeem(members, emergency, delay), net),
+        Built::NonStandardErp(delay) => p2sh(
+            &support::non_standard_erp_redeem(members, emergency, delay),
+            net,
+        ),
         Built::P2shErp => p2sh(&support::p2sh_erp_redeem(members, emergency, DELAY), net),
-        Built::P2shP2wshErp => p2sh_p2wsh(&support::p2sh_erp_redeem(members, emergency, DELAY), net),
+        Built::P2shP2wshErp => {
+            p2sh_p2wsh(&support::p2sh_erp_redeem(members, emergency, DELAY), net)
+        }
     }
 }
 
@@ -124,7 +144,11 @@ fn a_commit_builds_the_federation_of_its_era() {
     let mainnet_eras = [
         (Built::Standard, MAINNET_STANDARD, 9),
         (Built::Standard, MAINNET_STANDARD, 15),
-        (Built::NonStandardErp(DELAY_BEFORE_RSKIP293), MAINNET_NON_STANDARD_BEFORE_RSKIP293, 9),
+        (
+            Built::NonStandardErp(DELAY_BEFORE_RSKIP293),
+            MAINNET_NON_STANDARD_BEFORE_RSKIP293,
+            9,
+        ),
         (Built::NonStandardErp(DELAY), MAINNET_NON_STANDARD, 9),
         (Built::P2shErp, MAINNET_P2SH_ERP, 9),
         (Built::P2shP2wshErp, MAINNET_P2SH_P2WSH_ERP, 9),
@@ -138,7 +162,10 @@ fn a_commit_builds_the_federation_of_its_era() {
         (Built::P2shP2wshErp, TESTNET_P2SH_P2WSH_ERP, 9),
         (Built::P2shP2wshErp, TESTNET_P2SH_P2WSH_ERP, 20),
     ];
-    for (network, eras) in [(mainnet(), &mainnet_eras[..]), (testnet(), &testnet_eras[..])] {
+    for (network, eras) in [
+        (mainnet(), &mainnet_eras[..]),
+        (testnet(), &testnet_eras[..]),
+    ] {
         let emergency = support::erp_keys_of(&network.0);
         let net = network.2;
         for &(built, block, count) in eras {
@@ -163,7 +190,12 @@ fn a_commit_builds_the_federation_of_its_era() {
 #[test]
 fn a_commit_throws_where_bitcoin_could_not_spend_from_the_federation_it_builds() {
     for (network, block, largest, too_many) in [
-        (mainnet(), MAINNET_NON_STANDARD_BEFORE_RSKIP293, 9, &[10][..]),
+        (
+            mainnet(),
+            MAINNET_NON_STANDARD_BEFORE_RSKIP293,
+            9,
+            &[10][..],
+        ),
         (mainnet(), MAINNET_NON_STANDARD, 9, &[10][..]),
         (testnet(), TESTNET_NON_STANDARD, 10, &[11][..]),
         (mainnet(), MAINNET_P2SH_ERP, 9, &[10][..]),
@@ -199,7 +231,14 @@ fn a_pending_federation_of_one_member_is_not_committed() {
     support::pend_federation(&mut ctx, (config, cfg), &members(1));
     let authorizer = support::deciding_authorizers(config)[0];
     let args = encode::args(&[Arg::Bytes(&[0; 32])]);
-    let out = governance::commit_federation(&mut ctx, &args, 0, config, cfg, &support::sent_by(authorizer))
-        .expect("commitFederation answers");
+    let out = governance::commit_federation(
+        &mut ctx,
+        &args,
+        0,
+        config,
+        cfg,
+        &support::sent_by(authorizer),
+    )
+    .expect("commitFederation answers");
     assert_eq!(support::int_answer(&out.bytes), -2);
 }

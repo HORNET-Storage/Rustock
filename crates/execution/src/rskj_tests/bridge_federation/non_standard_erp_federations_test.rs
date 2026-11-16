@@ -68,11 +68,36 @@ fn redeem(members: &[[u8; 33]], network: &Network, block: u64) -> Vec<u8> {
 fn a_nonstandard_erp_redeem_script_is_laid_out_as_rskjs_in_each_era() {
     let members = members();
     for (era, network, block, delay) in [
-        ("mainnet from RSKIP201", mainnet(), MAINNET_RSKIP201, DELAY_BEFORE_RSKIP293),
-        ("mainnet before RSKIP293", mainnet(), MAINNET_RSKIP293 - 1, DELAY_BEFORE_RSKIP293),
-        ("mainnet from RSKIP293", mainnet(), MAINNET_RSKIP293, DELAY_FROM_RSKIP293),
-        ("testnet from RSKIP284", testnet(), TESTNET_RSKIP284, DELAY_BEFORE_RSKIP293),
-        ("testnet from RSKIP293", testnet(), TESTNET_RSKIP293, DELAY_FROM_RSKIP293),
+        (
+            "mainnet from RSKIP201",
+            mainnet(),
+            MAINNET_RSKIP201,
+            DELAY_BEFORE_RSKIP293,
+        ),
+        (
+            "mainnet before RSKIP293",
+            mainnet(),
+            MAINNET_RSKIP293 - 1,
+            DELAY_BEFORE_RSKIP293,
+        ),
+        (
+            "mainnet from RSKIP293",
+            mainnet(),
+            MAINNET_RSKIP293,
+            DELAY_FROM_RSKIP293,
+        ),
+        (
+            "testnet from RSKIP284",
+            testnet(),
+            TESTNET_RSKIP284,
+            DELAY_BEFORE_RSKIP293,
+        ),
+        (
+            "testnet from RSKIP293",
+            testnet(),
+            TESTNET_RSKIP293,
+            DELAY_FROM_RSKIP293,
+        ),
     ] {
         let emergency = support::erp_keys_of(&network.0);
         assert_eq!(
@@ -83,10 +108,15 @@ fn a_nonstandard_erp_redeem_script_is_laid_out_as_rskjs_in_each_era() {
     }
 
     let hardcoded = redeem(&members, &testnet(), TESTNET_BEFORE_RSKIP284);
-    assert_eq!(redeem(&support::keys(1, 5), &testnet(), TESTNET_BEFORE_RSKIP284), hardcoded);
+    assert_eq!(
+        redeem(&support::keys(1, 5), &testnet(), TESTNET_BEFORE_RSKIP284),
+        hardcoded
+    );
     let unsigned_delay = redeem(&members, &testnet(), TESTNET_RSKIP284);
     let signed_delay = redeem(&members, &testnet(), TESTNET_RSKIP293);
-    assert!(hardcoded != unsigned_delay && hardcoded != signed_delay && unsigned_delay != signed_delay);
+    assert!(
+        hardcoded != unsigned_delay && hardcoded != signed_delay && unsigned_delay != signed_delay
+    );
 
     assert_eq!(
         redeem(&members, &mainnet(), MAINNET_RSKIP201),
@@ -140,8 +170,11 @@ fn the_last_nonstandard_erp_federation_of_testnet_has_its_real_address() {
         hex::encode(support::p2sh(&support::hash160(&redeem)).as_bytes()),
         "a91412d5d2996618c8abcb1e6fc17be3cd8e2790c25f87"
     );
-    let address = bitcoin::Address::p2sh(bitcoin::Script::from_bytes(&redeem), bitcoin::Network::Testnet)
-        .expect("a redeem script within 520 bytes");
+    let address = bitcoin::Address::p2sh(
+        bitcoin::Script::from_bytes(&redeem),
+        bitcoin::Network::Testnet,
+    )
+    .expect("a redeem script within 520 bytes");
     assert_eq!(address.to_string(), "2MtxpJPt2xCa3AyFYUjTT7Aop9Z6gGf4rqA");
 }
 
@@ -249,17 +282,61 @@ fn delay_bitcoin_reads(script: &[u8], members: usize) -> i64 {
 fn before_rskip293_bitcoin_reads_the_emergency_delay_little_endian_from_big_endian_bytes() {
     let members = support::keys(1, 9);
     for (era, network, block, delay, read) in [
-        ("testnet before RSKIP293", testnet(), TESTNET_RSKIP284, 52_560, 20_685),
-        ("testnet before RSKIP293", testnet(), TESTNET_RSKIP284, 300, 11_265),
-        ("mainnet before RSKIP293", mainnet(), MAINNET_RSKIP293 - 1, 52_560, 20_685),
-        ("mainnet before RSKIP293", mainnet(), MAINNET_RSKIP293 - 1, 300, 11_265),
-        ("testnet from RSKIP293", testnet(), TESTNET_RSKIP293, 52_560, 52_560),
-        ("mainnet from RSKIP293", mainnet(), MAINNET_RSKIP293, 52_560, 52_560),
+        (
+            "testnet before RSKIP293",
+            testnet(),
+            TESTNET_RSKIP284,
+            52_560,
+            20_685,
+        ),
+        (
+            "testnet before RSKIP293",
+            testnet(),
+            TESTNET_RSKIP284,
+            300,
+            11_265,
+        ),
+        (
+            "mainnet before RSKIP293",
+            mainnet(),
+            MAINNET_RSKIP293 - 1,
+            52_560,
+            20_685,
+        ),
+        (
+            "mainnet before RSKIP293",
+            mainnet(),
+            MAINNET_RSKIP293 - 1,
+            300,
+            11_265,
+        ),
+        (
+            "testnet from RSKIP293",
+            testnet(),
+            TESTNET_RSKIP293,
+            52_560,
+            52_560,
+        ),
+        (
+            "mainnet from RSKIP293",
+            mainnet(),
+            MAINNET_RSKIP293,
+            52_560,
+            52_560,
+        ),
     ] {
         let emergency = support::erp_keys_of(&network.0);
         let network = (support::with_erp(network.0, &emergency, delay), network.1);
         let script = redeem(&members, &network, block);
-        assert_eq!(delay_bitcoin_reads(&script, members.len()), read, "{era}, a delay of {delay}");
-        assert_eq!(read <= delay, delay != 300, "{era}, a delay of {delay}: the emergency keys spend");
+        assert_eq!(
+            delay_bitcoin_reads(&script, members.len()),
+            read,
+            "{era}, a delay of {delay}"
+        );
+        assert_eq!(
+            read <= delay,
+            delay != 300,
+            "{era}, a delay of {delay}: the emergency keys spend"
+        );
     }
 }

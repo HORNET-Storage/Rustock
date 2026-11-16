@@ -16,7 +16,9 @@ use sha2::Digest as _;
 use crate::abi::encode::{self, Arg};
 use crate::bridge::constants::{BridgeConstants, BtcNetwork};
 use crate::bridge::federation::{serialize_federation_multikey, StoredMember};
-use crate::bridge::{btc_chain, btc_rules, federation, getters, governance, peg, serialization, storage, tx};
+use crate::bridge::{
+    btc_chain, btc_rules, federation, getters, governance, peg, serialization, storage, tx,
+};
 use crate::hardfork::{RskHardforkConfig, RskNetworkUpgrade};
 use crate::precompiles::{BridgeTxContext, BRIDGE_ADDR};
 
@@ -73,7 +75,13 @@ pub(super) fn keys(first: u8, count: u8) -> Vec<[u8; 33]> {
 /// to OP_15 below 16 and a one-byte push from 16 on, to the 20 keys it takes.
 pub(super) fn multisig(keys: &[[u8; 33]], threshold: usize) -> Vec<u8> {
     assert!(keys.len() <= 20 && (1..=keys.len()).contains(&threshold));
-    let number = |n: usize| if n < 16 { vec![0x50 + n as u8] } else { vec![1, n as u8] };
+    let number = |n: usize| {
+        if n < 16 {
+            vec![0x50 + n as u8]
+        } else {
+            vec![1, n as u8]
+        }
+    };
     let mut sorted = keys.to_vec();
     sorted.sort();
     let mut script = number(threshold);
@@ -125,7 +133,11 @@ pub(super) fn with_erp(network: BridgeConstants, erp: &[[u8; 33]], delay: i64) -
 /// multisig, each without its `OP_CHECKMULTISIG`, in `OP_NOTIF <members>
 /// OP_ELSE <delay> OP_CHECKSEQUENCEVERIFY OP_DROP <emergency> OP_ENDIF
 /// OP_CHECKMULTISIG`. `delay` is the bytes the delay is pushed as.
-pub(super) fn non_standard_erp_redeem(members: &[[u8; 33]], emergency: &[[u8; 33]], delay: &[u8]) -> Vec<u8> {
+pub(super) fn non_standard_erp_redeem(
+    members: &[[u8; 33]],
+    emergency: &[[u8; 33]],
+    delay: &[u8],
+) -> Vec<u8> {
     let members = standard_redeem(members);
     let emergency = standard_redeem(emergency);
     let mut script = vec![0x64];
@@ -143,7 +155,11 @@ pub(super) fn non_standard_erp_redeem(members: &[[u8; 33]], emergency: &[[u8; 33
 /// <members' multisig> OP_ELSE <delay> OP_CHECKSEQUENCEVERIFY OP_DROP
 /// <emergency multisig> OP_ENDIF`, each multisig whole. `delay` is the bytes
 /// the delay is pushed as, Java's `BigInteger.toByteArray` reversed.
-pub(super) fn p2sh_erp_redeem(members: &[[u8; 33]], emergency: &[[u8; 33]], delay: &[u8]) -> Vec<u8> {
+pub(super) fn p2sh_erp_redeem(
+    members: &[[u8; 33]],
+    emergency: &[[u8; 33]],
+    delay: &[u8],
+) -> Vec<u8> {
     let mut script = vec![0x64];
     script.extend(standard_redeem(members));
     script.extend_from_slice(&[0x67, delay.len() as u8]);
@@ -392,7 +408,10 @@ pub(super) fn sent_by(sender: RskAddress) -> BridgeTxContext {
 }
 
 /// What a Bridge method answers, where it does not throw.
-fn answer(out: Result<revm::precompile::PrecompileOutput, revm::precompile::PrecompileError>, method: &str) -> i128 {
+fn answer(
+    out: Result<revm::precompile::PrecompileOutput, revm::precompile::PrecompileError>,
+    method: &str,
+) -> i128 {
     out.map(|out| int_answer(&out.bytes))
         .unwrap_or_else(|e| panic!("{method} throws: {e:?}"))
 }
@@ -414,8 +433,19 @@ pub(super) fn pend_federation<CTX: crate::RskContextTr>(
     for member in members {
         let args = encode::args(&[Arg::Bytes(member), Arg::Bytes(member), Arg::Bytes(member)]);
         for &sender in &deciding {
-            let out = governance::add_federator_public_key_multikey(ctx, &args, 0, config, cfg, &sent_by(sender));
-            assert_eq!(answer(out, "addFederatorPublicKeyMultikey"), 1, "addFederatorPublicKeyMultikey");
+            let out = governance::add_federator_public_key_multikey(
+                ctx,
+                &args,
+                0,
+                config,
+                cfg,
+                &sent_by(sender),
+            );
+            assert_eq!(
+                answer(out, "addFederatorPublicKeyMultikey"),
+                1,
+                "addFederatorPublicKeyMultikey"
+            );
         }
     }
 }
@@ -431,7 +461,8 @@ pub(super) fn elect_federation<CTX: crate::RskContextTr>(
 ) -> Option<i128> {
     pend_federation(ctx, network, members);
     let (config, cfg) = network;
-    let hash = getters::get_pending_federation_hash(ctx, 0).expect("getPendingFederationHash answers");
+    let hash =
+        getters::get_pending_federation_hash(ctx, 0).expect("getPendingFederationHash answers");
     let length = U256::from_be_slice(&hash.bytes[32..64]).to::<usize>();
     let args = encode::args(&[Arg::Bytes(&hash.bytes[64..64 + length])]);
     let deciding = deciding_authorizers(config);

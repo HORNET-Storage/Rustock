@@ -397,7 +397,8 @@ fn the_regular_pegout_size_sets_releasebtcs_minimum() {
         minimum > config.minimum_pegout_tx_value,
         "the fee is what binds"
     );
-    let queued = |satoshis| support::release_queued((&config, &cfg), 6_000_000, &keys, fee_per_kb, satoshis);
+    let queued =
+        |satoshis| support::release_queued((&config, &cfg), 6_000_000, &keys, fee_per_kb, satoshis);
     assert_eq!(queued(minimum), 1);
     assert_eq!(queued(minimum - 1), 0);
 }

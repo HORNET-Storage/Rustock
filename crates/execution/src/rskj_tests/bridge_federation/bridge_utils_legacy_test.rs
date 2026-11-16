@@ -32,7 +32,9 @@ fn before_rskip271_the_legacy_pegout_size_sets_releasebtcs_minimum() {
         let fee = fee_per_kb * size / 1000;
         fee + fee * config.minimum_pegout_value_percentage_to_receive_after_fee / 100
     };
-    let queued = |block, satoshis| support::release_queued((&config, &cfg), block, &keys, fee_per_kb, satoshis);
+    let queued = |block, satoshis| {
+        support::release_queued((&config, &cfg), block, &keys, fee_per_kb, satoshis)
+    };
     assert_eq!(queued(MAINNET_RSKIP271 - 1, minimum(2054)), 1);
     assert_eq!(queued(MAINNET_RSKIP271 - 1, minimum(2054) - 1), 0);
     assert_eq!(queued(MAINNET_RSKIP271, minimum(2054)), 0);
@@ -67,11 +69,33 @@ fn before_rskip284_a_flyover_address_is_refused_short_or_of_another_network() {
     let with = |version: u8| [&[version][..], &[0x41; 20][..]].concat();
     for (case, net, block, user, lp) in [
         ("no bytes", testnet(), 2_122_593, vec![], with(0x6f)),
-        ("a hash of one byte", testnet(), 2_122_593, vec![0x6f, 0x41], with(0x6f)),
-        ("a testnet p2sh version on mainnet", mainnet(), 4_000_000, with(0xc4), with(0x00)),
-        ("a mainnet p2sh version on testnet", testnet(), 2_122_593, with(0x05), with(0x6f)),
+        (
+            "a hash of one byte",
+            testnet(),
+            2_122_593,
+            vec![0x6f, 0x41],
+            with(0x6f),
+        ),
+        (
+            "a testnet p2sh version on mainnet",
+            mainnet(),
+            4_000_000,
+            with(0xc4),
+            with(0x00),
+        ),
+        (
+            "a mainnet p2sh version on testnet",
+            testnet(),
+            2_122_593,
+            with(0x05),
+            with(0x6f),
+        ),
     ] {
-        assert_eq!(answer(net, block, &user, &lp), flyover_code::GENERIC_ERROR, "{case}");
+        assert_eq!(
+            answer(net, block, &user, &lp),
+            flyover_code::GENERIC_ERROR,
+            "{case}"
+        );
     }
     // The same addresses on their own networks get past them.
     assert_ne!(
