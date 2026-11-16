@@ -355,6 +355,14 @@ fn federation_change_code<CTX: crate::RskContextTr>(
             if !bridge_load_bytes_named(ctx, PENDING_FEDERATION_KEY).is_empty() {
                 return -1; // PENDING_FEDERATION_ALREADY_EXISTS
             }
+            // From RSKIP419 a committed federation waits as the proposed one
+            // through its spendability validation, and none is created while
+            // it does (`getProposedFederation` answers none before RSKIP419).
+            if hardfork_cfg.has_rskip419(block_number)
+                && !bridge_load_bytes_named(ctx, PROPOSED_FEDERATION_KEY).is_empty()
+            {
+                return -4; // PROPOSED_FEDERATION_ALREADY_EXISTS
+            }
             let new_fed = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
             let old_fed = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
             let age = federation_activation_age(config, hardfork_cfg, block_number);
@@ -2120,10 +2128,71 @@ mod tests {
         );
     }
 
+    /// From RSKIP419 a committed federation is proposed first, and
+    /// `createPendingFederation` answers -4, PROPOSED_FEDERATION_ALREADY_EXISTS,
+    /// while one is stored: after it looks for a pending federation, before it
+    /// looks for a federation awaiting activation or retiring. The dry run
+    /// answers the same, so the vote isn't counted. Before RSKIP419 a proposed
+    /// federation is none to rskj.
+    #[test]
+    fn from_rskip419_no_federation_is_created_while_one_is_proposed() {
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let authorizers = federation_change_authorizers(&config);
+        let deciding = authorizers.len() / 2 + 1;
+        // The deciding authorizers' answers to createFederation at `block`, with
+        // a proposed federation stored or not, and whether a pending federation
+        // was created.
+        let votes = |block: u64, proposed: bool| {
+            let mut ctx = revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default());
+            if proposed {
+                let members = [
+                    StoredMember::from_btc([0x02; 33]),
+                    StoredMember::from_btc([0x03; 33]),
+                ];
+                bridge_store_bytes_named(
+                    &mut ctx,
+                    PROPOSED_FEDERATION_KEY,
+                    &super::super::federation::serialize_federation_multikey(
+                        &members,
+                        0,
+                        block - 1,
+                    ),
+                );
+            }
+            let answers: Vec<i64> = authorizers[..deciding]
+                .iter()
+                .map(|authorizer| {
+                    let tx_ctx = crate::precompiles::BridgeTxContext {
+                        rsk_sender: *authorizer,
+                        ..Default::default()
+                    };
+                    let out = create_federation(&mut ctx, 0, &config, &cfg, &tx_ctx).unwrap();
+                    i64::from_be_bytes(out.bytes[24..32].try_into().unwrap())
+                })
+                .collect();
+            let pending = !bridge_load_bytes_named(&mut ctx, PENDING_FEDERATION_KEY).is_empty();
+            (answers, pending)
+        };
+        let lovell = 7_338_024;
+        assert!(cfg.has_rskip419(lovell) && !cfg.has_rskip419(lovell - 1));
+        let created = (vec![1; deciding], true);
+        assert_eq!(votes(lovell - 1, true), created, "before RSKIP419");
+        assert_eq!(votes(lovell, true), (vec![-4; deciding], false));
+        assert_eq!(votes(lovell, false), created);
+    }
+
     /// rskj builds the federation as a commit goes through, and the build
     /// throws for one Bitcoin could not spend from: more than 20 keys
     /// (`ScriptBuilder.createMultiSigOutputScript`), or an ERP redeem script
-    /// longer than a scriptSig element holds, less a flyover prefix
+    /// longer than a scriptSig element holds, less a flyover prefix, or for a
+    /// P2SH-P2WSH federation than a witness script may be
     /// (`ErpFederation.validateRedeemScript`). The dry run builds nothing, so
     /// the votes before the deciding one are taken; the deciding one throws.
     #[test]
