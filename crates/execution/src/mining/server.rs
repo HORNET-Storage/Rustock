@@ -89,8 +89,6 @@ pub enum SubmitError {
     NoTagInCoinbase,
     #[error("no work outstanding for {hash}: it was never handed out, or it has aged out of the cache")]
     UnknownWork { hash: B256 },
-    #[error("the parent of this work ({parent}) is no longer the executed head ({head:?}); the chain moved on")]
-    ParentNoLongerHead { parent: B256, head: Option<B256> },
     /// rskj `MinerClientImpl.mineBlock` returns false while
     /// `hasBetterBlockToSync()`: a node still catching up does not mine.
     #[error("not mining: the node has a better block to sync")]
@@ -134,6 +132,8 @@ pub trait ChainAccess: Send + Sync {
     fn executed_head(&self) -> Result<Option<B256>, String>;
     /// Whether a block with this hash is already stored.
     fn has_block(&self, hash: B256) -> Result<bool, String>;
+    /// The header stored under `hash`, named by that key.
+    fn header(&self, hash: B256) -> Result<Option<Header>, String>;
     /// Uncles to include in a block mined on `parent_hash`.
     fn select_uncles(&self, block_number: u64, parent_hash: B256) -> Result<Vec<Header>, String>;
     /// Store a fully executed block and make it the head if it wins.
@@ -145,6 +145,16 @@ pub trait ChainAccess: Send + Sync {
         &self,
         block: &Block,
         state_root: B256,
+        laps: &mut Laps,
+    ) -> Result<CommitOutcome, String>;
+    /// Store a block whose parent is no longer the executed head, executed
+    /// beside the chain against its own parent's state, and answer whether
+    /// it takes the head, without moving the head: the sync service makes
+    /// that switch, as it does for a peer's block executed beside the chain,
+    /// once the hook has told it of the block.
+    fn commit_mined_block_beside(
+        &self,
+        block: &Block,
         laps: &mut Laps,
     ) -> Result<CommitOutcome, String>;
 }
@@ -166,8 +176,8 @@ pub struct CommitOutcome {
 pub struct StoreChainAccess {
     pub store: Arc<BlockStore>,
     pub trie_store: Arc<dyn TrieStore>,
-    /// Called with every block this commits, so a transaction pool can
-    /// drop what has just been mined.
+    /// Called with every block this commits, and what the commit made of
+    /// it, so a transaction pool can drop what has just been mined.
     ///
     /// A locally mined block does not travel the sync service's import
     /// path, which is the only place that called `remove_mined`. So
@@ -185,7 +195,10 @@ pub struct StoreChainAccess {
     /// executed head: rskj's `EthereumImpl.addNewMinedBlock` (L60-68) tells
     /// the rest of the node after `blockchain.tryToConnect` has connected
     /// it, so whatever the hook tells sees the chain with the block on it.
-    pub on_committed: Option<Arc<dyn Fn(&Block) + Send + Sync>>,
+    /// For a block beside the chain ([`ChainAccess::commit_mined_block_beside`])
+    /// the head hasn't moved when it is called: the sync service it tells
+    /// makes the switch.
+    pub on_committed: Option<Arc<dyn Fn(&Block, ImportResult) + Send + Sync>>,
     /// Best blocks between trie flushes: rskj's
     /// `blockchain.flushNumberOfBlocks`, whose `BlockChainFlusher` flushes
     /// every tenth block a node mines or connects. 1 flushes every block.
@@ -207,7 +220,7 @@ impl StoreChainAccess {
     pub fn new(
         store: Arc<BlockStore>,
         trie_store: Arc<dyn TrieStore>,
-        on_committed: Option<Arc<dyn Fn(&Block) + Send + Sync>>,
+        on_committed: Option<Arc<dyn Fn(&Block, ImportResult) + Send + Sync>>,
     ) -> Self {
         Self::with_flush_every(store, trie_store, on_committed, 1)
     }
@@ -215,7 +228,7 @@ impl StoreChainAccess {
     pub fn with_flush_every(
         store: Arc<BlockStore>,
         trie_store: Arc<dyn TrieStore>,
-        on_committed: Option<Arc<dyn Fn(&Block) + Send + Sync>>,
+        on_committed: Option<Arc<dyn Fn(&Block, ImportResult) + Send + Sync>>,
         flush_every: u64,
     ) -> Self {
         Self {
@@ -239,6 +252,61 @@ impl StoreChainAccess {
         } else {
             false
         }
+    }
+
+    /// Store a mined block's header, body and total difficulty, each keyed
+    /// by its hash, and return the total.
+    ///
+    /// Deliberately not `put_block`: that writes the canonical
+    /// `number -> hash` pointer unconditionally, which would hand the
+    /// height to a block that lost to the head and leave the canonical
+    /// chain naming a block that is not on it. Header and body are safe to
+    /// store either way, being keyed by hash.
+    fn store_mined(&self, block: &Block, hash: B256) -> Result<U256, String> {
+        let parent_td = self
+            .store
+            .total_difficulty(block.header.parent_hash)
+            .map_err(|e| e.to_string())?
+            .unwrap_or(U256::ZERO);
+        let td = parent_td + cumulative_difficulty(block);
+        self.store
+            .put_header_with_hash(hash, &block.header)
+            .map_err(|e| e.to_string())?;
+        self.store
+            .put_body(hash, &block.transactions, &block.ommers)
+            .map_err(|e| e.to_string())?;
+        self.store
+            .put_total_difficulty(hash, td)
+            .map_err(|e| e.to_string())?;
+        Ok(td)
+    }
+
+    /// Whether a mined block of total difficulty `td` takes the head. rskj
+    /// connects a mined block through `blockchain.tryToConnect`, as it does a
+    /// peer's: it takes the head by `SelectionRule.shouldWeAddThisBlock`,
+    /// which settles a tie in total difficulty by fees and then hashes.
+    fn takes_head(&self, block: &Block, hash: B256, td: U256) -> Result<bool, String> {
+        let (current_td, current) = match self.store.head().map_err(|e| e.to_string())? {
+            Some(head) => {
+                let td = self
+                    .store
+                    .total_difficulty(head)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(U256::ZERO);
+                let current = self.store.contender(head, td).map_err(|e| e.to_string())?;
+                (td, current)
+            }
+            None => (U256::ZERO, None),
+        };
+        let mined = Contender {
+            total_difficulty: td,
+            paid_fees: block.header.paid_fees,
+            hash,
+        };
+        Ok(match &current {
+            Some(current) => should_we_add_this_block(&mined, current),
+            None => td > current_td,
+        })
     }
 }
 
@@ -289,6 +357,16 @@ impl ChainAccess for StoreChainAccess {
         self.store.header(hash).map(|h| h.is_some()).map_err(|e| e.to_string())
     }
 
+    fn header(&self, hash: B256) -> Result<Option<Header>, String> {
+        // Named by the key it is stored under, as `mainchain` names each: a
+        // genesis from an rskj file hashes otherwise when recomputed.
+        let header = self.store.header(hash).map_err(|e| e.to_string())?;
+        Ok(header.map(|mut header| {
+            header.cached_hash = Some(hash);
+            header
+        }))
+    }
+
     fn executed_head(&self) -> Result<Option<B256>, String> {
         match self.store.exec_head().map_err(|e| e.to_string())? {
             Some((hash, _)) => Ok(Some(hash)),
@@ -332,51 +410,10 @@ impl ChainAccess for StoreChainAccess {
             });
         }
 
-        let parent_td = self
-            .store
-            .total_difficulty(block.header.parent_hash)
-            .map_err(|e| e.to_string())?
-            .unwrap_or(U256::ZERO);
-        let td = parent_td + cumulative_difficulty(block);
-
-        // Deliberately not `put_block`: that writes the canonical
-        // `number -> hash` pointer unconditionally, which would hand the
-        // height to a block that lost to the head below and leave the
-        // canonical chain naming a block that is not on it. Header and body
-        // are safe to store either way, being keyed by hash.
-        self.store.put_header_with_hash(hash, &block.header).map_err(|e| e.to_string())?;
-        self.store
-            .put_body(hash, &block.transactions, &block.ommers)
-            .map_err(|e| e.to_string())?;
-        self.store.put_total_difficulty(hash, td).map_err(|e| e.to_string())?;
-
-        let (current_td, current) = match self.store.head().map_err(|e| e.to_string())? {
-            Some(head) => {
-                let td = self
-                    .store
-                    .total_difficulty(head)
-                    .map_err(|e| e.to_string())?
-                    .unwrap_or(U256::ZERO);
-                let current = self.store.contender(head, td).map_err(|e| e.to_string())?;
-                (td, current)
-            }
-            None => (U256::ZERO, None),
-        };
-
+        let td = self.store_mined(block, hash)?;
+        let takes_head = self.takes_head(block, hash, td)?;
         switch_chain += laps.lap();
 
-        // rskj connects a mined block through `blockchain.tryToConnect`, as it
-        // does a peer's: it takes the head by `SelectionRule.shouldWeAddThisBlock`,
-        // which settles a tie in total difficulty by fees and then hashes.
-        let mined = Contender {
-            total_difficulty: td,
-            paid_fees: block.header.paid_fees,
-            hash,
-        };
-        let takes_head = match &current {
-            Some(current) => should_we_add_this_block(&mined, current),
-            None => td > current_td,
-        };
         let result = if takes_head {
             self.store.update_canonical_chain(hash).map_err(|e| e.to_string())?;
             self.store.set_exec_head(hash, state_root).map_err(|e| e.to_string())?;
@@ -399,7 +436,7 @@ impl ChainAccess for StoreChainAccess {
         // service, told from here, reads the executed head this just set
         // (#323).
         if let Some(hook) = &self.on_committed {
-            hook(block);
+            hook(block, result);
         }
         on_best_block += laps.lap();
 
@@ -408,6 +445,51 @@ impl ChainAccess for StoreChainAccess {
             "Mined block #{} {:?} imported: {}", number, hash, result.as_str()
         );
         Ok(CommitOutcome { result, switch_chain, on_best_block })
+    }
+
+    fn commit_mined_block_beside(
+        &self,
+        block: &Block,
+        laps: &mut Laps,
+    ) -> Result<CommitOutcome, String> {
+        let hash = block.hash();
+        let number = block.header.number;
+        if self.store.has_block(hash).map_err(|e| e.to_string())? {
+            return Ok(CommitOutcome {
+                result: ImportResult::Exist,
+                switch_chain: laps.lap(),
+                on_best_block: std::time::Duration::ZERO,
+            });
+        }
+        // Its state durable before the store may adopt its branch on the
+        // strength of it, as the sync service makes durable a block it
+        // executes beside the chain.
+        self.trie_store.flush();
+        let td = self.store_mined(block, hash)?;
+        // rskj answers what `internalTryToConnect` made of the block:
+        // `IMPORTED_BEST` where the selection rule takes it, and
+        // `IMPORTED_NOT_BEST` where it extends a chain beside the best one.
+        let result = if self.takes_head(block, hash, td)? {
+            ImportResult::ImportedBest
+        } else {
+            ImportResult::ImportedNotBest
+        };
+        let switch_chain = laps.lap();
+        // The peers are sent it, best or not, and the sync service weighs it.
+        if let Some(hook) = &self.on_committed {
+            hook(block, result);
+        }
+        let on_best_block = laps.lap();
+
+        info!(
+            target: "rustock::mining",
+            "Mined block #{} {:?} imported beside the chain: {}", number, hash, result.as_str()
+        );
+        Ok(CommitOutcome {
+            result,
+            switch_chain,
+            on_best_block,
+        })
     }
 }
 
@@ -838,13 +920,13 @@ impl MinerServer {
             });
         }
 
+        // The work's parent may no longer be the executed head: the chain moved
+        // on while the solution was found. rskj connects such a block as it
+        // connects any (`BlockChainImpl.internalTryToConnect`): against its own
+        // parent's state, beside the chain, stored whether it is best or not,
+        // and answers what that made of it.
         let head = self.chain.executed_head().map_err(SubmitError::Storage)?;
-        if head != Some(template.parent_hash()) {
-            return Err(SubmitError::ParentNoLongerHead {
-                parent: template.parent_hash(),
-                head,
-            });
-        }
+        let beside = head != Some(template.parent_hash());
         t.preamble = laps.lap();
 
         // rskj connects a solution whose proof of work holds through
@@ -889,14 +971,13 @@ impl MinerServer {
         // best block that every other node refuses.
         let parent = self
             .chain
-            .mainchain(1)
+            .header(template.parent_hash())
             .map_err(SubmitError::Storage)?
-            .into_iter()
-            .next()
-            .filter(|parent| parent.hash() == template.parent_hash())
-            .ok_or(SubmitError::ParentNoLongerHead {
-                parent: template.parent_hash(),
-                head,
+            .ok_or_else(|| {
+                SubmitError::Storage(format!(
+                    "the parent {} of this work is not stored",
+                    template.parent_hash()
+                ))
             })?;
         if let Err(e) =
             rustock_core::validation::HeaderVerifier::default_rsk(self.chain_config.clone())
@@ -915,11 +996,16 @@ impl MinerServer {
             .map_err(SubmitError::Template)?;
         // `process_and_commit`, in its two halves, so the receipts can be
         // timed apart from execution. The timed processor reads the clock
-        // only when measuring; the plain one never does.
+        // only when measuring; the plain one never does. A block beside the
+        // chain keeps what it keys by hash, its receipts and transactions, as
+        // it runs; what it keys by height waits for the chain to take it up
+        // (`BlockProcessor::process_beside`).
         let processor = self.builder.processor();
         let trie_store = self.builder.trie_store();
         let mut process = crate::ProcessTimings::default();
-        let executed = if laps.enabled() {
+        let executed = if beside {
+            processor.process_beside(&block, &state_root, trie_store)
+        } else if laps.enabled() {
             processor.process_block_timed(&block, &state_root, trie_store, &mut process)
         } else {
             processor.process_block(&block, &state_root, trie_store)
@@ -940,6 +1026,20 @@ impl MinerServer {
         t.execute = process.execute;
         t.trie_save = process.trie_save;
         t.post_execute_validation = process.post_validation;
+        if beside {
+            let outcome = self
+                .chain
+                .commit_mined_block_beside(&block, &mut laps)
+                .map_err(SubmitError::Storage)?;
+            // The head hasn't moved by this. If the block takes it, the sync
+            // service's switch moves it and tells the miner of its new best
+            // block, which builds new work then.
+            return Ok(SubmittedBlockInfo {
+                block_imported_result: outcome.result,
+                block_hash: completed_hash,
+                block_included_height: number,
+            });
+        }
         processor
             .commit_receipts(&block, &executed)
             .map_err(|e| SubmitError::Execution(e.to_string()))?;

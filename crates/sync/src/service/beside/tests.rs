@@ -37,6 +37,9 @@ struct Node {
     /// Blocks the stand-in fails to run as a local fault would, and how many
     /// more times.
     local_faults: Arc<Mutex<HashMap<B256, usize>>>,
+    /// Blocks counted as executed here: those the stand-in ran, and those a
+    /// test puts in as run by the miner.
+    executed: Arc<Mutex<HashSet<B256>>>,
     /// What the node sent its peer.
     sent: mpsc::Receiver<P2pMessage>,
     /// What it told subscribers.
@@ -90,7 +93,7 @@ async fn node_over(dir: tempfile::TempDir, store: Arc<BlockStore>) -> Node {
     let invalid = Arc::new(Mutex::new(HashSet::new()));
     let local_faults = Arc::new(Mutex::new(HashMap::new()));
     let (counted, refused, faulty) = (runs.clone(), invalid.clone(), local_faults.clone());
-    service.set_test_beside(move |block: &Block| {
+    let executed = service.set_test_beside(move |block: &Block| {
         let hash = block.hash();
         *counted.lock().unwrap().entry(hash).or_insert(0) += 1;
         if refused.lock().unwrap().contains(&hash) {
@@ -116,6 +119,7 @@ async fn node_over(dir: tempfile::TempDir, store: Arc<BlockStore>) -> Node {
         runs,
         invalid,
         local_faults,
+        executed,
         sent,
         events: events.subscribe(),
         best,
@@ -161,6 +165,19 @@ impl Node {
             ommers: Vec::new(),
         };
         self.service.on_new_block(PEER, block).await;
+    }
+
+    /// This node's miner solved `header`, an empty block whose parent is no
+    /// longer the head, and kept it beside the chain: stored with its total
+    /// and executed against its parent's state, its own run counted as done.
+    fn mined_beside(&self, header: &Header, total: u64) {
+        let hash = header.hash();
+        self.store.put_header_with_hash(hash, header).unwrap();
+        self.store.put_body(hash, &[], &[]).unwrap();
+        self.store
+            .put_total_difficulty(hash, U256::from(total))
+            .unwrap();
+        self.executed.lock().unwrap().insert(hash);
     }
 
     fn executed_head(&self) -> Option<B256> {
@@ -281,6 +298,63 @@ async fn a_heavier_branch_executed_as_it_came_is_switched_to_at_once() {
         node.announced(),
         vec![(a2, true), (b2.hash(), false), (b3.hash(), false)],
         "the block left is retracted, then the branch taken up is announced"
+    );
+}
+
+/// A block this node mined on a parent that is no longer the head is kept
+/// beside the chain by the miner, run against its parent's state, as rskj
+/// connects any block (`BlockChainImpl.internalTryToConnect`). Told of it,
+/// the sync service weighs it as it weighs a peer's block executed beside the
+/// chain: a lighter one stays beside it, and a heavier one is switched to at
+/// once, with nothing run again, the block it displaces retracted and the
+/// miner told of its new best block.
+#[tokio::test]
+async fn a_mined_block_kept_beside_the_chain_is_switched_to_when_heavier() {
+    let mut node = node().await;
+    let chain = node.chain(&[1, 2]); // totals 2 and 4
+    let (a1, a2) = (chain[1].hash(), chain[2].hash());
+
+    let lighter = node.header(2, a1, 1, 0xC0); // total 3
+    node.mined_beside(&lighter, 3);
+    node.service
+        .handle_event(crate::SyncEvent::MinedBlock {
+            hash: lighter.hash(),
+        })
+        .await;
+    assert_eq!(
+        node.head(),
+        Some(a2),
+        "a lighter mined block stays beside the chain"
+    );
+    assert_eq!(node.store.exec_head().unwrap(), Some((a2, node.root)));
+    assert_eq!(node.store.canonical_hash(2).unwrap(), Some(a2));
+    assert!(node.best.lock().unwrap().is_empty());
+    assert!(node.announced().is_empty());
+
+    let heavier = node.header(2, a1, 3, 0xC1); // total 5
+    node.mined_beside(&heavier, 5);
+    node.service
+        .handle_event(crate::SyncEvent::MinedBlock {
+            hash: heavier.hash(),
+        })
+        .await;
+    assert_eq!(node.head(), Some(heavier.hash()));
+    assert_eq!(
+        node.store.exec_head().unwrap(),
+        Some((heavier.hash(), node.root)),
+        "execution is at the mined block, taken up without running it again"
+    );
+    assert_eq!(node.store.canonical_hash(2).unwrap(), Some(heavier.hash()));
+    assert_eq!(
+        (node.runs(lighter.hash()), node.runs(heavier.hash())),
+        (0, 0),
+        "the miner ran them; nothing runs them again"
+    );
+    assert_eq!(*node.best.lock().unwrap(), vec![heavier.hash()]);
+    assert_eq!(
+        node.announced(),
+        vec![(a2, true), (heavier.hash(), false)],
+        "the block left is retracted, then the mined block is announced"
     );
 }
 

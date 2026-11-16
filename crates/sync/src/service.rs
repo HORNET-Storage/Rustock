@@ -2343,6 +2343,20 @@ impl SyncService {
         }
     }
 
+    /// Whether `hash`, a block this node mined, is beside the chain: stored,
+    /// and not the block the canonical index names at its height. The miner
+    /// keeps a solution whose work's parent is no longer the executed head
+    /// so, executed against its own parent's state
+    /// (`ChainAccess::commit_mined_block_beside`), as rskj connects any block.
+    fn mined_beside_the_chain(&self, hash: B256) -> bool {
+        let store = &self.manager.store;
+        store
+            .header(hash)
+            .ok()
+            .flatten()
+            .is_some_and(|header| store.canonical_hash(header.number).ok().flatten() != Some(hash))
+    }
+
     /// Re-queue canonical blocks this node already holds but has not executed.
     ///
     /// `drain_follow_buffer` is reachable from exactly one place:
@@ -3772,6 +3786,14 @@ impl SyncService {
             }
             SyncEvent::MinedBlock { hash } => {
                 self.on_mined_block(hash);
+                // A solution whose work's parent was no longer the head is
+                // kept beside the chain by the miner, executed already. It is
+                // weighed against the head here as a peer's block executed
+                // beside the chain is, and switched to if it takes the head:
+                // rskj's `tryToConnect` for a mined block.
+                if self.mined_beside_the_chain(hash) {
+                    self.execute_beside_chain(hash).await;
+                }
             }
         }
     }

@@ -3600,20 +3600,30 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         // What the sync service's import path does for a block that arrived
         // from a peer, done here for one this node mined; then what rskj's
         // `EthereumImpl.addNewMinedBlock` does with a mined block once it is
-        // connected: the sync service takes its state as the node's, and the
-        // peers are sent it, best or not.
-        let on_committed: Arc<dyn Fn(&rustock_core::Block) + Send + Sync> = {
+        // connected: the sync service takes its state as the node's, or weighs
+        // it where it was kept beside the chain, and the peers are sent it,
+        // best or not. The pool drops what a best block mined, as rskj's
+        // `TransactionPoolImpl.processBest` does; a block beside the chain
+        // leaves it, and a switch to it later takes them out then.
+        let on_committed: Arc<
+            dyn Fn(&rustock_core::Block, rustock_execution::mining::ImportResult) + Send + Sync,
+        > = {
             let pool = pool.clone();
             let broadcast = rustock_sync::on_mined(
                 peer_store.clone(),
                 mined_events.clone(),
                 tokio::runtime::Handle::current(),
             );
-            Arc::new(move |block: &rustock_core::Block| {
-                pool.remove_mined(&block.transactions);
-                pool.evict_outdated(block.header.number);
-                broadcast(block);
-            })
+            Arc::new(
+                move |block: &rustock_core::Block,
+                      result: rustock_execution::mining::ImportResult| {
+                    if result == rustock_execution::mining::ImportResult::ImportedBest {
+                        pool.remove_mined(&block.transactions);
+                        pool.evict_outdated(block.header.number);
+                    }
+                    broadcast(block);
+                },
+            )
         };
         let chain = Arc::new(
             rustock_execution::mining::StoreChainAccess::with_flush_every(

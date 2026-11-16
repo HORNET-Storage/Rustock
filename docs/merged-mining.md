@@ -347,8 +347,9 @@ All three RPC forms converge on `complete_and_import`:
 1. **Match** — `extract_merged_mining_hash` finds the **last** `RSKBLOCK:` in the
    coinbase and reads the 32 bytes after it. rskj
    `MnrModuleImpl.extractBlockHashForMergedMining`.
-2. **Check the parent still stands** — if the executed head has moved off the
-   template's parent, refuse with `ParentNoLongerHead`.
+2. **See whether the parent still stands** — if the executed head has moved off
+   the template's parent, the block is connected beside the chain (step 6), as
+   rskj's `BlockChainImpl.internalTryToConnect` connects any block.
 3. **Compress the coinbase** — `compress_coinbase`, the same function the
    verifier's format is defined by.
 4. **Fill the three fields**, with a `debug_assert` that the merged-mining hash
@@ -358,7 +359,14 @@ All three RPC forms converge on `complete_and_import`:
    catching before it is stored and announced rather than after.
 6. **Execute and commit** — `process_and_commit` against the parent state root
    the template recorded, so the submission re-executes from the same point.
-7. **Rebuild work** — the chain moved, so whatever is on offer is stale.
+   Beside the chain it is `process_beside`, which keeps what the block keys by
+   hash, and `commit_mined_block_beside`, which stores the block and answers
+   `IMPORTED_BEST` or `IMPORTED_NOT_BEST` by the selection rule without moving
+   the head: the sync service, told of the block, weighs it as it weighs a
+   peer's block executed beside the chain, and makes the switch.
+7. **Rebuild work** — the chain moved, so whatever is on offer is stale. Not
+   for a block beside the chain: if it takes the head, the switch tells the
+   miner of its new best block.
 
 ### Importing: why not `put_block`
 
@@ -417,10 +425,11 @@ garbage collector reclaims them (they are unreachable from any canonical
 root), but on a node with collection disabled this grows without bound.
 
 **Running a miner and a sync service at once.** The sync service owns the
-executed state root and does not know the miner exists. The miner refuses a
-submission whose parent is no longer the executed head, so a race is reported
-rather than corrupting state — but a node that is actively syncing will refuse
-most solutions. Mine on a node that has caught up.
+executed state root and the switch between branches. A solution whose work's
+parent is no longer the executed head is run against that parent's own state
+and kept beside the chain, and the sync service takes it up if it is heavier,
+so a race leaves the state as it was. A node that is still catching up hands
+out no work (`SubmitError::Syncing`). Mine on a node that has caught up.
 
 ---
 

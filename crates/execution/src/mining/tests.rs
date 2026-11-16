@@ -1465,6 +1465,105 @@ fn a_losing_block_is_stored_but_not_made_canonical() {
     assert_eq!(fx.store.head().unwrap(), Some(rival_hash), "the head must not move");
 }
 
+/// A block of another miner on the parent a template built on, made the head
+/// and the executed head with `total_difficulty` behind it: the chain moved
+/// on while the work was out.
+fn move_the_chain_on(fx: &MiningFixture, total_difficulty: U256) -> B256 {
+    let rival = header_at(fx.parent.number + 1, fx.parent.hash(), fx.parent.state_root);
+    let rival_hash = rival.hash();
+    fx.store.put_header_with_hash(rival_hash, &rival).unwrap();
+    fx.store
+        .put_canonical_hash(rival.number, rival_hash)
+        .unwrap();
+    fx.store
+        .put_total_difficulty(rival_hash, total_difficulty)
+        .unwrap();
+    fx.store.set_head(rival_hash).unwrap();
+    fx.store
+        .set_exec_head(rival_hash, fx.parent.state_root)
+        .unwrap();
+    rival_hash
+}
+
+/// A solution whose work's parent is no longer the executed head -- the chain
+/// moved on while it was mined -- is connected as rskj connects any block
+/// (`BlockChainImpl.internalTryToConnect`): run against its own parent's
+/// state, kept with its receipts and its total difficulty, and answered
+/// `IMPORTED_NOT_BEST` where the head outweighs it. The head, the canonical
+/// index and the executed head stay where they were. The node refused such a
+/// solution, and the block was lost.
+#[test]
+fn a_solution_on_a_parent_the_chain_left_is_kept_beside_the_chain() {
+    let fx = fixture(20);
+    let work = fx.server.get_work().unwrap();
+    let height = fx.parent.number + 1;
+    let rival_hash = move_the_chain_on(&fx, U256::from(1_000_000));
+
+    let raw = bitcoin::consensus::serialize(&solve(&work));
+    let info = fx
+        .server
+        .submit_bitcoin_block(&raw)
+        .expect("a solution on a parent the chain left is still a block");
+
+    assert_eq!(info.block_imported_result, ImportResult::ImportedNotBest);
+    let mined = fx
+        .store
+        .header(info.block_hash)
+        .unwrap()
+        .expect("the block is kept: it may yet win");
+    assert_eq!(mined.parent_hash, fx.parent.hash());
+    assert_eq!(
+        fx.store.total_difficulty(info.block_hash).unwrap(),
+        Some(U256::from(height) + mined.difficulty),
+        "its total is its parent's and its own"
+    );
+    assert!(
+        fx.server
+            .builder_for_test()
+            .processor()
+            .was_executed_locally(info.block_hash),
+        "it ran against its parent's state, and its receipts are kept by its hash"
+    );
+    assert_eq!(fx.store.head().unwrap(), Some(rival_hash), "the head stays");
+    assert_eq!(fx.store.canonical_hash(height).unwrap(), Some(rival_hash));
+    assert_eq!(
+        fx.store.exec_head().unwrap(),
+        Some((rival_hash, fx.parent.state_root)),
+        "the executed head stays"
+    );
+}
+
+/// The same where the solution outweighs the head: answered `IMPORTED_BEST`,
+/// as rskj answers it, and the switch left to the sync service, which weighs
+/// a block kept beside the chain against the head once it is told of it, and
+/// takes the head by its own way of switching branches.
+#[test]
+fn a_solution_on_a_parent_the_chain_left_that_outweighs_the_head_is_answered_best() {
+    let fx = fixture(20);
+    let work = fx.server.get_work().unwrap();
+    // A rival that adds nothing to its parent's total: the solution's own
+    // difficulty outweighs it.
+    let rival_hash = move_the_chain_on(&fx, U256::from(fx.parent.number + 1));
+
+    let raw = bitcoin::consensus::serialize(&solve(&work));
+    let info = fx
+        .server
+        .submit_bitcoin_block(&raw)
+        .expect("a solution on a parent the chain left is still a block");
+
+    assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
+    assert!(fx.store.header(info.block_hash).unwrap().is_some());
+    assert_eq!(
+        fx.store.head().unwrap(),
+        Some(rival_hash),
+        "the switch is the sync service's"
+    );
+    assert_eq!(
+        fx.store.exec_head().unwrap(),
+        Some((rival_hash, fx.parent.state_root))
+    );
+}
+
 /// The round trip again, but deep enough that REMASC actually pays out.
 ///
 /// Everywhere else these tests mine block #21, and REMASC's
@@ -3088,12 +3187,12 @@ fn the_commit_hook_runs_once_the_block_is_the_head() {
     store.set_exec_head(parent_hash, root).unwrap();
 
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let hook: Arc<dyn Fn(&rustock_core::Block) + Send + Sync> = {
+    let hook: Arc<dyn Fn(&rustock_core::Block, ImportResult) + Send + Sync> = {
         let (store, seen) = (store.clone(), seen.clone());
-        Arc::new(move |_block: &rustock_core::Block| {
+        Arc::new(move |_block: &rustock_core::Block, result: ImportResult| {
             let exec_head = store.exec_head().unwrap();
             let canonical = store.canonical_hash(1).unwrap();
-            seen.lock().unwrap().push((exec_head, canonical));
+            seen.lock().unwrap().push((exec_head, canonical, result));
         })
     };
     let chain = StoreChainAccess::new(store.clone(), trie_store, Some(hook));
@@ -3111,7 +3210,7 @@ fn the_commit_hook_runs_once_the_block_is_the_head() {
     assert_eq!(outcome.result, ImportResult::ImportedBest);
     assert_eq!(
         *seen.lock().unwrap(),
-        vec![(Some((hash, root)), Some(hash))],
+        vec![(Some((hash, root)), Some(hash), ImportResult::ImportedBest)],
         "the hook ran once, with the block the executed head and canonical"
     );
 }
@@ -3156,7 +3255,14 @@ fn a_mined_block_that_ties_the_head_goes_by_the_selection_rule() {
     store.set_head(held_first_hash).unwrap();
     store.set_exec_head(held_first_hash, root).unwrap();
 
-    let chain = StoreChainAccess::new(store.clone(), trie_store, None);
+    let told = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook: Arc<dyn Fn(&rustock_core::Block, ImportResult) + Send + Sync> = {
+        let told = told.clone();
+        Arc::new(move |block: &rustock_core::Block, result: ImportResult| {
+            told.lock().unwrap().push((block.hash(), result));
+        })
+    };
+    let chain = StoreChainAccess::new(store.clone(), trie_store, Some(hook));
     let mined = |header: Header| rustock_core::Block {
         header,
         transactions: Vec::new(),
@@ -3185,6 +3291,14 @@ fn a_mined_block_that_ties_the_head_goes_by_the_selection_rule() {
     assert_eq!(outcome.result, ImportResult::ImportedNotBest);
     assert_eq!(store.head().unwrap(), Some(lower.hash()), "the head stays");
     assert_eq!(store.canonical_hash(1).unwrap(), Some(lower.hash()));
+    assert_eq!(
+        *told.lock().unwrap(),
+        vec![
+            (lower.hash(), ImportResult::ImportedBest),
+            (higher.hash(), ImportResult::ImportedNotBest)
+        ],
+        "the hook is told what each commit made of its block"
+    );
 }
 
 /// The thread mines on its clock: at a 100 ms median (the floor), it yields
