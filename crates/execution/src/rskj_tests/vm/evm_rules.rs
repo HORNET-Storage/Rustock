@@ -4,6 +4,7 @@
 //! rskj's `reference.conf` gives the rule.
 
 use alloy_primitives::{keccak256, Address, B256, U256};
+use rustock_core::Transaction;
 
 use super::harness::{
     call, compile, create, push_address, return_top, run_code, words, Chain, CONTRACT, GAS,
@@ -361,5 +362,52 @@ fn before_rskip169_extcodehash_of_a_contract_whose_constructor_runs_is_0() {
         assert!(ran.success, "#{number}");
         let stored = chain.storage(made, 0);
         assert_eq!(stored, while_it_runs + U256::from(1), "#{number}");
+    }
+}
+
+/// Before RSKIP174 (iris300) a creation transaction writes a new account over
+/// one already at its address (`TransactionExecutor.create`:
+/// `createAccount(addr, false)`), and the balance the address held is lost:
+/// the contract holds the 7 wei it is sent. But it writes it in the
+/// transaction's `cacheTrack`, which a creation that fails rolls back
+/// (`TransactionExecutor.go`), so there the balance stays, as it does at
+/// every height from RSKIP174. The failed creations here revert, and throw;
+/// the next transaction of the block reads the balance with BALANCE.
+#[test]
+fn before_rskip174_a_failed_deployment_leaves_the_balance_already_at_the_address() {
+    let made = SENDER.create(0);
+    let probe = [
+        compile(&format!("{} BALANCE", push_address(made))),
+        return_top(1),
+    ]
+    .concat();
+    let cases = [
+        ("STOP", IRIS - 1, 7),
+        ("STOP", IRIS, 107),
+        ("PUSH1 0x00 PUSH1 0x00 REVERT", IRIS - 1, 100),
+        ("PUSH1 0x00 PUSH1 0x00 REVERT", IRIS, 100),
+        ("INVALID", IRIS - 1, 100),
+        ("INVALID", IRIS, 100),
+    ];
+    for (init, number, left) in cases {
+        let mut chain = Chain::mainnet(number);
+        chain.put(SENDER, 0, ONE_RBTC, &[]);
+        chain.put(CONTRACT, 1, U256::ZERO, &probe);
+        chain.put(made, 0, U256::from(100), &[]);
+        let deploy = Transaction {
+            value: U256::from(7),
+            ..create(0, GAS, &compile(init))
+        };
+        let read = call(1, CONTRACT, U256::ZERO, GAS, &[]);
+        let ran = chain.block(&[(deploy, SENDER), (read, SENDER)]);
+        let case = format!("{init} #{number}");
+        assert_eq!(ran.tx_results[0].success, init == "STOP", "{case}");
+        let read = words(&ran.tx_results[1].output);
+        assert_eq!(read, [U256::from(left)], "{case}: what the block reads");
+        assert_eq!(
+            chain.balance(made),
+            U256::from(left),
+            "{case}: what it leaves"
+        );
     }
 }

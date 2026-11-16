@@ -106,24 +106,35 @@ invisible_exception: Arc<AtomicBool>,
     /// returnDataBuffer semantics: `Program.callToAddress` resets the
     /// caller's buffer only inside `executeCode` (callee HAS code) and
     /// `callToPrecompiledAddress`; a call that executes nothing — empty-code
-    /// callee, depth limit, insufficient endowment — leaves the PREVIOUS
-    /// call's return data in place, where canonical EVM (EIP-211) clears it.
-    /// This pre-iris quirk is disabled once RSKIP171 activates.
+    /// callee, insufficient endowment — leaves the PREVIOUS call's return
+    /// data in place, where canonical EVM (EIP-211) clears it. This pre-iris
+    /// quirk is disabled once RSKIP171 activates.
     active_precompiles: Vec<Address>,
     /// Post-RSKIP171 (iris300): `Program.cleanReturnDataBuffer` now resets
-    /// the buffer on EVERY call that runs no new frame (empty-code callee,
-    /// insufficient endowment, depth limit, precompile-out-of-gas), matching
-    /// canonical EVM / revm's default EIP-211 clearing. When `true`, the
+    /// the buffer on a call that runs no new frame for an empty-code callee,
+    /// an insufficient endowment or a precompile's gas, matching canonical
+    /// EVM / revm's default EIP-211 clearing. When `true`, the
     /// buffer-preservation above is disabled (mainnet #3,616,094: a DEX
     /// router does RETURNDATASIZE right after a value transfer to an empty
     /// account — preserving the prior call's 32-byte output sent it down a
-    /// different branch and out of gas).
+    /// different branch and out of gas). A call refused for the depth keeps
+    /// the buffer at every height (`Program.callToAddress` and
+    /// `callToPrecompiledAddress` return before any clean-up), though a
+    /// program that deep has made no call that could have filled it.
     rskip171_active: bool,
     /// RSKIP90 (orchid): a precompile that returns makes its output the
     /// caller's return data. Before it rskj's `Program.executePrecompiled`,
     /// which runs a contract's call to a precompile before RSKIP197, leaves
     /// the return data as the call before left it.
     rskip90_active: bool,
+    /// Before RSKIP174 (iris300) a creation transaction's contract holds only
+    /// what the transaction sends it: rskj's `TransactionExecutor.create`
+    /// writes a new account over one already at its address
+    /// (`createAccount(addr, false)`), whose balance is lost. It writes it in
+    /// the transaction's `cacheTrack`, which a creation that fails rolls back
+    /// (`go`), so the old balance is taken in the creation's frame, which a
+    /// failure takes back. Only a block's run sets it (`with_rskip174`).
+    deploy_overwrites: bool,
     /// Fail a transaction as it starts to run code. rskj can't build its
     /// program's invocation from the block's header
     /// (`env::header_fits_program_invoke`), throws, and catches nothing:
@@ -262,6 +273,13 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
         self
     }
 
+    /// Whether RSKIP174 is active, before which a creation transaction's
+    /// contract holds only what it is sent. See `deploy_overwrites`.
+    pub fn with_rskip174(mut self, active: bool) -> Self {
+        self.deploy_overwrites = !active;
+        self
+    }
+
     /// Whether a local call to `to` runs whatever gas it has: a precompile,
     /// before RSKIP136. rskj leaves out the check that the gas covers a
     /// precompile's cost for every local call (TransactionExecutor.java:350).
@@ -352,6 +370,7 @@ impl<CTX, ERROR, FRAME> RskHandler<CTX, ERROR, FRAME> {
             active_precompiles,
             rskip171_active,
             rskip90_active: true,
+            deploy_overwrites: false,
             // Per-transaction, as before RSKIP-144; `postponing_fees` opts in.
             postpone_fees: false,
             fail_programs: false,
@@ -837,6 +856,9 @@ where
         // bumps the nonce (even post-RSKIP125), so it stays 0.
         set_created_contract_nonce(evm, 0);
         begin_creation(evm);
+        if self.deploy_overwrites {
+            overwrite_deployed_balance(evm);
+        }
         skip_code_header(evm);
         self.open_frame(evm, false);
         evm.ctx().chain_mut().internal_txs.enter(None);
@@ -1882,6 +1904,27 @@ where
         return;
     };
     evm.ctx().chain_mut().code_saved.remove(&created_address);
+}
+
+/// A creation transaction's frame has opened before RSKIP174 (see
+/// `deploy_overwrites`): its contract holds only the value it was sent, a
+/// balance already at the address lost, until a failure of the frame takes
+/// that back.
+fn overwrite_deployed_balance<EVM>(evm: &mut EVM)
+where
+    EVM: EvmTr<
+        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Frame = EthFrame<EthInterpreter>,
+    >,
+{
+    use revm::context_interface::Transaction;
+    let FrameData::Create(CreateFrame { created_address }) = evm.frame_stack().get().data else {
+        return;
+    };
+    let sent = evm.ctx().tx().value();
+    if let Ok(mut account) = evm.ctx().journal_mut().load_account_mut(created_address) {
+        account.set_balance(sent);
+    }
 }
 
 /// rskj's code header (`Program.processAndSkipCodeHeader`, which

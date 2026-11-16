@@ -2368,7 +2368,11 @@ impl RskExecutor {
             // whatever was there, so before RSKIP174 (iris300) deploying onto
             // an address that already holds a balance destroys it. Someone
             // funding a deploy address before the deployment lands loses the
-            // money, and the chain's supply drops with it.
+            // money, and the chain's supply drops with it -- unless the
+            // creation fails: the account is written in `cacheTrack`, which
+            // rskj's `go` rolls back then. So the handler takes the balance in
+            // the creation's frame, which a failure takes back
+            // (`RskHandler::with_rskip174`).
             //
             // revm does the sane thing and keeps the balance, which is the
             // post-iris300 rule, so only the earlier window needs this. The
@@ -2378,6 +2382,11 @@ impl RskExecutor {
             //
             // Testnet #647,051 is a live instance -- 0.05 RBTC sitting at the
             // deploy address, gone in the reference node's post-state.
+            //
+            // The fresh account's nonce is zero too. Only a hash collision
+            // gives an address a creation derives a nonce, or code, which
+            // revm would refuse the creation for; the nonce is reset here,
+            // before the frame opens, and code is left alone.
             if tx.to.is_empty() && !self.hardfork_cfg.has_rskip174(header.number) {
                 use revm::context_interface::journaled_state::account::JournaledAccountTr;
                 use revm::context_interface::{ContextTr, JournalTr};
@@ -2385,24 +2394,18 @@ impl RskExecutor {
                 // Read before taking a mutable handle, so an address with
                 // nothing in it is not materialised into an empty account that
                 // the state root would then have to carry.
-                let occupied = evm
+                let has_nonce = evm
                     .ctx
                     .journal_mut()
                     .load_account(created)
-                    .map(|a| !a.data.info.balance.is_zero() || a.data.info.nonce != 0)
+                    .map(|a| a.data.info.nonce != 0)
                     .unwrap_or(false);
-                if occupied {
+                if has_nonce {
                     let mut acc = evm
                         .ctx
                         .journal_mut()
                         .load_account_mut(created)
                         .map_err(|e| ExecutionError::Evm(format!("{e:?}")))?;
-                    // `new AccountState()` -- nonce and balance both zero.
-                    // Code lives under its own trie key and createAccount does
-                    // not touch it, so an address holding code still collides
-                    // in revm where rskj would overwrite. Reaching that needs a
-                    // hash collision, so it is left alone rather than modelled.
-                    acc.data.set_balance(U256::ZERO);
                     acc.data.set_nonce(0);
                 }
             }
@@ -2423,6 +2426,7 @@ impl RskExecutor {
             .postponing_fees(postpone_fees)
             .failing_programs(fails_programs)
             .with_rskip90(self.hardfork_cfg.has_rskip90(header.number))
+            .with_rskip174(self.hardfork_cfg.has_rskip174(header.number))
             .with_called_precompiles(called_precompiles.clone())
             .with_reached_sequential_only(reached_sequential_only.clone());
                 // `inspect_run` for the one transaction being traced, `run`
