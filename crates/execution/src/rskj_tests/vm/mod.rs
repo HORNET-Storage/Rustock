@@ -4,6 +4,7 @@
 mod contract_creating_dsl_rollback_test;
 mod create2_test;
 mod dsl_files_test;
+mod evm_rules;
 mod ext_code_hash_test;
 pub(super) mod harness;
 mod initcode_cost_calculator_test;
