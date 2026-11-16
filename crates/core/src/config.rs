@@ -410,13 +410,19 @@ impl ChainConfig {
         }
     }
 
+    /// rskj `RskContext` loads a genesis file with `useRskip92Encoding` as
+    /// RSKIP92, an orchid rule, is active at block 0.
+    fn rskip92_at_genesis(&self) -> bool {
+        self.activation_heights.orchid == 0
+    }
+
     /// Returns the well-known genesis hash for this network, if one exists.
     /// Mainnet and testnet have hardcoded hashes because Java's RLP encoding
     /// of the genesis difficulty includes a leading zero byte that differs
     /// from standard encoding, producing a different hash.
     pub fn known_genesis_hash(&self) -> Option<B256> {
         if let Some(spec) = &self.genesis_spec {
-            return Some(spec.hash());
+            return Some(spec.hash_encoded(self.rskip92_at_genesis()));
         }
         match self.chain_id {
             30 => Some("0xf88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0".parse().unwrap()),
@@ -431,7 +437,7 @@ impl ChainConfig {
         let empty_trie_hash: B256 = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421".parse().unwrap();
 
         if let Some(spec) = &self.genesis_spec {
-            return spec.header();
+            return spec.header_encoded(self.rskip92_at_genesis());
         }
 
         match self.chain_id {
