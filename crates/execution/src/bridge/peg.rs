@@ -10261,6 +10261,56 @@ mod tests {
         }
     }
 
+    /// From RSKIP170 rskj looks for the RSKT payload in every output's script,
+    /// and one bitcoinj can't parse throws the `PeginInstructionsException` a
+    /// payload that doesn't parse throws. A P2PKH sender's peg-in is refunded,
+    /// logging rejected_pegin(PEGIN_V1_INVALID_PAYLOAD=4), where it would be
+    /// credited: before RSKIP379 in `legacyRegisterPegin`'s catch, from it in
+    /// `evaluatePegin`'s. From no sender it is turned down for its payload,
+    /// not for its sender. Before RSKIP170 nothing reads the outputs so.
+    #[test]
+    fn from_rskip170_an_output_bitcoinj_cannot_parse_is_an_invalid_payload() {
+        use crate::hardfork::RskNetworkUpgrade::*;
+        let key = real_pubkey();
+        let sender = (pushes(&[&[0x30; 71], &key]), bitcoin::Witness::new());
+        let to = super::super::federation::rsk_address_from_public_key(&key).unwrap();
+        let amount = 1_000_000_000;
+        // OP_PUSHDATA1 with no length after it.
+        let unparseable = bitcoin::ScriptBuf::from_bytes(vec![0x4c]);
+        let paying = |input: &(bitcoin::ScriptBuf, bitcoin::Witness), cfg: &RskHardforkConfig| {
+            spend(
+                vec![input.clone()],
+                &[
+                    (amount, regtest_federation_script_for(cfg)),
+                    (0, unparseable.clone()),
+                ],
+            )
+        };
+
+        for cfg in [
+            rskj_regtest_until(Fingerroot500),
+            RskHardforkConfig::rskj_regtest(),
+        ] {
+            let tx = paying(&sender, &cfg);
+            let (ok, processed, logs, utxos) = registration(&tx, &cfg);
+            assert_eq!((ok, processed, utxos), (true, true, 0), "refunded");
+            assert_eq!(logs.first(), Some(&rejected(&tx, 4)));
+            let credited = pegin_btc(to, &tx, amount, 0);
+            assert!(logs.iter().all(|(topics, _)| topics[0] != credited.0[0]));
+        }
+
+        let cfg = RskHardforkConfig::rskj_regtest();
+        let tx = paying(&native_segwit(), &cfg);
+        assert_eq!(
+            registration(&tx, &cfg),
+            (true, false, vec![rejected(&tx, 4), unrefundable(&tx, 1)], 0)
+        );
+
+        let cfg = rskj_regtest_until(Papyrus200);
+        let tx = paying(&native_segwit(), &cfg);
+        assert_eq!(registration(&tx, &cfg), (true, false, vec![], 0));
+    }
+
     /// A v1 peg-in over the locking cap, from no sender, with no refund
     /// address in its payload: before RSKIP379 `processPegInVersion1` logs
     /// rejected_pegin(PEGIN_CAP_SURPASSED=1), then `refundTxSender`, with
