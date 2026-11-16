@@ -1836,6 +1836,42 @@ mod tests {
         assert_eq!(intrinsic_gas(&tx), 21_000 + 4 + 16 + 4 + 16);
     }
 
+    /// rskj `Transaction.transactionCost` as the pool reads it at its head,
+    /// on mainnet: a byte of call data other than zero costs 68 before
+    /// RSKIP400 (arrowhead600, #6,223,700) and 16 from it, a zero byte 4
+    /// throughout; from RSKIP438 (lovell700, #7,338,024) a creation pays 2
+    /// more for each 32 bytes of its init code, the last ones counted whole
+    /// (`InitcodeCostCalculator`), and a call pays nothing for its data so.
+    #[test]
+    fn the_pool_prices_call_data_and_init_code_by_the_heads_upgrades() {
+        let rules = ChainRules::for_chain(
+            rustock_execution::hardfork::RskHardforkConfig::mainnet(),
+            10_000_000,
+        );
+        let mut call = make_tx(0, 1);
+        call.input = Bytes::from(vec![0x00, 0x01, 0x02]);
+        let mut creation = make_tx(0, 1);
+        creation.to = Bytes::new();
+        creation.input = Bytes::from(vec![0x01; 33]);
+        for (number, call_cost, creation_cost) in [
+            (6_223_699, 21_000 + 4 + 2 * 68, 53_000 + 33 * 68),
+            (6_223_700, 21_000 + 4 + 2 * 16, 53_000 + 33 * 16),
+            (7_338_023, 21_000 + 4 + 2 * 16, 53_000 + 33 * 16),
+            (7_338_024, 21_000 + 4 + 2 * 16, 53_000 + 33 * 16 + 2 * 2),
+        ] {
+            assert_eq!(
+                rules.transaction_cost(&call, number),
+                call_cost,
+                "#{number}"
+            );
+            assert_eq!(
+                rules.transaction_cost(&creation, number),
+                creation_cost,
+                "#{number}"
+            );
+        }
+    }
+
     // ========== rskj: addAndGetPendingTransaction ==========
 
     #[test]
