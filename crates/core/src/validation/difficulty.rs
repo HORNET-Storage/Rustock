@@ -104,8 +104,10 @@ impl DifficultyRule {
             return parent.difficulty;
         }
 
-        // RSKIP156 (papyrus200): difficulty divisor changes from 50 to 400.
-        let divisor = if header.number >= activations.papyrus200 {
+        // RSKIP156 (papyrus200): the divisor goes from 50 to 400, except on
+        // regtest, which keeps its 2,048 (`Constants.getDifficultyBoundDivisor`,
+        // `getChainId() != REGTEST_CHAIN_ID`).
+        let divisor = if header.number >= activations.papyrus200 && self.config.chain_id != 33 {
             RSKIP156_DIFFICULTY_DIVISOR
         } else {
             self.config.difficulty_divisor
@@ -325,5 +327,58 @@ mod rskip290_tests {
         let parent = header_at(2_581_799, 1_000_000, U256::from(550_000_000u64));
         let late = rule.difficulty_for_child(&parent, 2_581_800, 1_000_000 + 60, 0);
         assert_eq!(late, U256::from(550_000_000u64));
+    }
+}
+
+#[cfg(test)]
+mod rskip156_tests {
+    use super::rskip97_tests::header_at;
+    use super::*;
+    use crate::config::ChainConfig;
+    use std::sync::Arc;
+
+    /// rskj moves the difficulty by a 400th from RSKIP156 on mainnet and
+    /// testnet, and by regtest's own 2,048th on regtest, RSKIP156 or not
+    /// (`Constants.getDifficultyBoundDivisor`). Here a block sooner than its
+    /// chain's duration, under each chain's constants with papyrus200 at
+    /// genesis.
+    #[test]
+    fn regtest_keeps_its_divisor_under_rskip156() {
+        for (mut config, divisor) in [
+            (ChainConfig::mainnet(), 400u64),
+            (ChainConfig::testnet(), 400),
+            (ChainConfig::regtest(), 2_048),
+        ] {
+            config
+                .activation_heights
+                .set_rskj_hardfork("papyrus200", Some(0));
+            let chain = config.chain_id;
+            let rule = DifficultyRule {
+                config: Arc::new(config),
+            };
+            let parent = header_at(100, 1_000_000, U256::from(10u64.pow(18)));
+            let got = rule.difficulty_for_child(&parent, 101, 1_000_000 + 1, 0);
+            let step = U256::from(10u64.pow(18) / divisor);
+            assert_eq!(got, parent.difficulty + step, "chain {chain}");
+        }
+    }
+
+    /// Mainnet's divisor is 50 up to the block before papyrus200 and 400 from
+    /// its first block; its ten-minute drop goes with RSKIP97, at orchid: the
+    /// block before still drops to the floor, and orchid's first does not.
+    #[test]
+    fn mainnet_changes_its_divisor_and_its_drop_at_their_first_blocks() {
+        let rule = DifficultyRule {
+            config: Arc::new(ChainConfig::mainnet()),
+        };
+        let d = U256::from(10u64.pow(18));
+        let after = |number: u64, seconds: u64| {
+            let parent = header_at(number - 1, 1_000_000, d);
+            rule.difficulty_for_child(&parent, number, 1_000_000 + seconds, 0)
+        };
+        assert_eq!(after(2_392_699, 1), d + d / U256::from(50));
+        assert_eq!(after(2_392_700, 1), d + d / U256::from(400));
+        assert_eq!(after(728_999, 600), rule.config.min_difficulty);
+        assert_eq!(after(729_000, 600), d - d / U256::from(50));
     }
 }
