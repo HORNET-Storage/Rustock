@@ -348,8 +348,10 @@ impl BlockProcessor {
         // closed again when the block is done, and what was recorded goes
         // with the block, to be stored where it is committed, on any thread.
         // Nothing else the thread runs is recorded -- a local call, a trace,
-        // a block built for the miner -- and a block that fails leaves
-        // nothing behind for the next to store.
+        // the miner's trial run of its candidates -- and a block that fails
+        // leaves nothing behind for the next to store. A template the miner
+        // builds runs here too, and what it records goes with it unstored:
+        // only the block a solution completes is committed.
         let recording = self.legacy_events.is_some();
         if recording {
             crate::silent::start();

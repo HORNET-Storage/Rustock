@@ -3301,6 +3301,79 @@ fn a_mined_block_that_ties_the_head_goes_by_the_selection_rule() {
     );
 }
 
+/// A block kept beside the chain leaves the peg decisions it made that the
+/// Bridge logs no event for with `leave_unlogged`, with its hash and height,
+/// before it is stored, so that no path takes it onto the chain without
+/// them. A block that made none leaves nothing, and one already stored is
+/// not left again.
+#[test]
+fn a_block_kept_beside_the_chain_leaves_its_peg_decisions_before_it_is_stored() {
+    use crate::silent::{SilentKind, SilentRecord};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let trie_store: Arc<dyn TrieStore> = Arc::new(MemoryTrieStore::new());
+    let root = TrieNode::empty().compute_hash(trie_store.as_ref());
+    let parent = header_at(0, B256::ZERO, root);
+    let parent_hash = parent.hash();
+    store.put_header_with_hash(parent_hash, &parent).unwrap();
+    store.put_canonical_hash(0, parent_hash).unwrap();
+    store
+        .put_total_difficulty(parent_hash, U256::from(1))
+        .unwrap();
+
+    let left = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let leave: Arc<dyn Fn(B256, u64, Vec<SilentRecord>) + Send + Sync> = {
+        let (store, left) = (store.clone(), left.clone());
+        Arc::new(move |hash: B256, number: u64, records: Vec<SilentRecord>| {
+            let stored = store.has_block(hash).unwrap();
+            left.lock().unwrap().push((hash, number, records, stored));
+        })
+    };
+    let chain = StoreChainAccess::new(store.clone(), trie_store, None).with_leave_unlogged(leave);
+    let block = |extra: u8| {
+        let mut header = header_at(1, parent_hash, root);
+        header.extra_data = Bytes::from(vec![extra]);
+        rustock_core::Block {
+            header,
+            transactions: Vec::new(),
+            ommers: Vec::new(),
+        }
+    };
+    let decision = SilentRecord {
+        kind: SilentKind::BtcTxMarkedProcessed,
+        block: 1,
+        tx_index: 0,
+        fields: Vec::new(),
+    };
+    let laps = || crate::breakdown::Laps::new(false);
+
+    let made = block(1);
+    chain
+        .commit_mined_block_beside(&made, vec![decision.clone()], &mut laps())
+        .unwrap();
+    assert_eq!(
+        *left.lock().unwrap(),
+        vec![(made.hash(), 1, vec![decision.clone()], false)],
+        "left with its hash and height, before it is stored"
+    );
+    assert!(store.has_block(made.hash()).unwrap());
+
+    let none = block(2);
+    chain
+        .commit_mined_block_beside(&none, Vec::new(), &mut laps())
+        .unwrap();
+    let again = chain
+        .commit_mined_block_beside(&made, vec![decision], &mut laps())
+        .unwrap();
+    assert_eq!(again.result, ImportResult::Exist);
+    assert_eq!(
+        left.lock().unwrap().len(),
+        1,
+        "nothing is left for a block that made none, or for one already stored"
+    );
+}
+
 /// The thread mines on its clock: at a 100 ms median (the floor), it yields
 /// several blocks, and stopping ends it.
 #[test]

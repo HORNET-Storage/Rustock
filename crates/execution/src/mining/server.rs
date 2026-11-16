@@ -28,6 +28,7 @@ use crate::mining::merkle::{self, MerkleProofError};
 use crate::mining::template::{
     BlockTemplate, BlockTemplateBuilder, PendingTransactionSource, TemplateError,
 };
+use crate::silent::SilentRecord;
 
 /// What `mnr_getWork` answers with. rskj `co.rsk.mine.MinerWork`.
 #[derive(Debug, Clone)]
@@ -151,10 +152,13 @@ pub trait ChainAccess: Send + Sync {
     /// beside the chain against its own parent's state, and answer whether
     /// it takes the head, without moving the head: the sync service makes
     /// that switch, as it does for a peer's block executed beside the chain,
-    /// once the hook has told it of the block.
+    /// once the hook has told it of the block. `unlogged` holds the peg
+    /// decisions the block made that the Bridge logs no event for, which are
+    /// stored by height, so only once the chain takes the block up.
     fn commit_mined_block_beside(
         &self,
         block: &Block,
+        unlogged: Vec<SilentRecord>,
         laps: &mut Laps,
     ) -> Result<CommitOutcome, String>;
 }
@@ -212,6 +216,14 @@ pub struct StoreChainAccess {
     pub flush_every: u64,
     /// Best blocks committed since the last flush.
     pub since_flush: std::sync::atomic::AtomicU64,
+    /// Where [`ChainAccess::commit_mined_block_beside`] leaves the peg
+    /// decisions the Bridge logs no event for that a block it keeps beside
+    /// the chain made, with the block's hash and height. They are stored by
+    /// height, so not before the chain takes the block up, which is the sync
+    /// service's to do: it holds them till then, as it holds those of a
+    /// peer's block executed beside the chain. They are left before the
+    /// block is stored, so that no path can take the block up without them.
+    pub leave_unlogged: Option<Arc<dyn Fn(B256, u64, Vec<SilentRecord>) + Send + Sync>>,
 }
 
 impl StoreChainAccess {
@@ -237,7 +249,18 @@ impl StoreChainAccess {
             on_committed,
             flush_every: flush_every.max(1),
             since_flush: std::sync::atomic::AtomicU64::new(0),
+            leave_unlogged: None,
         }
+    }
+
+    /// Leave the peg decisions of a block kept beside the chain with `leave`
+    /// ([`Self::leave_unlogged`]).
+    pub fn with_leave_unlogged(
+        mut self,
+        leave: Arc<dyn Fn(B256, u64, Vec<SilentRecord>) + Send + Sync>,
+    ) -> Self {
+        self.leave_unlogged = Some(leave);
+        self
     }
 
     /// Count a best block and say whether it is time to flush. The counter
@@ -450,6 +473,7 @@ impl ChainAccess for StoreChainAccess {
     fn commit_mined_block_beside(
         &self,
         block: &Block,
+        unlogged: Vec<SilentRecord>,
         laps: &mut Laps,
     ) -> Result<CommitOutcome, String> {
         let hash = block.hash();
@@ -465,6 +489,13 @@ impl ChainAccess for StoreChainAccess {
         // strength of it, as the sync service makes durable a block it
         // executes beside the chain.
         self.trie_store.flush();
+        // Its peg decisions where the sync service takes them from, before the
+        // block is stored and any path can take it onto the chain.
+        if !unlogged.is_empty() {
+            if let Some(leave) = &self.leave_unlogged {
+                leave(hash, number, unlogged);
+            }
+        }
         let td = self.store_mined(block, hash)?;
         // rskj answers what `internalTryToConnect` made of the block:
         // `IMPORTED_BEST` where the selection rule takes it, and
@@ -1029,7 +1060,7 @@ impl MinerServer {
         if beside {
             let outcome = self
                 .chain
-                .commit_mined_block_beside(&block, &mut laps)
+                .commit_mined_block_beside(&block, executed.unlogged_peg_events, &mut laps)
                 .map_err(SubmitError::Storage)?;
             // The head hasn't moved by this. If the block takes it, the sync
             // service's switch moves it and tells the miner of its new best

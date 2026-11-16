@@ -182,6 +182,24 @@ impl SyncService {
         }));
     }
 
+    /// Where a block this node mined and kept beside the chain leaves the peg
+    /// decisions it made that the Bridge logs no event for
+    /// (`StoreChainAccess::leave_unlogged`): the place a peer's block
+    /// executed beside the chain leaves its own ([`Self::execute_beside`]).
+    /// They wait there, by the block's hash, until a path takes the block
+    /// onto the chain and stores them under its height.
+    pub fn unlogged_holder(&self) -> Arc<dyn Fn(B256, u64, Vec<SilentRecord>) + Send + Sync> {
+        let unlogged = self.beside_unlogged.clone();
+        Arc::new(move |hash, number, records| {
+            if !records.is_empty() {
+                unlogged
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(hash, (number, records));
+            }
+        })
+    }
+
     /// Execute beside the chain with `beside` in place of the block
     /// processor, and count a block executed here once `beside` has run it,
     /// or once the test has put it in the set returned.

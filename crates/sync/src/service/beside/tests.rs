@@ -358,6 +358,60 @@ async fn a_mined_block_kept_beside_the_chain_is_switched_to_when_heavier() {
     );
 }
 
+/// A block this node mined beside the chain leaves the peg decisions it made
+/// that the Bridge logs no event for where a peer's block executed beside the
+/// chain leaves its own (`SyncService::unlogged_holder`): the switch to it
+/// takes them out, to store under its height, and those of a block the chain
+/// doesn't take wait. A block that made none leaves nothing.
+#[tokio::test]
+async fn a_mined_block_kept_beside_the_chain_leaves_its_peg_decisions_for_the_switch() {
+    use rustock_execution::silent::{SilentKind, SilentRecord};
+
+    let mut node = node().await;
+    let chain = node.chain(&[1, 2]); // totals 2 and 4
+    let (a1, a2) = (chain[1].hash(), chain[2].hash());
+    let decision = SilentRecord {
+        kind: SilentKind::BtcTxMarkedProcessed,
+        block: 2,
+        tx_index: 0,
+        fields: Vec::new(),
+    };
+    let hold = node.service.unlogged_holder();
+
+    let lighter = node.header(2, a1, 1, 0xC0); // total 3
+    hold(lighter.hash(), 2, vec![decision.clone()]);
+    node.mined_beside(&lighter, 3);
+    node.service
+        .handle_event(crate::SyncEvent::MinedBlock {
+            hash: lighter.hash(),
+        })
+        .await;
+
+    let heavier = node.header(2, a1, 3, 0xC1); // total 5
+    hold(heavier.hash(), 2, vec![decision.clone()]);
+    hold(a2, 2, Vec::new());
+    node.mined_beside(&heavier, 5);
+    node.service
+        .handle_event(crate::SyncEvent::MinedBlock {
+            hash: heavier.hash(),
+        })
+        .await;
+    assert_eq!(node.head(), Some(heavier.hash()));
+    let held: Vec<_> = node
+        .service
+        .beside_unlogged
+        .lock()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        held,
+        vec![(lighter.hash(), (2, vec![decision]))],
+        "the switch took the heavier block's out; the lighter block's wait"
+    );
+}
+
 /// A chain heavier by its headers whose bodies never come leaves the head,
 /// the canonical chain and execution where they are, as rskj's best block
 /// stays on what it has connected, and the node goes on following its own

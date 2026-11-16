@@ -2755,7 +2755,12 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         block_processor = block_processor.with_sender_cache(cache.clone());
     }
     block_processor = block_processor.with_execution_threads(args.execution_threads);
-    if !args.no_peg_event_recording {
+    // The peg events the Bridge logs nothing for, recorded as blocks are
+    // committed. One store, which the miner's processor shares, so a block
+    // this node mines is recorded as a peer's block is.
+    let legacy_events = if args.no_peg_event_recording {
+        None
+    } else {
         let dir = args
             .peg_events_dir
             .clone()
@@ -2763,14 +2768,18 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         match rustock_storage::legacy_event_store::LegacyEventStore::open(&dir) {
             Ok(st) => {
                 info!("Recording unlogged peg events to {dir}");
-                block_processor = block_processor.with_legacy_event_store(std::sync::Arc::new(st));
+                Some(std::sync::Arc::new(st))
             }
             // A diagnostic store failing to open must not stop the node from
             // following the chain. Say so loudly and carry on without it.
-            Err(e) => tracing::warn!(
-                "peg event recording disabled: cannot open {dir}: {e}"
-            ),
+            Err(e) => {
+                tracing::warn!("peg event recording disabled: cannot open {dir}: {e}");
+                None
+            }
         }
+    };
+    if let Some(st) = &legacy_events {
+        block_processor = block_processor.with_legacy_event_store(st.clone());
     }
     if config.genesis_spec.is_some() {
         // A chain from an rskj genesis file is rskj's regtest, Bridge
@@ -3527,6 +3536,10 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         });
     }
 
+    // Where a block the miner keeps beside the chain leaves the peg decisions
+    // the Bridge logs nothing for, for the sync service to store once the
+    // chain takes the block up.
+    let unlogged_holder = sync_service.unlogged_holder();
     // Supervise the sync task: a panic inside it would otherwise be swallowed
     // by tokio and leave the node running but silently stalled.
     let sync_handle = tokio::spawn(sync_service.start());
@@ -3570,7 +3583,8 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             ..Default::default()
         };
         // The miner's processor is wired like the node's: the same rules
-        // (`rule_keeping_processor`), caches, threads and, on a chain from an
+        // (`rule_keeping_processor`), caches, threads, store of the peg
+        // events the Bridge logs nothing for and, on a chain from an
         // rskj genesis file, rskj's regtest Bridge constants. A bare
         // processor here ran REMASC against the built-in federation, so the
         // first payout (block 15 on regtest) reached a state root no node
@@ -3585,6 +3599,9 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             miner_processor = miner_processor.with_sender_cache(cache.clone());
         }
         miner_processor = miner_processor.with_execution_threads(args.execution_threads);
+        if let Some(st) = &legacy_events {
+            miner_processor = miner_processor.with_legacy_event_store(st.clone());
+        }
         if config.genesis_spec.is_some() {
             miner_processor = miner_processor.with_bridge_constants(
                 rustock_execution::bridge::constants::BridgeConstants::rskj_regtest(),
@@ -3631,7 +3648,8 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
                 trie_store_for_pool.clone(),
                 Some(on_committed),
                 args.flush_every,
-            ),
+            )
+            .with_leave_unlogged(unlogged_holder),
         );
         let mut server = rustock_execution::MinerServer::new(
             builder,
