@@ -1229,20 +1229,6 @@ fn confirmations_throw_for_a_path_longer_than_its_branch() {
     assert_eq!(int_of(&bridge.answer(&data(0b111))), -1);
 }
 
-/// rskj's `BitcoinTestUtils.getBtcEcKeyFromSeed`: the key whose private part
-/// is the seed's Keccak-256 hash.
-fn key_from_seed(seed: &str) -> [u8; 33] {
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
-    use sha3::Digest;
-    let private = sha3::Keccak256::digest(seed.as_bytes());
-    let key = k256::SecretKey::from_slice(&private).unwrap();
-    key.public_key()
-        .to_encoded_point(true)
-        .as_bytes()
-        .try_into()
-        .unwrap()
-}
-
 /// The nine keys rskj's `addSignature` tests make from `<seed>1` to
 /// `<seed>9`, sorted as it sorts them.
 fn seeded_keys(seed: &str) -> Vec<[u8; 33]> {

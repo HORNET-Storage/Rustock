@@ -307,3 +307,36 @@ pub(super) fn genesis_federator(constants: &BridgeConstants) -> Address {
     let keys = crate::bridge::peg::genesis_federation_keys(constants);
     crate::bridge::federation::rsk_address_from_public_key(&keys[0]).unwrap()
 }
+
+/// The compressed public key of a private key.
+pub(super) fn public_key_of(private: &[u8; 32]) -> [u8; 33] {
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    let key = k256::SecretKey::from_slice(private).unwrap();
+    key.public_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .try_into()
+        .unwrap()
+}
+
+/// rskj's `BitcoinTestUtils.getBtcEcKeyFromSeed`: the key whose private part
+/// is the seed's Keccak-256 hash.
+pub(super) fn key_from_seed(seed: &str) -> [u8; 33] {
+    use sha3::Digest;
+    public_key_of(&sha3::Keccak256::digest(seed.as_bytes()).into())
+}
+
+/// rskj's `BtcECKey.fromPrivate(Hex.decode(hex))`: the key of a private
+/// number written in a few hex digits.
+pub(super) fn key_of_private(hex: &str) -> [u8; 33] {
+    let digits = alloy_primitives::hex::decode(hex).unwrap();
+    let mut private = [0u8; 32];
+    private[32 - digits.len()..].copy_from_slice(&digits);
+    public_key_of(&private)
+}
+
+/// RIPEMD-160 of SHA-256, Bitcoin's hash of a key or a script.
+pub(super) fn hash160(data: &[u8]) -> [u8; 20] {
+    use ripemd::Digest as _;
+    ripemd::Ripemd160::digest(sha2::Sha256::digest(data)).into()
+}
