@@ -163,19 +163,30 @@ pub(crate) struct Chain {
     root: TrieNode,
     /// The next block's number.
     pub(crate) number: u64,
+    blocks: Arc<BlockStore>,
     _blocks: tempfile::TempDir,
 }
 
 impl Chain {
     pub(crate) fn new(config: RskHardforkConfig, number: u64) -> Self {
-        let blocks = tempfile::tempdir().expect("a folder for the block store");
-        let block_store = Arc::new(BlockStore::open(blocks.path()).expect("a block store"));
+        let folder = tempfile::tempdir().expect("a folder for the block store");
+        let blocks = Arc::new(BlockStore::open(folder.path()).expect("a block store"));
         Self {
-            executor: RskExecutor::new(config, block_store),
+            executor: RskExecutor::new(config, blocks.clone()),
             store: Arc::new(MemoryTrieStore::new()),
             root: TrieNode::empty(),
             number,
-            _blocks: blocks,
+            blocks,
+            _blocks: folder,
+        }
+    }
+
+    /// The chain, its executor changed by `change`: given REMASC's constants
+    /// or the Bridge's, say.
+    pub(crate) fn map_executor(self, change: impl FnOnce(RskExecutor) -> RskExecutor) -> Self {
+        Self {
+            executor: change(self.executor),
+            ..self
         }
     }
 
@@ -242,6 +253,43 @@ impl Chain {
             &self.root,
             self.store.clone(),
         )?;
+        self.apply(&result);
+        self.number += 1;
+        Ok(result)
+    }
+
+    /// Runs `transactions` in the block `header` heads, whose uncles are
+    /// `ommers`, and keeps the block as the chain's at its height, as an
+    /// imported block is kept: REMASC reads the blocks before it there.
+    pub(crate) fn import(
+        &mut self,
+        header: &Header,
+        ommers: &[Header],
+        transactions: &[(Transaction, Address)],
+    ) -> BlockExecutionResult {
+        let store = self.store.clone();
+        let result = self
+            .executor
+            .execute_block(header, transactions, &self.root, store);
+        let result = result.expect("the block runs");
+        self.apply(&result);
+        let hash = header.hash();
+        let blocks = &self.blocks;
+        blocks
+            .put_header_with_hash(hash, header)
+            .expect("the header is kept");
+        blocks
+            .put_canonical_hash(header.number, hash)
+            .expect("the height is kept");
+        blocks
+            .put_body(hash, &[], ommers)
+            .expect("the uncles are kept");
+        self.number = header.number + 1;
+        result
+    }
+
+    /// Leaves the state a block that ran left.
+    fn apply(&mut self, result: &BlockExecutionResult) {
         self.root = match &result.applied_root {
             Some(root) => root.clone(),
             None => crate::state::apply_state_changes(
@@ -251,8 +299,6 @@ impl Chain {
                 &result.markers,
             ),
         };
-        self.number += 1;
-        Ok(result)
     }
 
     /// Runs `transactions` in the next block.
@@ -294,10 +340,24 @@ impl Chain {
 
     /// The word at `slot` of `address`'s storage: zero where none is.
     pub(crate) fn storage(&self, address: Address, slot: u64) -> U256 {
-        let slot = B256::from(U256::from(slot));
-        let key = TrieKeySlice::from_key(&rustock_trie::storage_key(&address, &slot));
-        let value = self.root.get(&key, self.store.as_ref());
+        self.storage_word(address, U256::from(slot))
+    }
+
+    /// The word at `key` of `address`'s storage: zero where none is.
+    pub(crate) fn storage_word(&self, address: Address, key: U256) -> U256 {
+        let key = rustock_trie::storage_key(&address, &B256::from(key));
+        let value = self
+            .root
+            .get(&TrieKeySlice::from_key(&key), self.store.as_ref());
         value.map_or(U256::ZERO, |value| U256::from_be_slice(&value))
+    }
+
+    /// Writes `bytes` at `key` of `address`'s storage, as rskj's
+    /// `addStorageBytes` writes a value of any length.
+    pub(crate) fn put_storage_bytes(&mut self, address: Address, key: U256, bytes: &[u8]) {
+        let key = rustock_trie::storage_key(&address, &B256::from(key));
+        let store = self.store.as_ref();
+        self.root = self.root.put(&TrieKeySlice::from_key(&key), bytes, store);
     }
 }
 
