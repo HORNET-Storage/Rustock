@@ -122,6 +122,11 @@ pub(super) fn hex_word(value: U256) -> String {
     format!("0x{}", hex::encode(value.to_be_bytes::<32>()))
 }
 
+/// PUSH20 of `address`, for [`compile`].
+pub(super) fn push_address(address: Address) -> String {
+    format!("PUSH20 0x{}", hex::encode(address))
+}
+
 /// A transaction calling `to` with `data`, at a gas price of 0.
 pub(super) fn call(nonce: u64, to: Address, value: U256, gas: u64, data: &[u8]) -> Transaction {
     Transaction {

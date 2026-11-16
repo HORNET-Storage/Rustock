@@ -8,10 +8,12 @@
 //! contracts check them against. A frame that fails drops its logs, as rskj
 //! drops its events. Each case runs from lovell700 on mainnet.
 
-use alloy_primitives::{hex, Address, U256};
+use alloy_primitives::{Address, U256};
 use rustock_core::Transaction;
 
-use super::harness::{call, compile, hex_word, logged, Chain, CONTRACT, LOG_TOP, ONE_RBTC, SENDER};
+use super::harness::{
+    call, compile, hex_word, logged, push_address, Chain, CONTRACT, LOG_TOP, ONE_RBTC, SENDER,
+};
 use crate::executor::TxExecutionResult;
 use crate::hardfork::{RskHardforkConfig, RskNetworkUpgrade};
 
@@ -68,11 +70,6 @@ fn bytes32(bytes: &[u8]) -> U256 {
 /// PUSH32 of `word`.
 fn push(word: U256) -> String {
     format!("PUSH32 {}", hex_word(word))
-}
-
-/// PUSH20 of `address`.
-fn push_address(address: Address) -> String {
-    format!("PUSH20 0x{}", hex::encode(address))
 }
 
 /// `op` (CALL, CALLCODE, DELEGATECALL or STATICCALL) of the contract the
