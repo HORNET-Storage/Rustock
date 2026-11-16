@@ -3,7 +3,7 @@
 //! each case runs as a contract's code in a block, on each side of the height
 //! rskj's `reference.conf` gives the rule.
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 
 use super::harness::{
     call, compile, push_address, return_top, run_code, words, Chain, CONTRACT, GAS, ONE_RBTC,
@@ -12,6 +12,8 @@ use super::harness::{
 
 /// orchid on mainnet: RSKIP91.
 const ORCHID: u64 = 729_000;
+/// wasabi100 on mainnet: RSKIP125.
+const WASABI: u64 = 1_591_000;
 /// iris300 on mainnet.
 const IRIS: u64 = 3_614_800;
 /// The contract a case's contract calls.
@@ -76,4 +78,66 @@ fn in_a_static_call_a_call_with_a_value_and_create2_fail_and_callcode_with_one_r
         .map(|code| run(&plainly, code))
         .collect();
     assert_eq!(pushed, [one.clone(), one.clone(), one], "by a CALL");
+}
+
+/// The init code CREATE2 runs in the cases below: 0x60, a PUSH1 that the code
+/// ends before, which pushes 0 and stops, leaving the new contract no code.
+const PUSH1_AT_THE_END: &str = "PUSH1 0x60 PUSH1 0x00 MSTORE8";
+
+/// CREATE2 of 10 wei, salt 0, and the byte at 0 of memory as its init code.
+const CREATE2_OF_THE_BYTE: &str = "PUSH1 0x00 PUSH1 0x01 PUSH1 0x00 PUSH1 0x0a CREATE2";
+
+/// rskj's `Create2Test.testCREATE2_DuplicateContractCreation`. From RSKIP125
+/// `Program.createContract` refuses a creation at an address that holds code
+/// or a nonce, and the contract a first CREATE2 made holds a nonce (1) and no
+/// code: a second CREATE2 of the same init code and salt makes nothing, moves
+/// no value, and spends all the gas it was given, all the program had. The
+/// STOP after it needs none, so the transaction succeeds.
+#[test]
+fn a_second_create2_at_the_address_of_one_it_made_fails_with_all_the_gas() {
+    let code = compile(&format!(
+        "{PUSH1_AT_THE_END} {CREATE2_OF_THE_BYTE} {CREATE2_OF_THE_BYTE} STOP"
+    ));
+    let mut chain = Chain::mainnet(IRIS);
+    chain.put(SENDER, 0, ONE_RBTC, &[]);
+    chain.put(CONTRACT, 1, U256::from(1_000), &code);
+    let ran = chain.run(SENDER, call(0, CONTRACT, U256::ZERO, GAS, &[]));
+    assert!(ran.success);
+    assert_eq!(
+        ran.gas_used, GAS,
+        "the second CREATE2 spent the gas it was given"
+    );
+    let made = CONTRACT.create2_from_code(B256::ZERO, [0x60]);
+    let account = chain.account(made).expect("the first CREATE2's contract");
+    assert_eq!(
+        (account.nonce, account.balance),
+        (U256::from(1), U256::from(10))
+    );
+    assert_eq!(
+        chain.balance(CONTRACT),
+        U256::from(990),
+        "the second moved no value"
+    );
+}
+
+/// rskj's `Create2Test.testCREATE2_PreserveContractAddressBalance`: CREATE2 at
+/// an address that holds a balance keeps it, and adds the value it moves.
+/// `Program.createContract` carries an existing account's balance over
+/// (`createAccount(contractAddress, existingAccount)`) at every height; only
+/// a creation transaction waits for RSKIP174 (iris300) to.
+#[test]
+fn create2_keeps_the_balance_already_at_the_address_at_every_height() {
+    let code = compile(&format!("{PUSH1_AT_THE_END} {CREATE2_OF_THE_BYTE}"));
+    let code = [code, return_top(1)].concat();
+    let made = CONTRACT.create2_from_code(B256::ZERO, [0x60]);
+    for number in [WASABI, IRIS - 1, IRIS] {
+        let mut chain = Chain::mainnet(number);
+        chain.put(SENDER, 0, ONE_RBTC, &[]);
+        chain.put(CONTRACT, 1, U256::from(1_000), &code);
+        chain.put(made, 0, U256::from(100), &[]);
+        let ran = chain.run(SENDER, call(0, CONTRACT, U256::ZERO, GAS, &[]));
+        let pushed = U256::from_be_slice(made.as_slice());
+        assert_eq!(words(&ran.output), [pushed], "#{number}");
+        assert_eq!(chain.balance(made), U256::from(110), "#{number}");
+    }
 }
