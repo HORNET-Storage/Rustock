@@ -2,6 +2,7 @@
 //! bitcoinj's BIP32 and base58 code.
 
 use bitcoin::hashes::{hash160, hmac, sha512, Hash, HashEngine};
+use bitcoin::secp256k1::constants::CURVE_ORDER;
 use bitcoin::secp256k1::{PublicKey, Scalar, Secp256k1, VerifyOnly};
 
 use super::{Failure, NativeContract};
@@ -251,12 +252,7 @@ impl ExtendedKey {
         engine.input(&parent);
         engine.input(&index.to_be_bytes());
         let i = hmac::Hmac::<sha512::Hash>::from_engine(engine).to_byte_array();
-        let tweak = Scalar::from_be_bytes(field(&i, 0))
-            .map_err(|_| Failure::threw("I_L is not below the curve's order"))?;
-        let key = self
-            .key
-            .add_exp_tweak(secp, &tweak)
-            .map_err(|_| Failure::threw("the derived key is the point at infinity"))?;
+        let key = child_point(secp, self.key, field(&i, 0))?;
         Ok(Self {
             header: self.header,
             // bitcoinj counts the depth in an int and writes its low byte.
@@ -279,6 +275,26 @@ impl ExtendedKey {
         data.extend_from_slice(&self.key.serialize());
         bitcoin::base58::encode_check(&data)
     }
+}
+
+/// `deriveChildKeyBytesFromPublic`'s point, I_L·G added to the parent's.
+/// bitcoinj's `assertLessThanN` refuses an I_L above the curve's order, and
+/// not one equal to it: that I_L multiplies G to the point at infinity, and
+/// the child keeps its parent's point. A sum that is the point at infinity
+/// is refused (`assertNonInfinity`).
+fn child_point(
+    secp: &Secp256k1<VerifyOnly>,
+    parent: PublicKey,
+    il: [u8; 32],
+) -> Result<PublicKey, Failure> {
+    if il == CURVE_ORDER {
+        return Ok(parent);
+    }
+    let tweak =
+        Scalar::from_be_bytes(il).map_err(|_| Failure::threw("I_L is above the curve's order"))?;
+    parent
+        .add_exp_tweak(secp, &tweak)
+        .map_err(|_| Failure::threw("the derived key is the point at infinity"))
 }
 
 /// The `N` bytes of `data` from `at`, a fixed place inside it.
@@ -547,6 +563,36 @@ mod tests {
         assert_eq!(expected[4], 1);
         expected[4] = 0;
         assert_eq!(child, expected);
+    }
+
+    /// bitcoinj refuses an I_L above the curve's order, and derives from one
+    /// equal to it: n·G is the point at infinity, so the child's point is its
+    /// parent's. One below it, n - 1, adds -G, and added to G itself makes the
+    /// point at infinity, which bitcoinj refuses.
+    #[test]
+    fn an_i_l_equal_to_the_curves_order_keeps_the_parents_point() {
+        let secp = Secp256k1::verification_only();
+        let parent = ExtendedKey::from_base58(TPUB).unwrap().key;
+        assert_eq!(child_point(&secp, parent, CURVE_ORDER), Ok(parent));
+        let mut above = CURVE_ORDER;
+        above[31] += 1;
+        assert!(matches!(
+            child_point(&secp, parent, above),
+            Err(Failure::Threw(_))
+        ));
+        let mut below = CURVE_ORDER;
+        below[31] -= 1;
+        let child = child_point(&secp, parent, below).unwrap();
+        assert_eq!(child.add_exp_tweak(&secp, &Scalar::ONE).unwrap(), parent);
+        let generator = PublicKey::from_slice(
+            &hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            child_point(&secp, generator, below),
+            Err(Failure::Threw(_))
+        ));
     }
 
     /// rskj's `ExtractPublicKeyFromExtendedPublicKeyTest`, and keys it refuses.
