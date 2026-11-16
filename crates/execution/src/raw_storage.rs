@@ -63,6 +63,17 @@ pub struct RskChainExt {
     /// standing. Each holds rskj's storage-prefix marker (`setupContract`
     /// writes it as the creation begins), whatever code it ended with.
     pub created_in_block: std::collections::HashSet<Address>,
+    /// The contracts whose code a creation in this block saved, empty or not:
+    /// rskj's block repository holds what the block writes in a cache until
+    /// the block ends, the code key of each among it
+    /// (`crate::rsk_instructions::ContractMarker::code_saved_in_block`). A
+    /// creation saves its code as it ends, a contract's constructor having
+    /// run (`Program.finalizeContractCreation`) or a transaction's
+    /// (`TransactionExecutor.createContract`); a creation's frame opening
+    /// at an address starts it with none. Before RSKIP453 a contract's
+    /// creation whose code is past the limit or can't be paid for keeps its
+    /// contract and saves no code.
+    pub code_saved: std::collections::HashSet<Address>,
     /// The logs a contract's call to the Bridge wrote before the call failed.
     /// rskj's Bridge writes its logs straight into the list of the program
     /// that called it (`Program.callToPrecompiledAddress` hands it

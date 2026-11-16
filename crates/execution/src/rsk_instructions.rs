@@ -546,7 +546,10 @@ pub(crate) fn take_callee_past_an_address() -> bool {
 ///   - account present but not a contract (no code) -> `keccak256("")`;
 ///   - contract -> its code hash. One whose code key holds nothing answers
 ///     `keccak256("")` from RSKIP169 (`getCodeHashStandard`) and `0` before
-///     it (`getCodeHashNonStandard`), which needs [`ContractMarker`].
+///     it (`getCodeHashNonStandard`), which needs [`ContractMarker`]. Before
+///     it too, one whose empty code a creation in the block saved answers
+///     `keccak256("")`, the hash of the empty value the block's cache holds
+///     for the key ([`ContractMarker::code_saved_in_block`]).
 ///
 /// revm's stock EXTCODEHASH instead returns `0` whenever `AccountInfo::is_empty()`
 /// (EIP-161: balance==0 && nonce==0 && no code), so an existing-but-empty
@@ -583,7 +586,7 @@ fn rsk_extcodehash<WIRE: InterpreterTypes, H: Host + ContractMarker + ?Sized>(
         B256::ZERO
     } else if !codeless {
         code_hash
-    } else if EXTCODEHASH_STANDARD.get() {
+    } else if EXTCODEHASH_STANDARD.get() || context.host.code_saved_in_block(addr) {
         KECCAK_EMPTY
     } else {
         match context.host.holds_contract_marker(addr) {
@@ -605,6 +608,15 @@ pub trait ContractMarker {
     /// Whether `address` holds the marker. `None` where the state couldn't be
     /// read, the error left in the context as revm's own loads leave it.
     fn holds_contract_marker(&mut self, address: Address) -> Option<bool>;
+
+    /// Whether a creation in this block saved the code of `address`, empty
+    /// or not. rskj's block repository keeps what the block's transactions
+    /// write in a cache until the block ends (`RepositoryLocator
+    /// .startTrackingAt`, `MutableTrieCache`), where the code key of such a
+    /// contract holds the code saved, and an empty value hashes to
+    /// `keccak256("")` (`MutableTrieCache.getValueHash`). A contract whose
+    /// constructor is still running has the marker and no code yet.
+    fn code_saved_in_block(&self, address: Address) -> bool;
 }
 
 type RskDb = revm::database::WrapDatabaseRef<crate::database::RskDatabase>;
@@ -650,6 +662,10 @@ where
                 None
             }
         }
+    }
+
+    fn code_saved_in_block(&self, address: Address) -> bool {
+        self.chain.code_saved.contains(&address)
     }
 }
 

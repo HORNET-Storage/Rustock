@@ -836,6 +836,7 @@ where
         // Top-level CREATE transaction: rskj's TransactionExecutor.create never
         // bumps the nonce (even post-RSKIP125), so it stays 0.
         set_created_contract_nonce(evm, 0);
+        begin_creation(evm);
         skip_code_header(evm);
         self.open_frame(evm, false);
         evm.ctx().chain_mut().internal_txs.enter(None);
@@ -969,6 +970,7 @@ where
                             // created contract's nonce to 1; before, it is 0.
                             let nonce = u64::from(self.rskip125_active);
                             set_created_contract_nonce(evm, nonce);
+                            begin_creation(evm);
                             skip_code_header(evm);
                             self.open_frame(evm, creates);
                             // The program runs as that internal transaction,
@@ -1208,7 +1210,10 @@ struct Plain;
 impl<EVM> FrameDriver<EVM> for Plain
 where
     EVM: EvmTr<
-        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Context: ContextTr<
+            Chain = crate::raw_storage::RskChainExt,
+            Journal: JournalTr<State = EvmState>,
+        >,
         Frame = EthFrame<EthInterpreter>,
         Instructions: InstructionProvider<
             Context = <EVM as EvmTr>::Context,
@@ -1243,7 +1248,10 @@ struct Inspected;
 impl<EVM> FrameDriver<EVM> for Inspected
 where
     EVM: revm::inspector::InspectorEvmTr<
-        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Context: ContextTr<
+            Chain = crate::raw_storage::RskChainExt,
+            Journal: JournalTr<State = EvmState>,
+        >,
         Frame = EthFrame<EthInterpreter>,
     >,
 {
@@ -1486,7 +1494,10 @@ fn rsk_frame_run<EVM>(
 ) -> Result<FrameInitOrResult<EthFrame<EthInterpreter>>, ContextTrDbError<EVM::Context>>
 where
     EVM: EvmTr<
-        Context: ContextTr<Journal: JournalTr<State = EvmState>>,
+        Context: ContextTr<
+            Chain = crate::raw_storage::RskChainExt,
+            Journal: JournalTr<State = EvmState>,
+        >,
         Frame = EthFrame<EthInterpreter>,
         Instructions: InstructionProvider<
             Context = <EVM as EvmTr>::Context,
@@ -1520,7 +1531,7 @@ fn rsk_frame_return<CTX>(
     empty_create_on_unpayable_deposit: bool,
 ) -> FrameInitOrResult<EthFrame<EthInterpreter>>
 where
-    CTX: ContextTr<Journal: JournalTr<State = EvmState>>,
+    CTX: ContextTr<Chain = crate::raw_storage::RskChainExt, Journal: JournalTr<State = EvmState>>,
 {
     let mut interpreter_result = match action {
         InterpreterAction::NewFrame(frame_input) => {
@@ -1565,6 +1576,11 @@ where
                     &mut interpreter_result,
                     create.created_address,
                 );
+                // A creation that ends well saves its code
+                // (`RskChainExt::code_saved`).
+                if interpreter_result.result.is_ok() {
+                    ctx.chain_mut().code_saved.insert(create.created_address);
+                }
             }
             ItemOrResult::Result(FrameResult::Create(CreateOutcome::new(
                 interpreter_result,
@@ -1581,7 +1597,8 @@ where
 /// over-max-size code (0x6000, rskj Constants.MAX_CONTRACT_SIZE) leaves the
 /// contract with EMPTY code — without charging the deposit — while the
 /// constructor's state changes stay committed and the address is returned.
-fn rsk_return_create<CTX: ContextTr>(
+/// Only a creation that keeps its code saves it (`RskChainExt::code_saved`).
+fn rsk_return_create<CTX: ContextTr<Chain = crate::raw_storage::RskChainExt>>(
     ctx: &mut CTX,
     checkpoint: revm::context_interface::journaled_state::JournalCheckpoint,
     interpreter_result: &mut revm::interpreter::InterpreterResult,
@@ -1598,7 +1615,8 @@ fn rsk_return_create<CTX: ContextTr>(
     let deposit = cfg.gas_params().code_deposit_cost(code_len);
     // Short-circuit keeps the deposit uncharged in the oversize case, like
     // rskj (the exception set by either check skips spendGas + saveCode).
-    if oversize || !interpreter_result.gas.record_cost(deposit) {
+    let unsaved = oversize || !interpreter_result.gas.record_cost(deposit);
+    if unsaved {
         interpreter_result.output = Bytes::new();
     }
 
@@ -1608,6 +1626,9 @@ fn rsk_return_create<CTX: ContextTr>(
         revm::state::Bytecode::new_legacy(interpreter_result.output.clone()),
     );
     interpreter_result.result = InstructionResult::Return;
+    if !unsaved {
+        ctx.chain_mut().code_saved.insert(address);
+    }
 }
 
 /// Divergence-hunt diagnostic (env-gated): log every sub-frame's input and
@@ -1845,6 +1866,22 @@ where
     if let Ok(mut acc) = evm.ctx().journal_mut().load_account_mut(created_address) {
         acc.set_nonce(nonce);
     }
+}
+
+/// A creation's frame has opened (the top one): its contract has no code
+/// saved until the creation ends, whatever a creation at the address before
+/// it saved and a failure took back (`RskChainExt::code_saved`).
+fn begin_creation<EVM>(evm: &mut EVM)
+where
+    EVM: EvmTr<
+        Context: ContextTr<Chain = crate::raw_storage::RskChainExt>,
+        Frame = EthFrame<EthInterpreter>,
+    >,
+{
+    let FrameData::Create(CreateFrame { created_address }) = evm.frame_stack().get().data else {
+        return;
+    };
+    evm.ctx().chain_mut().code_saved.remove(&created_address);
 }
 
 /// rskj's code header (`Program.processAndSkipCodeHeader`, which

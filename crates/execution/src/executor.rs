@@ -15880,17 +15880,23 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
     /// FRCR-279: before RSKIP169 (iris300) rskj's EXTCODEHASH answers a
     /// contract whose code key holds nothing with 0 (`getCodeHashNonStandard`),
     /// and from it with `keccak256("")`, as any account without code. A
-    /// contract is an account with the marker `setupContract` writes: here
-    /// one made with no code in the same transaction, one made earlier in the
-    /// block and one from before it. An account without the marker answers
-    /// `keccak256("")` either way -- one a creation with no data made too,
-    /// as rskj's `TransactionExecutor.create` doesn't call `setupContract` for
-    /// it -- and an address with no account 0.
+    /// contract is an account with the marker `setupContract` writes. The key
+    /// of one made with no code before the block holds nothing. But the
+    /// block's repository keeps what its transactions write in a cache until
+    /// the block ends (`RepositoryLocator.startTrackingAt`, `MutableTrieCache`),
+    /// and there the key of a contract made with no code in the block holds
+    /// the empty code its creation saved, which hashes to `keccak256("")`
+    /// (`MutableTrieCache.getValueHash`; rskj's
+    /// `ExtCodeHashDslTest.invokeEXTCodeHASHWithCacheEmptyDeploy`): here one
+    /// made in the same transaction, and one made earlier in the block. An
+    /// account without the marker answers `keccak256("")` either way -- one
+    /// a creation with no data made too, as rskj's `TransactionExecutor.create`
+    /// doesn't call `setupContract` for it -- and an address with no account 0.
     ///
     /// The contract made with no code keeps its marker, too, though a later
     /// transaction loads it again, which drops revm's flag for a creation.
     #[test]
-    fn extcodehash_of_a_contract_without_code_is_0_before_rskip169() {
+    fn extcodehash_of_a_contract_without_code_before_rskip169_reads_the_blocks_cache() {
         let one_rbtc = U256::from(10u64).pow(U256::from(18));
         let sender = Address::repeat_byte(0xAC);
         // Probe: SSTORE(addr, EXTCODEHASH(addr) + 1), the address its calldata.
@@ -15959,14 +15965,10 @@ bf09f6e52420834e8e0e0b1a6df563aba550cf7f99e9724264187c45dcf3d73e8585a0e35196\
             let probed = |target: &Address| slot(&probe, U256::from_be_slice(target.as_slice()));
             assert_eq!(
                 slot(&maker, U256::ZERO),
-                contract,
+                empty,
                 "#{number}: made in this transaction"
             );
-            assert_eq!(
-                probed(&made),
-                contract,
-                "#{number}: made earlier in the block"
-            );
+            assert_eq!(probed(&made), empty, "#{number}: made earlier in the block");
             assert_eq!(
                 probed(&codeless),
                 contract,

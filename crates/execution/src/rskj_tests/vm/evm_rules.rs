@@ -6,14 +6,16 @@
 use alloy_primitives::{keccak256, Address, B256, U256};
 
 use super::harness::{
-    call, compile, push_address, return_top, run_code, words, Chain, CONTRACT, GAS, ONE_RBTC,
-    SENDER,
+    call, compile, create, push_address, return_top, run_code, words, Chain, CONTRACT, GAS,
+    ONE_RBTC, SENDER,
 };
 
 /// orchid on mainnet: RSKIP91.
 const ORCHID: u64 = 729_000;
 /// wasabi100 on mainnet: RSKIP125.
 const WASABI: u64 = 1_591_000;
+/// papyrus200 on mainnet: RSKIP140.
+const PAPYRUS: u64 = 2_392_700;
 /// iris300 on mainnet.
 const IRIS: u64 = 3_614_800;
 /// The contract a case's contract calls.
@@ -279,4 +281,85 @@ fn before_rskip150_a_call_through_a_word_past_a_precompiles_address_is_refused_1
     let ran = chain.run(SENDER, call(0, CONTRACT, U256::ZERO, GAS, &[]));
     assert!(ran.success);
     assert_eq!(chain.storage(CONTRACT, 0), U256::from(1));
+}
+
+/// Before RSKIP169 rskj's EXTCODEHASH reads a contract's code key with
+/// `getCodeHashNonStandard`, which answers 0 where the key holds nothing. The
+/// block's repository keeps what its transactions write in a cache until the
+/// block ends (`RepositoryLocator.startTrackingAt`, `MutableTrieCache`), so
+/// the key of a contract made in the block with no code holds the empty code
+/// its creation saved, whose hash is keccak256("")
+/// (`MutableTrieCache.getValueHash`). But a creation before RSKIP453 whose
+/// code is past the limit keeps its contract and saves no code
+/// (`Program.finalizeContractCreation`), and its key holds nothing: 0. From
+/// RSKIP169 both answer keccak256("").
+#[test]
+fn before_rskip169_extcodehash_of_a_contract_made_in_the_block_reads_the_code_it_saved() {
+    let code = compile(
+        "PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 CREATE EXTCODEHASH \
+         PUSH6 0x6160016000f3 PUSH1 0x00 MSTORE \
+         PUSH1 0x06 PUSH1 0x1a PUSH1 0x00 CREATE EXTCODEHASH",
+    );
+    let code = [code, return_top(2)].concat();
+    let empty = U256::from_be_slice(keccak256([]).as_slice());
+    for (number, past_the_limit) in [(PAPYRUS, U256::ZERO), (IRIS - 1, U256::ZERO), (IRIS, empty)] {
+        let ran = run_code(number, &code);
+        assert!(ran.success, "#{number}");
+        assert_eq!(words(&ran.output), [past_the_limit, empty], "#{number}");
+    }
+}
+
+/// A creation transaction saves its code too, empty or not
+/// (`TransactionExecutor.createContract`): before RSKIP169 a later
+/// transaction of its block reads the empty value the cache holds,
+/// keccak256(""), and one of the block after reads the trie, whose key holds
+/// nothing: 0.
+#[test]
+fn before_rskip169_extcodehash_of_a_contract_a_transaction_made_without_code_reads_its_block() {
+    let probe = [
+        compile("PUSH1 0x00 CALLDATALOAD EXTCODEHASH"),
+        return_top(1),
+    ]
+    .concat();
+    let made = SENDER.create(0).into_word();
+    let mut chain = Chain::mainnet(PAPYRUS);
+    chain.put(SENDER, 0, ONE_RBTC, &[]);
+    chain.put(CONTRACT, 1, U256::ZERO, &probe);
+    let ran = chain.block(&[
+        (create(0, GAS, &[0x00]), SENDER),
+        (call(1, CONTRACT, U256::ZERO, GAS, made.as_slice()), SENDER),
+    ]);
+    assert!(ran.tx_results.iter().all(|tx| tx.success));
+    let empty = U256::from_be_slice(keccak256([]).as_slice());
+    assert_eq!(words(&ran.tx_results[1].output), [empty], "in its block");
+    let later = chain.run(SENDER, call(2, CONTRACT, U256::ZERO, GAS, made.as_slice()));
+    assert_eq!(words(&later.output), [U256::ZERO], "in the block after");
+}
+
+/// While its constructor runs a contract has rskj's marker and no code saved:
+/// before RSKIP169 EXTCODEHASH of it answers 0, from RSKIP169 keccak256("").
+/// So it does where a creation at the same address saved empty code earlier
+/// in the transaction, in a call that then failed and took it back. The
+/// contract calls itself to make that creation and revert, then makes the
+/// second, whose constructor stores EXTCODEHASH of its own address, plus one.
+#[test]
+fn before_rskip169_extcodehash_of_a_contract_whose_constructor_runs_is_0() {
+    let code = compile(
+        "CALLDATASIZE @inner JUMPI \
+         PUSH1 0x00 PUSH1 0x00 PUSH1 0x01 PUSH1 0x00 PUSH1 0x00 ADDRESS GAS CALL POP \
+         PUSH9 0x303f60010160005500 PUSH1 0x00 MSTORE \
+         PUSH1 0x09 PUSH1 0x17 PUSH1 0x00 CREATE STOP \
+         inner: PUSH1 0x00 PUSH1 0x00 PUSH1 0x00 CREATE POP PUSH1 0x00 PUSH1 0x00 REVERT",
+    );
+    let made = CONTRACT.create(1);
+    let empty = U256::from_be_slice(keccak256([]).as_slice());
+    for (number, while_it_runs) in [(PAPYRUS, U256::ZERO), (IRIS, empty)] {
+        let mut chain = Chain::mainnet(number);
+        chain.put(SENDER, 0, ONE_RBTC, &[]);
+        chain.put(CONTRACT, 1, U256::ZERO, &code);
+        let ran = chain.run(SENDER, call(0, CONTRACT, U256::ZERO, GAS, &[]));
+        assert!(ran.success, "#{number}");
+        let stored = chain.storage(made, 0);
+        assert_eq!(stored, while_it_runs + U256::from(1), "#{number}");
+    }
 }
