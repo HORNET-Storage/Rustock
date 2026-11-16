@@ -226,10 +226,11 @@ impl HeaderVerifier {
     ///
     /// Note: `ParentHashRule` is intentionally **not** included here because
     /// the sync pipeline looks up the parent by `header.parent_hash`, so
-    /// finding it in the store already proves hash consistency.  Including the
-    /// rule would break for the genesis block, whose canonical hash is derived
-    /// from Java's non-canonical RLP encoding (leading zeros in difficulty)
-    /// and cannot be reproduced by our standard `Header::hash()`.
+    /// finding it in the store already proves hash consistency. A store keys
+    /// a header by the hash it came with, and block 0 is the one header that
+    /// ever read back to another: in a store written before it kept its
+    /// difficulty's bytes as the genesis file writes them, which the node
+    /// writes again when it opens one.
     pub fn default_rsk(config: std::sync::Arc<crate::config::ChainConfig>) -> Self {
         let mut verifier = Self::new()
             .with_static_rule(GasUsedRule)

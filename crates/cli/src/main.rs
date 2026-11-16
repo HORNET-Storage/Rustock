@@ -2228,6 +2228,9 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
 
     let genesis_hash = setup_genesis(&store, &config)?;
     info!("Genesis Hash: {:?}", genesis_hash);
+    if !read_only && rewrite_old_genesis(&store, &config, genesis_hash)? {
+        info!("Block 0 written again, with its difficulty as its genesis file writes it");
+    }
 
     let verifier = Arc::new(HeaderVerifier::default_rsk(config.clone()));
     // The manager takes ownership below; snapshot sync needs the same rules.
@@ -4376,6 +4379,35 @@ fn setup_genesis(store: &BlockStore, config: &ChainConfig) -> Result<alloy_primi
     Ok(hash)
 }
 
+/// A store written before block 0 kept its difficulty as its genesis file
+/// writes it holds the block with the value's own bytes: read back, it
+/// hashes to another hash than its key, the network's genesis hash, and so
+/// does the copy of it a peer is sent. Such a block 0 is written again as
+/// the chain's own header, which hashes to that key. Returns whether it was.
+///
+/// Nothing is written where the chain's header is not this store's block 0,
+/// or where the store's reads back to its key already.
+fn rewrite_old_genesis(
+    store: &BlockStore,
+    config: &ChainConfig,
+    hash: alloy_primitives::B256,
+) -> Result<bool> {
+    // Under the chain's own heights, which a header's hash depends on.
+    let genesis = config
+        .genesis_header()
+        .with_activations(&config.activation_heights);
+    if genesis.hash() != hash {
+        return Ok(false);
+    }
+    match store.header(hash)? {
+        Some(stored) if stored.hash() != hash => {
+            store.put_header_with_hash(hash, &genesis)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 /// A block processor that holds a block to what every node holds it to: the
 /// chain's own constants, for the header rules an uncle meets, and fork
 /// detection on, as rskj runs `ForkDetectionDataRule` on every block it
@@ -5988,6 +6020,43 @@ mod genesis_tests {
         let m = build_genesis_state(&ChainConfig::mainnet(), &store_m).unwrap();
         let t = build_genesis_state(&ChainConfig::testnet(), &store_t).unwrap();
         assert_ne!(m.compute_hash(&store_m), t.compute_hash(&store_t));
+    }
+
+    /// A store from before block 0 kept its difficulty as its genesis file
+    /// writes it: its block 0 reads back to another hash than its key, the
+    /// network's genesis hash. `rewrite_old_genesis` writes the chain's header
+    /// in its place, once; a store whose block 0 reads back to its key is left
+    /// as it is, and so is one that holds another chain's.
+    #[test]
+    fn an_old_stores_block_0_is_written_again_to_read_back_to_its_hash() {
+        for config in [ChainConfig::mainnet(), ChainConfig::testnet()] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = BlockStore::open(dir.path())
+                .unwrap()
+                .with_activations(config.activation_heights.clone());
+            let hash = config.known_genesis_hash().unwrap();
+            let old = rustock_core::Header {
+                kept: None,
+                ..config.genesis_header()
+            }
+            .with_activations(&config.activation_heights);
+            store.put_header_with_hash(hash, &old).unwrap();
+            store.put_canonical_hash(0, hash).unwrap();
+            assert_ne!(store.header(hash).unwrap().unwrap().hash(), hash);
+
+            assert!(rewrite_old_genesis(&store, &config, hash).unwrap());
+            assert_eq!(store.header(hash).unwrap().unwrap().hash(), hash);
+            assert!(!rewrite_old_genesis(&store, &config, hash).unwrap(), "once");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = ChainConfig::mainnet();
+        let store = BlockStore::open(dir.path())
+            .unwrap()
+            .with_activations(config.activation_heights.clone());
+        let hash = setup_genesis(&store, &config).unwrap();
+        assert!(!rewrite_old_genesis(&store, &config, hash).unwrap());
+        assert!(!rewrite_old_genesis(&store, &ChainConfig::testnet(), hash).unwrap());
     }
 
     /// The node's block processor and its miner's are built by the same
