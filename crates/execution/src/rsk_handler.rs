@@ -133,7 +133,8 @@ invisible_exception: Arc<AtomicBool>,
     /// (`createAccount(addr, false)`), whose balance is lost. It writes it in
     /// the transaction's `cacheTrack`, which a creation that fails rolls back
     /// (`go`), so the old balance is taken in the creation's frame, which a
-    /// failure takes back. Only a block's run sets it (`with_rskip174`).
+    /// failure takes back. rskj's `create` runs so for a local call too, so
+    /// every run sets it (`with_rskip174`).
     deploy_overwrites: bool,
     /// Fail a transaction as it starts to run code. rskj can't build its
     /// program's invocation from the block's header

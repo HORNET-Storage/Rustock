@@ -538,6 +538,7 @@ impl RskExecutor {
             )
             .failing_programs(!header_fits_program_invoke(header))
             .with_rskip90(self.hardfork_cfg.has_rskip90(header.number))
+            .with_rskip174(self.hardfork_cfg.has_rskip174(header.number))
             .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
             .from_nobody(no_sender)
             .with_reached_sequential_only(reached_sequential_only.clone());
@@ -685,6 +686,7 @@ impl RskExecutor {
             )
             .failing_programs(!header_fits_program_invoke(header))
             .with_rskip90(self.hardfork_cfg.has_rskip90(header.number))
+            .with_rskip174(self.hardfork_cfg.has_rskip174(header.number))
             .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
             .with_reached_sequential_only(reached_sequential_only.clone());
             use revm::inspector::InspectorHandler;
@@ -888,6 +890,7 @@ impl RskExecutor {
             )
             .failing_programs(!header_fits_program_invoke(header))
             .with_rskip90(self.hardfork_cfg.has_rskip90(header.number))
+            .with_rskip174(self.hardfork_cfg.has_rskip174(header.number))
             .as_local_call(local_call, self.hardfork_cfg.has_rskip136(header.number))
             .from_nobody(no_sender)
             .with_reached_sequential_only(reached_sequential_only.clone());
@@ -4001,6 +4004,53 @@ mod tests {
             .execute_local_call(&header, &tx, sender, &root, store)
             .unwrap();
         assert!(local.success);
+    }
+
+    /// Before RSKIP174 (iris300) rskj's `create()` writes a creation's
+    /// account over one already at its address, for a local call and an
+    /// estimate as for a block's transaction (`createAccount`'s carry-over
+    /// is `RSKIP174 && isExist`, TransactionExecutor.java:403): a contract
+    /// that reads its own balance as it is created holds only the 7 it was
+    /// sent. From iris300 the 1,000 already there is carried over.
+    #[test]
+    fn before_rskip174_every_run_of_a_creation_holds_only_what_it_was_sent() {
+        let sender = Address::repeat_byte(0x5F);
+        let store = Arc::new(MemoryTrieStore::new());
+        let ether = U256::from(10u64).pow(U256::from(18));
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &sender, 0, ether);
+        let root = put_account(
+            &root,
+            store.as_ref(),
+            &sender.create(0),
+            0,
+            U256::from(1_000),
+        );
+        // ADDRESS BALANCE, returned as the contract's code.
+        let init = vec![0x30, 0x31, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+        let tx = unsigned_tx(0, None, 7, 1_000_000, init);
+        let executor = mainnet_executor();
+        for (number, holds) in [(3_614_799u64, 7u64), (3_614_800, 1_007)] {
+            let header = dummy_header(number);
+            let holds = U256::from(holds);
+            let local = executor
+                .execute_local_call(&header, &tx, sender, &root, store.clone())
+                .unwrap();
+            let read = U256::from_be_slice(&local.output);
+            assert_eq!(read, holds, "a local call at #{number}");
+            let (traced, _) = executor
+                .execute_tx_traced(&header, &tx, sender, &root, store.clone(), true, 0)
+                .unwrap();
+            let read = U256::from_be_slice(&traced.output);
+            assert_eq!(read, holds, "a trace at #{number}");
+            let (estimated, _) = executor
+                .execute_tx_for_estimate(&header, &tx, sender, &root, store.clone(), true)
+                .unwrap();
+            assert_eq!(
+                U256::from_be_slice(&estimated.output),
+                holds,
+                "an estimate at #{number}"
+            );
+        }
     }
 
     /// A local call leaves its sender's nonce as it found it (`execute()`,
