@@ -338,6 +338,15 @@ impl Chain {
             .map_or(U256::ZERO, |account| account.balance)
     }
 
+    /// The code at `address`: none where there is none.
+    pub(crate) fn code(&self, address: Address) -> Vec<u8> {
+        let key = rustock_trie::code_key(&address);
+        let code = self
+            .root
+            .get(&TrieKeySlice::from_key(&key), self.store.as_ref());
+        code.map(|code| code.to_vec()).unwrap_or_default()
+    }
+
     /// The word at `slot` of `address`'s storage: zero where none is.
     pub(crate) fn storage(&self, address: Address, slot: u64) -> U256 {
         self.storage_word(address, U256::from(slot))
