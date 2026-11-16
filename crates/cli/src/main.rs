@@ -2742,21 +2742,9 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         None
     };
 
-    // The same chain configuration the header verifier uses: an uncle is
-    // held to the rules a header is, on this chain's constants.
-    //
-    // Fork detection on, as rskj runs `ForkDetectionDataRule` on every block
-    // it imports and on every uncle. It reads the 449 headers below each
-    // one's parent: a few milliseconds a block, which a node following the
-    // chain can spare and a bulk replay -- the reason it is a switch at all --
-    // turns off for itself. The headers are here: the walk writes those under
-    // the checkpoint, and pruning keeps thousands more than 449.
-    let mut block_processor = rustock_execution::BlockProcessor::new(
-        hardfork_cfg.clone(),
-        store.clone(),
-    )
-    .with_chain_config(config.clone())
-    .with_fork_detection_validation(true);
+    // The same chain configuration the header verifier uses, and fork
+    // detection on: see `rule_keeping_processor`.
+    let mut block_processor = rule_keeping_processor(&hardfork_cfg, &store, &config);
     if let Some(cache) = &btc_block_cache {
         block_processor = block_processor.with_btc_block_cache(cache.clone());
     }
@@ -3578,14 +3566,15 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             min_gas_price_target: args.mining_min_gas_price.map(alloy_primitives::U256::from),
             ..Default::default()
         };
-        // The miner's processor is wired like the node's: the same caches,
-        // threads and, on a chain from an rskj genesis file, rskj's regtest
-        // Bridge constants. A bare processor here ran REMASC against the
-        // built-in federation, so the first payout (block 15 on regtest)
-        // reached a state root no node with the right constants reproduces.
-        let mut miner_processor =
-            rustock_execution::BlockProcessor::new(hardfork_cfg.clone(), store.clone())
-                .with_chain_config(config.clone());
+        // The miner's processor is wired like the node's: the same rules
+        // (`rule_keeping_processor`), caches, threads and, on a chain from an
+        // rskj genesis file, rskj's regtest Bridge constants. A bare
+        // processor here ran REMASC against the built-in federation, so the
+        // first payout (block 15 on regtest) reached a state root no node
+        // with the right constants reproduces; and one without fork
+        // detection let the miner name an uncle, or store a block of its
+        // own, that the node's processor refuses.
+        let mut miner_processor = rule_keeping_processor(&hardfork_cfg, &store, &config);
         if let Some(cache) = &btc_block_cache {
             miner_processor = miner_processor.with_btc_block_cache(cache.clone());
         }
@@ -4385,6 +4374,28 @@ fn setup_genesis(store: &BlockStore, config: &ChainConfig) -> Result<alloy_primi
     store.put_canonical_hash(0, hash)?;
     store.set_head(hash)?;
     Ok(hash)
+}
+
+/// A block processor that holds a block to what every node holds it to: the
+/// chain's own constants, for the header rules an uncle meets, and fork
+/// detection on, as rskj runs `ForkDetectionDataRule` on every block it
+/// imports and on every uncle. The node's processor and the miner's are both
+/// built from it, so a block this node mines meets the rules a peer's does
+/// (rskj connects both through `blockchain.tryToConnect`).
+///
+/// Fork detection reads the 449 headers below each block's parent: a few
+/// milliseconds a block, which a node following the chain can spare and a
+/// bulk replay -- the reason it is a switch at all -- turns off for itself.
+/// The headers are here: the walk writes those under the checkpoint, and
+/// pruning keeps thousands more than 449.
+fn rule_keeping_processor(
+    hardfork_cfg: &rustock_execution::RskHardforkConfig,
+    store: &Arc<BlockStore>,
+    config: &Arc<ChainConfig>,
+) -> rustock_execution::BlockProcessor {
+    rustock_execution::BlockProcessor::new(hardfork_cfg.clone(), store.clone())
+        .with_chain_config(config.clone())
+        .with_fork_detection_validation(true)
 }
 
 /// Runs an rskj database import and returns; the node is not started.
@@ -5977,6 +5988,18 @@ mod genesis_tests {
         let m = build_genesis_state(&ChainConfig::mainnet(), &store_m).unwrap();
         let t = build_genesis_state(&ChainConfig::testnet(), &store_t).unwrap();
         assert_ne!(m.compute_hash(&store_m), t.compute_hash(&store_t));
+    }
+
+    /// The node's block processor and its miner's are built by the same
+    /// function, and it turns fork detection on: a block this node mines, and
+    /// the uncles it names, meet the rule a peer's block meets.
+    #[test]
+    fn the_processor_the_node_and_its_miner_run_checks_fork_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+        let config = Arc::new(ChainConfig::regtest());
+        let (ladder, _) = hardfork_config(&config).unwrap();
+        assert!(rule_keeping_processor(&ladder, &store, &config).validates_fork_detection());
     }
 }
 
