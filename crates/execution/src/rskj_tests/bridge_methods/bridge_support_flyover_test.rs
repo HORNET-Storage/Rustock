@@ -447,6 +447,33 @@ fn from_rskip293_outputs_to_other_addresses_are_passed_over() {
     }
 }
 
+/// From RSKIP293 the wallet reads an output through bitcoinj-thin's
+/// `TransactionOutput.isMine` and `isWatched`, which catch the
+/// `ScriptException` of a script that doesn't parse and pass the output over:
+/// a payment with such an output beside the one to the active federation's
+/// Flyover address is registered for what it sends there. Before RSKIP293
+/// rskj reads that output as an address, bitcoinj throws, and the method
+/// answers GENERIC_ERROR. The outputs that don't parse: an OP_PUSHDATA1 with
+/// no length after it, and a push of two bytes with one.
+#[test]
+fn from_rskip293_an_output_whose_script_does_not_parse_is_passed_over() {
+    for net in [Net::Regtest, Net::Mainnet] {
+        for unparseable in [vec![0x4c], vec![0x02, 0x01]] {
+            let outputs = |active: &[u8], _: &[u8]| {
+                vec![(COIN, active.to_vec()), (COIN, unparseable.clone())]
+            };
+            let registered = send_to_any_address(net, true, outputs);
+            assert_eq!(
+                uint_of(&registered),
+                wei(COIN),
+                "{net:?} {unparseable:02x?}"
+            );
+            let before = send_to_any_address(net, false, outputs);
+            assert_eq!(int_of(&before), GENERIC_ERROR, "{net:?} {unparseable:02x?}");
+        }
+    }
+}
+
 /// rskj's `registerFlyoverBtcTransaction_multiple_output_to_random_addresses_*`:
 /// a payment to other addresses alone sends the federations nothing.
 #[test]

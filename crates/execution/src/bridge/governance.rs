@@ -1931,6 +1931,68 @@ mod tests {
         assert_eq!(old_format(&mut ctx), serialization::rlp_encode_u64(4000));
     }
 
+    /// From RSKIP377 a handover keeps, as the last retired federation's script,
+    /// the output script of its members' multisig, the default branch of its
+    /// ERP script, P2SH-P2WSH for a P2SH-P2WSH federation
+    /// (`FederationSupportImpl.getFederationMembersP2SHScript`,
+    /// `ErpFederation.getDefaultP2SHScript`), where before RSKIP377 it kept the
+    /// federation's own. rskj's regtest genesis federation, a P2SH-P2WSH ERP
+    /// one, handed over both ways: the legacy commit, between fingerroot500 and
+    /// lovell700, and RSKIP419's of a proposed federation.
+    #[test]
+    fn from_rskip377_the_last_retired_script_is_its_members_multisigs() {
+        use bitcoin::hashes::Hash as _;
+        use revm::MainContext;
+        let config = super::super::constants::BridgeConstants::rskj_regtest();
+        let hardforks = crate::hardfork::RskHardforkConfig::mainnet();
+        let ctx_at = |block: u64| {
+            revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default())
+        };
+        let genesis = super::super::peg::genesis_federation_keys(&config);
+        let multisig =
+            super::super::peg::build_federation_redeem_script(&genesis, genesis.len() / 2 + 1);
+        let witness_program = [
+            &[0x00, 0x20][..],
+            &bitcoin::hashes::sha256::Hash::hash(&multisig).to_byte_array(),
+        ]
+        .concat();
+        let members_script = super::super::peg::p2sh_output_script_program(
+            &super::super::peg::redeem_script_hash160_pub(&witness_program),
+        );
+        let expected =
+            serialization::rlp_encode_list(&[serialization::rlp_encode_element(&members_script)]);
+        let members: Vec<StoredMember> = super::super::peg::genesis_federation_keys(
+            &super::super::constants::BridgeConstants::testnet(),
+        )
+        .into_iter()
+        .map(StoredMember::from_btc)
+        .collect();
+        let retired =
+            |ctx: &mut _| bridge_load_bytes_named(ctx, LAST_RETIRED_FEDERATION_P2SH_SCRIPT_KEY);
+
+        let block = 6_000_000u64;
+        assert!(hardforks.has_rskip377(block) && !hardforks.has_rskip419(block));
+        let mut ctx = ctx_at(block);
+        commit_pending_federation(&mut ctx, &members, &config, &hardforks);
+        assert_eq!(retired(&mut ctx), expected, "the legacy commit");
+
+        let block = 7_400_000u64;
+        assert!(hardforks.has_rskip419(block));
+        let mut ctx = ctx_at(block);
+        bridge_store_bytes_named(
+            &mut ctx,
+            PROPOSED_FEDERATION_KEY,
+            &super::super::federation::serialize_federation_multikey(&members, 1_000, block - 10),
+        );
+        commit_proposed_federation(&mut ctx, &config, &hardforks);
+        assert_eq!(retired(&mut ctx), expected, "a proposed federation's");
+    }
+
     /// rskj answers `getActivePowpegRedeemScript` with the active federation's
     /// redeem script (`FederationSupportImpl.getActiveFederationRedeemScript`),
     /// where rustock answered no bytes at all. The vectors are RSKj's public
@@ -2264,6 +2326,19 @@ mod tests {
         assert!(size(largest + 1) > 486);
         assert_eq!(votes(p2sh_erp, largest), committed);
         assert_eq!(votes(p2sh_erp, largest + 1), thrown);
+
+        // From Reed a federation is a P2SH-P2WSH one, its redeem script in a
+        // witness, where 20 members' fits: 20 keys and no more.
+        let p2sh_p2wsh = 8_100_000;
+        assert_eq!(federation_format_version(&cfg, p2sh_p2wsh), 4000);
+        let mut keys: Vec<[u8; 33]> = (0..20).map(|i| member(i).btc).collect();
+        keys.sort();
+        let redeem = super::super::peg::build_committed_federation_redeem_script(
+            &keys, &config, &cfg, p2sh_p2wsh,
+        );
+        assert!(redeem.len() <= 3600 - 34);
+        assert_eq!(votes(p2sh_p2wsh, 20), committed);
+        assert_eq!(votes(p2sh_p2wsh, 21), thrown);
     }
 
     /// A Bridge call that reads the whitelist writes it back as the call
