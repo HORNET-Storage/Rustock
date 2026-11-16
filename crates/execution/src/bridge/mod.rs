@@ -1039,7 +1039,9 @@ fn execute_method<CTX: crate::RskContextTr>(
         "getActivePowpegRedeemScript" => {
             governance::get_active_powpeg_redeem_script(ctx, gas_cost, config, hardfork_cfg)
         }
-        "getActiveFederationCreationBlockHeight" => governance::get_active_federation_creation_block_height(ctx, gas_cost),
+        "getActiveFederationCreationBlockHeight" => {
+            governance::get_active_federation_creation_block_height(ctx, gas_cost, config, hardfork_cfg)
+        }
         "getNextPegoutCreationBlockNumber" => peg::get_next_pegout_creation_block_number(ctx, gas_cost),
         "getQueuedPegoutsCount" => peg::get_queued_pegouts_count(ctx, gas_cost),
         "getEstimatedFeesForNextPegOutEvent" => {

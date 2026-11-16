@@ -1373,12 +1373,28 @@ pub fn get_active_powpeg_redeem_script<CTX: crate::RskContextTr>(
     ))
 }
 
-/// `getActiveFederationCreationBlockHeight()` → uint256
+/// `getActiveFederationCreationBlockHeight()` → uint256: rskj
+/// `FederationSupportImpl.getActiveFederationCreationBlockHeight` (RSKIP186).
+/// Once the block run is the activation age past the next federation's
+/// creation block, that block, though no `updateCollections` has moved it to
+/// the active federation's cell yet; until then the active federation's, or 0
+/// where neither is stored.
 pub fn get_active_federation_creation_block_height<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
+    config: &super::constants::BridgeConstants,
+    hardfork_cfg: &crate::hardfork::RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    let val = bridge_load_u256(ctx, ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY);
+    let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
+    let val = if !hardfork_cfg.has_rskip186(block_number) {
+        U256::ZERO
+    } else {
+        let activation_age = federation_activation_age(config, hardfork_cfg, block_number);
+        match get_next_federation_creation_block_height(ctx) {
+            Some(next) if block_number >= next.saturating_add(activation_age) => U256::from(next),
+            _ => bridge_load_u256(ctx, ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY),
+        }
+    };
     let output = val.to_be_bytes::<32>();
     Ok(PrecompileOutput::new(gas_cost, output.to_vec().into()))
 }

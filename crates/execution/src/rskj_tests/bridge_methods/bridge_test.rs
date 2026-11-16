@@ -1243,6 +1243,81 @@ fn the_active_federation_creation_block_height_is_read_from_iris300() {
     assert_eq!(int_of(&bridge.answer(&data)), 1);
 }
 
+/// rskj's `FederationSupportImplTest.getActiveFederationCreationBlockHeight_with…`:
+/// from the block that is the activation age past the next federation's
+/// creation block, the answer is that block, though no `updateCollections`
+/// has moved it to the active federation's cell yet; before, the active
+/// federation's, or 0 where neither is stored. On mainnet, at hop400's
+/// activation age (18,500 blocks) and at fingerroot500's (40,320).
+#[test]
+fn the_active_federation_creation_block_height_is_the_next_ones_from_its_activation_age() {
+    use crate::bridge::serialization::rlp_encode_u64;
+    use crate::bridge::storage::{
+        bridge_store_bytes_named, ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY,
+        NEXT_FEDERATION_CREATION_BLOCK_HEIGHT_KEY,
+    };
+    let data = selector_only("getActiveFederationCreationBlockHeight()");
+    let answer = |number: u64, next: Option<u64>, active: Option<u64>| {
+        let mut bridge = Bridge::new(
+            RskHardforkConfig::mainnet(),
+            BridgeConstants::mainnet(),
+            number,
+        );
+        for (key, height) in [
+            (NEXT_FEDERATION_CREATION_BLOCK_HEIGHT_KEY, next),
+            (ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY, active),
+        ] {
+            if let Some(height) = height {
+                bridge_store_bytes_named(&mut bridge.ctx, key, &rlp_encode_u64(height));
+            }
+        }
+        int_of(&bridge.answer(&data))
+    };
+    let next = 4_700_000;
+    assert_eq!(answer(next + 18_499, Some(next), None), 0);
+    assert_eq!(answer(next + 18_499, Some(next), Some(1)), 1);
+    assert_eq!(answer(next + 18_500, Some(next), None), 4_700_000);
+    assert_eq!(answer(next + 18_500, Some(next), Some(1)), 4_700_000);
+    let next = 5_500_000;
+    assert_eq!(answer(next + 18_500, Some(next), Some(1)), 1);
+    assert_eq!(answer(next + 40_319, Some(next), None), 0);
+    assert_eq!(answer(next + 40_320, Some(next), Some(1)), 5_500_000);
+    assert_eq!(answer(next, None, None), 0);
+    assert_eq!(answer(next, None, Some(1)), 1);
+}
+
+/// rskj's `FederationSupportImplTest.getActiveFederationCreationBlockHeight_beforeRSKIP186_returnsZero`:
+/// before RSKIP-186 the federation support answers 0, whatever is stored. The
+/// Bridge has the method only from RSKIP-186, so this asks the federation
+/// support itself, on mainnet at block 3,000,000, before Iris.
+#[test]
+fn before_rskip186_the_active_federation_creation_block_height_is_zero() {
+    use crate::bridge::serialization::rlp_encode_u64;
+    use crate::bridge::storage::{
+        bridge_store_bytes_named, ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY,
+        NEXT_FEDERATION_CREATION_BLOCK_HEIGHT_KEY,
+    };
+    let mut bridge = Bridge::new(
+        RskHardforkConfig::mainnet(),
+        BridgeConstants::mainnet(),
+        3_000_000,
+    );
+    for (key, height) in [
+        (NEXT_FEDERATION_CREATION_BLOCK_HEIGHT_KEY, 1_000_000),
+        (ACTIVE_FEDERATION_CREATION_BLOCK_HEIGHT_KEY, 1),
+    ] {
+        bridge_store_bytes_named(&mut bridge.ctx, key, &rlp_encode_u64(height));
+    }
+    let output = crate::bridge::governance::get_active_federation_creation_block_height(
+        &mut bridge.ctx,
+        3_000,
+        &BridgeConstants::mainnet(),
+        &RskHardforkConfig::mainnet(),
+    )
+    .expect("an answer");
+    assert_eq!(output.bytes.as_ref(), &[0u8; 32][..]);
+}
+
 fn flyover_data(refund: &[u8], lbc: Address, lp: &[u8]) -> Vec<u8> {
     call_data(
         "registerFastBridgeBtcTransaction(bytes,uint256,bytes,bytes32,bytes,address,bytes,bool)",
