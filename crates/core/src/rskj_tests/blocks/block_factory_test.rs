@@ -191,10 +191,6 @@ fn decoded_genesis(heights: &ActivationHeights) -> Header {
 /// `GenesisHeader`, which writes its difficulty back as the bytes it was
 /// read from, `0x0000100000` here, and hashes those.
 #[test]
-#[ignore = "rskj reads block 0 as a GenesisHeader, which hashes the difficulty as the bytes it \
-            read, 0x0000100000 here; rustock's decoder hashes it without the leading zeros, so \
-            a block 0 it reads from bytes hashes otherwise (each chain's genesis hash is held in \
-            its config instead)"]
 fn the_genesis_block_reads_to_its_hash() {
     let genesis = decoded_genesis(&heights(|h| h.orchid = 0));
     let expected: B256 = "0xcabb7fbe88cd6d922042a32ffc08ce8b1fbb37d650b9d4e7dbfe2a7469adfa42"
@@ -204,17 +200,25 @@ fn the_genesis_block_reads_to_its_hash() {
 }
 
 /// rskj `genesisHasVersion0`: with no rule on, the genesis block reads as a
-/// version-0 header, with the fields of testnet's genesis.
+/// version-0 header, with the fields of testnet's genesis, its difficulty
+/// held as the bytes it came as.
 #[test]
 fn the_genesis_block_reads_as_testnets_version_0_genesis() {
     let genesis = decoded_genesis(&heights(|_| {}));
+    let testnet = ChainConfig::testnet().genesis_header();
     assert_eq!(genesis.version_fields, None);
+    let difficulty = |header: &Header| header.kept().and_then(|kept| kept.difficulty.clone());
+    assert_eq!(difficulty(&genesis), Some(hex!("0000100000").into()));
+    assert_eq!(difficulty(&genesis), difficulty(&testnet));
     assert_eq!(
         Header {
             kept: None,
             ..genesis
         },
-        ChainConfig::testnet().genesis_header()
+        Header {
+            kept: None,
+            ..testnet
+        }
     );
 }
 

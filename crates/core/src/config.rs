@@ -460,7 +460,7 @@ impl ChainConfig {
                 bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from_static(&[0x00])),
                 cached_hash: None,
                 cached_hash_for_merged_mining: None,
-                kept: None,
+                kept: Self::genesis_difficulty_as_written(),
             },
             // rskj's `orchid-testnet.json`, with what `GenesisLoaderImpl` and
             // `GenesisHeader` fill in: the uncles' hash and the two roots.
@@ -489,7 +489,7 @@ impl ChainConfig {
                 bitcoin_merged_mining_coinbase_transaction: Some(Bytes::from_static(&[0x00])),
                 cached_hash: None,
                 cached_hash_for_merged_mining: None,
-                kept: None,
+                kept: Self::genesis_difficulty_as_written(),
             },
             _ => Header {
                 parent_hash: B256::ZERO,
@@ -531,6 +531,17 @@ impl ChainConfig {
                 kept: None,
             },
         }
+    }
+
+    /// Mainnet's and testnet's genesis files write the difficulty
+    /// `0x0000100000`, and rskj's `GenesisHeader` writes it back, and hashes
+    /// it, as written: kept, so that the genesis written to the store reads
+    /// back with the network's genesis hash.
+    fn genesis_difficulty_as_written() -> Option<Box<crate::types::header::KeptFields>> {
+        Some(Box::new(crate::types::header::KeptFields {
+            difficulty: Some(Bytes::from_static(&hex_literal::hex!("0000100000"))),
+            ..Default::default()
+        }))
     }
 
 /// The ten accounts rskj's regtest genesis funds, in its own order.
@@ -1018,6 +1029,30 @@ mod tests {
             ..file.header()
         };
         assert_eq!(genesis, as_rskj_builds_it);
+    }
+
+    /// Mainnet's and testnet's genesis headers hash to the networks' genesis
+    /// hashes, and so do they as this node writes them to its store and reads
+    /// them back: rskj's `GenesisHeader` hashes the difficulty as the genesis
+    /// file writes it, `0x0000100000`.
+    #[test]
+    fn the_stored_genesis_reads_back_with_the_networks_genesis_hash() {
+        use crate::types::header::HeaderForm;
+        for (config, heights) in [
+            (ChainConfig::mainnet(), ActivationHeights::mainnet()),
+            (ChainConfig::testnet(), ActivationHeights::testnet()),
+        ] {
+            let genesis = config.genesis_header();
+            let known = config.known_genesis_hash().unwrap();
+            assert_eq!(genesis.clone().with_activations(&heights).hash(), known);
+            let read = Header::decode_in(
+                &mut genesis.encode_stored().as_slice(),
+                &heights,
+                HeaderForm::Stored,
+            )
+            .unwrap();
+            assert_eq!(read.hash(), known, "chain {}", config.chain_id);
+        }
     }
 
     #[test]

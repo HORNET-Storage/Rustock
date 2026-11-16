@@ -124,11 +124,9 @@ impl GenesisSpec {
         Ok(Self {
             parent_hash: B256::try_from(field("parentHash")?.as_slice())
                 .context("parentHash is not 32 bytes")?,
-            coinbase: if coinbase.is_empty() {
-                Address::ZERO
-            } else {
-                Address::try_from(coinbase.as_slice()).context("coinbase is not 20 bytes")?
-            },
+            // rskj's `new RskAddress(bytes)` throws on any other length, none
+            // included.
+            coinbase: Address::try_from(coinbase.as_slice()).context("coinbase is not 20 bytes")?,
             timestamp: u64::try_from(timestamp).context("timestamp out of range")?,
             extra_data: Bytes::from(field("extraData")?),
             gas_limit: u256_from_be(&field("gasLimit")?)?,
@@ -165,6 +163,13 @@ impl GenesisSpec {
             || !self.bitcoin_merged_mining_coinbase_transaction.is_empty()
     }
 
+    /// The gas limit as rskj's `GenesisHeader` holds it: the file's value
+    /// (`ByteUtil.byteArrayToLong`, then `longToBytes`) without leading
+    /// zeros, and one zero byte for zero (`ByteUtil.stripLeadingZeroes`).
+    fn gas_limit_bytes(&self) -> Vec<u8> {
+        crate::types::header::strip_leading_zeroes(&self.gas_limit.to_be_bytes::<32>()).to_vec()
+    }
+
     /// The genesis hash, as rskj's `GenesisHeader.getEncoded` produces it: a
     /// version-0 header with the difficulty bytes as given and RSKIP92's
     /// encoding (only the merged-mining header, no proof or coinbase), which
@@ -173,21 +178,17 @@ impl GenesisSpec {
         let mut list = Vec::new();
         self.parent_hash.encode(&mut list);
         EMPTY_LIST_HASH.encode(&mut list);
-        if self.coinbase == Address::ZERO {
-            // RLP.encodeRskAddress: the zero address is an empty element.
-            list.push(0x80);
-        } else {
-            self.coinbase.encode(&mut list);
-        }
+        // `new RskAddress(bytes)` holds the file's 20 bytes, and
+        // `RLP.encodeRskAddress` writes them: only the null address, of no
+        // bytes, is written empty, and the zero address is not it.
+        self.coinbase.encode(&mut list);
         self.state_root.unwrap_or_default().encode(&mut list);
         EMPTY_TRIE_HASH.encode(&mut list);
         EMPTY_TRIE_HASH.encode(&mut list);
         alloy_primitives::Bloom::ZERO.encode(&mut list);
         self.difficulty_bytes.encode(&mut list);
         0u64.encode(&mut list); // number
-        let gas_limit = self.gas_limit.to_be_bytes::<32>();
-        let start = gas_limit.iter().position(|b| *b != 0).unwrap_or(32);
-        gas_limit[start..].encode(&mut list);
+        self.gas_limit_bytes().as_slice().encode(&mut list);
         0u64.encode(&mut list); // gasUsed
         self.timestamp.encode(&mut list);
         self.extra_data.encode(&mut list);
@@ -213,11 +214,21 @@ impl GenesisSpec {
         alloy_primitives::keccak256(&out)
     }
 
-    /// The genesis header, carrying [`GenesisSpec::hash`]: it cannot be
-    /// recomputed from the fields, because the difficulty bytes are not
-    /// canonical.
+    /// The genesis header, carrying [`GenesisSpec::hash`], and keeping the
+    /// difficulty's bytes as the file writes them and the gas limit's as
+    /// rskj holds them where the typed fields would write them otherwise, so
+    /// that the header written to the store reads back with that hash.
     pub fn header(&self) -> Header {
         let some = |b: &Bytes| (!b.is_empty()).then(|| b.clone());
+        let java = crate::types::header::java_signed_bytes;
+        let difficulty = U256::from_be_slice(&self.difficulty_bytes);
+        let gas_limit = self.gas_limit_bytes();
+        let kept = crate::types::header::KeptFields {
+            difficulty: (self.difficulty_bytes[..] != java(&difficulty)[..])
+                .then(|| self.difficulty_bytes.clone()),
+            gas_limit: (gas_limit != java(&self.gas_limit)).then(|| Bytes::from(gas_limit)),
+            ..Default::default()
+        };
         Header {
             parent_hash: self.parent_hash,
             ommers_hash: EMPTY_LIST_HASH,
@@ -227,7 +238,7 @@ impl GenesisSpec {
             receipts_root: EMPTY_TRIE_HASH,
             logs_bloom: Default::default(),
             extension_data: None,
-            difficulty: U256::from_be_slice(&self.difficulty_bytes),
+            difficulty,
             number: 0,
             gas_limit: self.gas_limit,
             gas_used: 0,
@@ -245,7 +256,7 @@ impl GenesisSpec {
             ),
             cached_hash: Some(self.hash()),
             cached_hash_for_merged_mining: None,
-            kept: None,
+            kept: (kept != Default::default()).then(|| Box::new(kept)),
         }
     }
 }
@@ -309,5 +320,62 @@ mod tests {
             r#"{ "balance": "0", "contract": { "code": "0x00" } }"#,
         );
         assert!(GenesisSpec::from_json(&json).is_err());
+    }
+
+    /// rskj's `rsk-dev.json` has a gas limit whose top bit is set and a
+    /// difficulty written with leading zeros; here with the zero address as
+    /// coinbase too, which rskj writes as its 20 bytes, and, in a second file,
+    /// a gas limit of zero, which a `GenesisHeader` holds as one zero byte.
+    /// The genesis header's fields hash as the file does, and the header the
+    /// store writes reads back with that hash.
+    #[test]
+    fn the_genesis_header_hashes_as_the_file_and_reads_back_so() {
+        use crate::types::header::HeaderForm;
+        let heights = crate::config::ActivationHeights::regtest();
+        let dev = GENESIS
+            .replace("0x017D7840", "0x989680")
+            .replace("0x0010000000", "0x0000000001")
+            .replace(
+                "0x3333333333333333333333333333333333333333",
+                "0x0000000000000000000000000000000000000000",
+            );
+        let no_gas = dev.replace("0x989680", "0x00");
+        for json in [dev, no_gas] {
+            let g = GenesisSpec::from_json(&json)
+                .unwrap()
+                .with_state_root(B256::repeat_byte(1));
+            let header = g.header();
+            let built = Header {
+                cached_hash: None,
+                ..header.clone()
+            }
+            .with_activations(&heights);
+            assert_eq!(
+                built.hash(),
+                g.hash(),
+                "the header's fields hash as the file's"
+            );
+            let read = Header::decode_in(
+                &mut header.encode_stored().as_slice(),
+                &heights,
+                HeaderForm::Stored,
+            )
+            .unwrap();
+            assert_eq!(
+                read.hash(),
+                g.hash(),
+                "and so does what the store reads back"
+            );
+        }
+    }
+
+    /// rskj's `new RskAddress(bytes)` throws on a coinbase of any length but
+    /// 20, none included.
+    #[test]
+    fn a_coinbase_that_is_not_20_bytes_is_refused() {
+        for coinbase in ["0x", "0x33"] {
+            let json = GENESIS.replace("0x3333333333333333333333333333333333333333", coinbase);
+            assert!(GenesisSpec::from_json(&json).is_err(), "{coinbase}");
+        }
     }
 }

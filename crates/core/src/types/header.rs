@@ -162,6 +162,14 @@ pub struct KeptFields {
     /// `minimum_gas_price` holds `U256::MAX`, which no transaction's price
     /// reaches either; see [`Header::minimum_gas_price_value`].
     pub minimum_gas_price: Option<Bytes>,
+    /// Block 0's difficulty as the bytes it was read from, where they aren't
+    /// how rskj writes the value (`toByteArray`). rskj reads block 0 as a
+    /// `GenesisHeader`, which writes its difficulty back as it read it,
+    /// leading zeros and all (`GenesisHeader.encodeBlockDifficulty`), and
+    /// rskj's genesis files write it with them: `0x0000100000` on mainnet
+    /// and testnet. `difficulty` holds the value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<Bytes>,
     /// Whether RSKIP-92 is active for this header, where the heights it was
     /// read or built under ([`Header::with_activations`]) say otherwise than
     /// this process's at its height. rskj's `BlockFactory` and
@@ -282,7 +290,7 @@ fn rlp_to_shorts(bytes: &[u8]) -> Vec<i16> {
 /// encodes difficulty (`RLP.encodeBlockDifficulty`), gasLimit (raw bytes it
 /// produced the same way) and minimumGasPrice
 /// (`RLP.encodeSignedCoinNonNullZero`) with these semantics.
-fn java_signed_bytes(value: &U256) -> Vec<u8> {
+pub(crate) fn java_signed_bytes(value: &U256) -> Vec<u8> {
     if value.is_zero() {
         return vec![0];
     }
@@ -294,6 +302,15 @@ fn java_signed_bytes(value: &U256) -> Vec<u8> {
     }
     out.extend_from_slice(&be[start..]);
     out
+}
+
+/// `ByteUtil.stripLeadingZeroes`: the bytes from the first that isn't zero,
+/// and one zero byte where all are.
+pub(crate) fn strip_leading_zeroes(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|byte| *byte != 0) {
+        Some(first) => &bytes[first..],
+        None => &[0],
+    }
 }
 
 /// `new BigInteger(1, bytes).longValue()`: the low 64 bits of the unsigned
@@ -742,7 +759,11 @@ impl Header {
                 &self.logs_bloom,
             ),
         }
-        java_signed_bytes(&self.difficulty).as_slice().encode(list);
+        // Block 0's difficulty as it was read, where rskj keeps it so.
+        match kept.and_then(|k| k.difficulty.as_ref()) {
+            Some(bytes) => bytes.encode(list),
+            None => java_signed_bytes(&self.difficulty).as_slice().encode(list),
+        }
         self.number.encode(list);
         self.gas_limit_bytes()[..].encode(list);
         self.gas_used.encode(list);
@@ -950,9 +971,18 @@ impl Header {
         // zero, and `DifficultyRule` refuses zero wherever rskj takes a
         // header, as it does a difficulty past 256 bits: none of its
         // parents' leads there.
-        let difficulty = field(7)?.and_then(java_signed).ok_or(refused(
+        let difficulty_bytes = field(7)?;
+        let difficulty = difficulty_bytes.and_then(java_signed).ok_or(refused(
             "a difficulty that is none, negative or past 256 bits",
         ))?;
+        if number == 0 {
+            // rskj reads block 0 as a `GenesisHeader`
+            // (`BlockFactory.createBlockHeader`), which writes its difficulty
+            // back as the bytes it read: see `KeptFields::difficulty`.
+            kept.difficulty = difficulty_bytes
+                .filter(|bytes| *bytes != java_signed_bytes(&difficulty).as_slice())
+                .map(Bytes::copy_from_slice);
+        }
         // rskj keeps the gas limit's bytes: see `KeptFields::gas_limit`.
         // None is null to it, and every rule that reads a header's gas limit
         // throws on null (`new BigInteger(1, getGasLimit())`): a block's
@@ -1746,6 +1776,41 @@ mod tests {
             let (_, decoded) = respelled(index, element(spelled));
             writes_back_as(&decoded.unwrap(), &standard_items());
         }
+    }
+
+    /// Block 0 is the exception for the difficulty: rskj reads it as a
+    /// `GenesisHeader`, which writes the difficulty back as it came, leading
+    /// zeros and all, and hashes it so. The store reads back what it wrote.
+    #[test]
+    fn block_0_keeps_its_difficulty_as_it_came() {
+        let mut items = standard_items();
+        items[7] = element(&[0, 0, 0x12, 0xd6, 0x87]);
+        items[8] = element(&[]);
+        let header = Header::decode_with_hash(&mut list_of(&items).as_slice()).unwrap();
+        assert_eq!(
+            (header.number, header.difficulty),
+            (0, U256::from(1_234_567))
+        );
+        writes_back_as(&header, &items);
+        let stored = Header::decode_in(
+            &mut header.encode_stored().as_slice(),
+            crate::config::ActivationHeights::current(),
+            HeaderForm::Stored,
+        )
+        .unwrap();
+        assert_eq!(stored.hash(), header.hash());
+
+        // Block 1 with the same bytes hashes its difficulty as rskj writes it.
+        items[8] = element(&[1]);
+        let header = Header::decode_with_hash(&mut list_of(&items).as_slice()).unwrap();
+        assert_eq!(
+            header.hash(),
+            keccak256(list_of(&{
+                let mut items = items.clone();
+                items[7] = element(&[0x12, 0xd6, 0x87]);
+                items
+            }))
+        );
     }
 
     /// rskj reads every field with `getRLPData`, which gives a list's whole
