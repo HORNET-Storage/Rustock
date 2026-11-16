@@ -2,5 +2,7 @@
 
 mod support;
 
+mod block_executor_test;
+mod block_txs_validation_rule_test;
 mod constants_test;
 mod transaction_test;

@@ -63,6 +63,19 @@ pub(super) fn creation(init_code: Vec<u8>) -> Transaction {
     }
 }
 
+/// A state of `accounts`, each holding one RBTC at the nonce given, in
+/// `store`.
+fn funded(store: &MemoryTrieStore, accounts: &[(Address, u64)]) -> TrieNode {
+    accounts
+        .iter()
+        .fold(TrieNode::empty(), |root, (account, nonce)| {
+            let key = account_key(account);
+            let state =
+                AccountState::new(U256::from(*nonce), U256::from(10u64).pow(U256::from(18)));
+            root.put(&TrieKeySlice::from_key(&key), &state.encode(), store)
+        })
+}
+
 /// `transaction`, from [`SENDER`] holding one RBTC, run alone on mainnet at
 /// block `number`.
 pub(super) fn run_on_mainnet(
@@ -70,13 +83,7 @@ pub(super) fn run_on_mainnet(
     transaction: &Transaction,
 ) -> Result<TxExecutionResult, ExecutionError> {
     let store = Arc::new(MemoryTrieStore::new());
-    let key = account_key(&SENDER);
-    let funded = AccountState::new(U256::ZERO, U256::from(10u64).pow(U256::from(18)));
-    let root = TrieNode::empty().put(
-        &TrieKeySlice::from_key(&key),
-        &funded.encode(),
-        store.as_ref(),
-    );
+    let root = funded(&store, &[(SENDER, 0)]);
     let blocks_dir = tempfile::tempdir().unwrap();
     let blocks = Arc::new(BlockStore::open(blocks_dir.path()).unwrap());
     RskExecutor::new(RskHardforkConfig::mainnet(), blocks).execute_tx(
@@ -86,4 +93,42 @@ pub(super) fn run_on_mainnet(
         &root,
         store,
     )
+}
+
+/// A transfer of one wei at `nonce`, priced at nothing. Unsigned: who sends
+/// it is given where it runs.
+fn transfer(nonce: u64) -> Transaction {
+    Transaction {
+        nonce,
+        gas_price: U256::ZERO,
+        gas_limit: U256::from(21_000),
+        to: Bytes::copy_from_slice(Address::repeat_byte(0x02).as_slice()),
+        value: U256::from(1),
+        input: Bytes::new(),
+        v: 0,
+        r: U256::ZERO,
+        s: U256::ZERO,
+        cached_rlp: None,
+    }
+}
+
+/// A block on mainnet at `number` of `transactions`, each a transfer from
+/// its sender at its nonce, run on a state where `accounts` hold one RBTC
+/// at theirs.
+pub(super) fn run_block_on_mainnet(
+    number: u64,
+    accounts: &[(Address, u64)],
+    transactions: &[(Address, u64)],
+) -> Result<(), ExecutionError> {
+    let store = Arc::new(MemoryTrieStore::new());
+    let root = funded(&store, accounts);
+    let transactions: Vec<(Transaction, Address)> = transactions
+        .iter()
+        .map(|(sender, nonce)| (transfer(*nonce), *sender))
+        .collect();
+    let blocks_dir = tempfile::tempdir().unwrap();
+    let blocks = Arc::new(BlockStore::open(blocks_dir.path()).unwrap());
+    RskExecutor::new(RskHardforkConfig::mainnet(), blocks)
+        .execute_block(&header_at(number), &transactions, &root, store)
+        .map(|_| ())
 }

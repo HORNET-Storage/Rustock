@@ -4,6 +4,7 @@ mod support;
 
 mod block_difficulty_rule_test;
 mod block_difficulty_validation_rule_test;
+mod block_executor_test;
 mod block_factory_test;
 mod block_header_builder_test;
 mod block_header_test;
