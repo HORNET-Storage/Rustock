@@ -1434,7 +1434,10 @@ struct Args {
     /// bahamas, orchid060 and hop401 are accepted at the height this node
     /// already reads them at; tbd1000 is accepted and changes nothing (it is
     /// rskj's upgrade for RSKIP559, which no network schedules and this node
-    /// doesn't implement).
+    /// doesn't implement). An upgrade left out below a scheduled one, or
+    /// scheduled out of its order, is refused, but for reed810 and
+    /// arrowhead631: this node reads a rule from the upgrade in force, and
+    /// would read such a schedule otherwise than rskj.
     #[arg(long, value_name = "NAME=HEIGHT")]
     hardfork: Vec<String>,
 
@@ -5767,12 +5770,24 @@ mod genesis_tests {
 
         // Moving reed810 on a copy of mainnet moves RSKIP144 and RSKIP351
         // with it, in the header's heights as on the ladder.
-        let reed810 = mainnet_args(&["--allow-chain-overrides", "--hardfork", "reed810=100"]);
+        let reed810 =
+            mainnet_args(&["--allow-chain-overrides", "--hardfork", "reed810=9000000"]);
         let config = apply_chain_options(ChainConfig::mainnet(), &reed810).unwrap();
         let heights = &config.activation_heights;
-        assert_eq!((heights.rskip144, heights.rskip351), (Some(100), Some(100)));
+        assert_eq!(
+            (heights.rskip144, heights.rskip351),
+            (Some(9_000_000), Some(9_000_000))
+        );
         let (ladder, _) = hardfork_config(&config).unwrap();
-        assert!(ladder.runs_sublists(100) && !ladder.runs_sublists(99));
+        assert!(ladder.runs_sublists(9_000_000) && !ladder.runs_sublists(8_999_999));
+        // Below mainnet's earlier upgrades, reed810 would bring their rules
+        // down with it on this ladder: refused.
+        let low = mainnet_args(&["--allow-chain-overrides", "--hardfork", "reed810=100"]);
+        assert!(apply_chain_options(ChainConfig::mainnet(), &low).is_err());
+        // An upgrade left out below a scheduled one is refused: rskj would
+        // have its rules off, and this ladder on from the later upgrade.
+        let hole = regtest_args(&["--hardfork", "lovell700=-1"]);
+        assert!(apply_chain_options(ChainConfig::regtest(), &hole).is_err());
 
         // A rule this node does not schedule on its own is refused.
         let unknown = regtest_args(&["--consensus-rule", "rskip126=0"]);

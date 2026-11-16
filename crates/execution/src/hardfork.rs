@@ -113,6 +113,24 @@ impl ConsensusRule {
 }
 
 impl RskNetworkUpgrade {
+    /// The upgrades of rskj's `hardforkActivationHeights` that are rungs of
+    /// this ladder, in their order.
+    const SCHEDULED: [Self; 13] = [
+        Self::Orchid,
+        Self::Wasabi100,
+        Self::TwoToThree,
+        Self::Papyrus200,
+        Self::Iris300,
+        Self::Hop400,
+        Self::Fingerroot500,
+        Self::Arrowhead600,
+        Self::Arrowhead631,
+        Self::Lovell700,
+        Self::Reed800,
+        Self::Reed810,
+        Self::Vetiver900,
+    ];
+
     /// The upgrade rskj calls `name` in `hardforkActivationHeights`, for the
     /// upgrades this ladder models. `bahamas`, `afterBridgeSync`, `orchid060`,
     /// `hop401` and `tbd1000` are rskj names too, but not rungs here; see
@@ -134,6 +152,35 @@ impl RskNetworkUpgrade {
             "vetiver900" => Self::Vetiver900,
             _ => return None,
         })
+    }
+
+    /// rskj's name for the upgrade in `hardforkActivationHeights`.
+    pub fn rskj_name(self) -> &'static str {
+        match self {
+            Self::Genesis => "genesis",
+            Self::Orchid => "orchid",
+            Self::Wasabi100 => "wasabi100",
+            Self::TwoToThree => "twoToThree",
+            Self::Papyrus200 => "papyrus200",
+            Self::Iris300 => "iris300",
+            Self::Hop400 => "hop400",
+            Self::Fingerroot500 => "fingerroot500",
+            Self::Arrowhead600 => "arrowhead600",
+            Self::Arrowhead631 => "arrowhead631",
+            Self::Lovell700 => "lovell700",
+            Self::Reed800 => "reed800",
+            Self::Reed810 => "reed810",
+            Self::Vetiver900 => "vetiver900",
+        }
+    }
+
+    /// Whether the ladder reads this upgrade's rules at the upgrade's own
+    /// height, as rskj reads every rule, and not from the upgrade in force.
+    /// The two upgrades a network leaves out are read so: reed810, which
+    /// mainnet never schedules (RSKIP144, RSKIP351, RSKIP502, RSKIP529 and
+    /// RSKIP536), and arrowhead631, which testnet never does (RSKIP434).
+    fn is_read_at_its_own_height(self) -> bool {
+        matches!(self, Self::Arrowhead631 | Self::Reed810)
     }
 }
 
@@ -274,26 +321,11 @@ impl RskHardforkConfig {
 
     /// Every upgrade at block 0 but `unscheduled`, which stay at rskj's `-1`.
     fn from_genesis_without(unscheduled: &[RskNetworkUpgrade]) -> Vec<(u64, RskNetworkUpgrade)> {
-        use RskNetworkUpgrade::*;
-        [
-            Orchid,
-            Wasabi100,
-            TwoToThree,
-            Papyrus200,
-            Iris300,
-            Hop400,
-            Fingerroot500,
-            Arrowhead600,
-            Arrowhead631,
-            Lovell700,
-            Reed800,
-            Reed810,
-            Vetiver900,
-        ]
-        .into_iter()
-        .filter(|upgrade| !unscheduled.contains(upgrade))
-        .map(|upgrade| (0, upgrade))
-        .collect()
+        RskNetworkUpgrade::SCHEDULED
+            .into_iter()
+            .filter(|upgrade| !unscheduled.contains(upgrade))
+            .map(|upgrade| (0, upgrade))
+            .collect()
     }
 
     /// The first block `active_upgrade` is at `upgrade` or past it: the
@@ -305,6 +337,19 @@ impl RskHardforkConfig {
             .filter(|(_, rung)| *rung >= upgrade)
             .map(|(height, _)| *height)
             .min()
+    }
+
+    /// The first block this ladder has `upgrade`'s rules in force, or `None`
+    /// where it never has: the upgrade's own height for the two read that
+    /// way ([`RskNetworkUpgrade::is_read_at_its_own_height`]), and for every
+    /// other the lowest height of it or a later rung, as `active_upgrade`
+    /// reads it.
+    fn rules_in_force_from(&self, upgrade: RskNetworkUpgrade) -> Option<u64> {
+        if upgrade.is_read_at_its_own_height() {
+            self.activation_height(upgrade)
+        } else {
+            self.in_force_from(upgrade)
+        }
     }
 
     /// RSKIP252 (fingerroot500): the first block whose transactions' gas
@@ -344,8 +389,14 @@ impl RskHardforkConfig {
             .unwrap_or(RskNetworkUpgrade::Genesis)
     }
 
-    /// Schedule `upgrade` at `height`, or take it off the ladder with `None`
-    /// (rskj's `-1`). Activations stay ordered by height.
+    /// Schedule `upgrade` at `height`, or take it off the ladder with `None`.
+    /// Activations stay ordered by height.
+    ///
+    /// Off the ladder is rskj's `-1` only for a rung with no later rung
+    /// scheduled, and for reed810 and arrowhead631: every other rung's rules
+    /// are read from the upgrade in force, so a later rung still turns them
+    /// on. [`Self::with_rskj_overrides`], which takes rskj's own schedule,
+    /// refuses what this would read otherwise than rskj.
     pub fn with_hardfork(mut self, upgrade: RskNetworkUpgrade, height: Option<u64>) -> Self {
         self.activations.retain(|(_, u)| *u != upgrade);
         if let Some(h) = height {
@@ -402,7 +453,10 @@ impl RskHardforkConfig {
     /// What each name does here:
     ///
     /// - A rung of this ladder (`orchid` to `vetiver900`): scheduled at the
-    ///   height, or removed.
+    ///   height, or removed. Refused where the ladder would then read some
+    ///   upgrade's rules from another height than rskj does
+    ///   ([`Self::reads_as_rskj_does`]): with an upgrade left out below a
+    ///   scheduled one, or scheduled out of its order.
     /// - `afterBridgeSync`: where the federators' and authorizers' Bridge
     ///   transactions start to be paid, or never.
     /// - `bahamas`, `orchid060`, `hop401`: read at one fixed height per chain,
@@ -423,9 +477,16 @@ impl RskHardforkConfig {
         rules: &[(String, Option<u64>)],
     ) -> Result<(Self, Vec<String>), String> {
         let mut unmodelled = Vec::new();
+        // Where rskj reads each upgrade's rules from: where this ladder has
+        // them in force, until an override names another height.
+        let mut rskj_heights = RskNetworkUpgrade::SCHEDULED
+            .map(|upgrade| (upgrade, self.rules_in_force_from(upgrade)));
         for (name, height) in hardforks {
             if let Some(upgrade) = RskNetworkUpgrade::from_rskj_name(name) {
                 self = self.with_hardfork(upgrade, *height);
+                for named in rskj_heights.iter_mut().filter(|(rung, _)| *rung == upgrade) {
+                    named.1 = *height;
+                }
             } else if name == "afterBridgeSync" {
                 self.after_bridge_sync = *height;
             } else if let Some(fixed) = self.fixed_rskj_height(name) {
@@ -441,6 +502,7 @@ impl RskHardforkConfig {
                 return Err(format!("hardfork {name}: not an rskj upgrade name"));
             }
         }
+        self.reads_as_rskj_does(&rskj_heights)?;
         for (name, height) in rules {
             if let Some(rule) = ConsensusRule::from_rskj_name(name) {
                 self = self.with_consensus_rule(rule, *height);
@@ -454,6 +516,45 @@ impl RskHardforkConfig {
             }
         }
         Ok((self, unmodelled))
+    }
+
+    /// Whether this ladder has every upgrade's rules in force from the height
+    /// rskj reads them at, which `rskj_heights` gives for each.
+    ///
+    /// rskj reads each rule at the height of its own upgrade
+    /// (`ActivationConfig.isActive`): an upgrade at `-1` has its rules off for
+    /// good, whatever is scheduled after it, and one scheduled above a later
+    /// upgrade has them off until its own height. This ladder reads a rule
+    /// from the upgrade in force (`active_upgrade() >= X`), and has it on from
+    /// the later upgrade's height in both cases; and an upgrade scheduled
+    /// below an earlier one brings the earlier one's rules down with it. The
+    /// networks leave out only reed810 and arrowhead631, whose rules are read
+    /// at their own heights here as well; rskj's own tests leave out others.
+    /// A schedule this ladder would read otherwise than rskj is refused, not
+    /// run.
+    fn reads_as_rskj_does(
+        &self,
+        rskj_heights: &[(RskNetworkUpgrade, Option<u64>)],
+    ) -> Result<(), String> {
+        let from = |height: Option<u64>| match height {
+            Some(height) => format!("from #{height}"),
+            None => "never".to_string(),
+        };
+        for (upgrade, rskj) in rskj_heights {
+            let here = self.rules_in_force_from(*upgrade);
+            if here != *rskj {
+                return Err(format!(
+                    "hardfork overrides: rskj reads {name}'s rules {rskj}, and this node would \
+                     read them {here}. It reads a rule from the upgrade in force, so no upgrade \
+                     but reed810 and arrowhead631 can be left out below a scheduled one, or \
+                     scheduled out of its order",
+                    name = upgrade.rskj_name(),
+                    rskj = from(*rskj),
+                    here = from(here),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Maps the RSK network upgrade to the closest revm SpecId.
@@ -1593,6 +1694,77 @@ mod override_tests {
         assert!(!cfg.has_rskip144(8_000_000));
         assert!(!cfg.has_rskip535(8_000_000));
         assert_eq!(cfg.active_upgrade(7_604_200), RskNetworkUpgrade::Vetiver900);
+    }
+
+    /// rskj reads each rule at its own upgrade's height, so an upgrade at -1
+    /// has its rules off for good whatever comes after it; this ladder reads
+    /// a rule from the upgrade in force and would have them on. rskj's own
+    /// tests leave out lovell700, iris300 and arrowhead600 that way (RSKIP438,
+    /// RSKIP445 and RSKIP446; RSKIP174; RSKIP203). No network does, and the
+    /// schedule is refused.
+    #[test]
+    fn an_upgrade_left_out_below_a_scheduled_one_is_refused() {
+        for name in ["lovell700", "iris300", "arrowhead600", "orchid", "reed800"] {
+            for base in [
+                RskHardforkConfig::rskj_regtest(),
+                RskHardforkConfig::regtest(),
+                RskHardforkConfig::mainnet(),
+                RskHardforkConfig::testnet(),
+            ] {
+                let refused = base.with_rskj_overrides(&[h(name, -1)], &[]).unwrap_err();
+                let never = format!("rskj reads {name}'s rules never");
+                assert!(refused.contains(&never), "{refused}");
+            }
+        }
+        // With every later upgrade left out too, the ladder ends below it, and
+        // reads as rskj's does: lovell700's rules are off and arrowhead600's on.
+        let last_four =
+            [h("lovell700", -1), h("reed800", -1), h("reed810", -1), h("vetiver900", -1)];
+        let (ends, _) = RskHardforkConfig::rskj_regtest()
+            .with_rskj_overrides(&last_four, &[])
+            .unwrap();
+        assert_eq!(ends.active_upgrade(u64::MAX), RskNetworkUpgrade::Arrowhead600);
+        assert!(!ends.has_initcode_metering(u64::MAX) && !ends.has_rskip445(u64::MAX));
+        assert!(ends.has_push0(0));
+        // A later upgrade put back over the ones left out would turn theirs on,
+        // though no override names them.
+        let refused = ends.with_rskj_overrides(&[h("vetiver900", 0)], &[]).unwrap_err();
+        assert!(refused.contains("rskj reads lovell700's rules never"), "{refused}");
+        // reed810 and arrowhead631 are read at their own heights, as on the
+        // networks that leave them out, so each may be left out anywhere.
+        let (testnet, _) = RskHardforkConfig::testnet()
+            .with_rskj_overrides(&[h("reed810", -1)], &[])
+            .unwrap();
+        assert!(!testnet.has_rskip144(u64::MAX) && testnet.has_rskip540(7_604_200));
+        let (mainnet, _) = RskHardforkConfig::mainnet()
+            .with_rskj_overrides(&[h("arrowhead631", -1)], &[])
+            .unwrap();
+        assert!(!mainnet.has_rskip434(u64::MAX) && mainnet.has_rskip445(7_338_024));
+    }
+
+    /// The same for an upgrade moved out of its order: above a later one its
+    /// rules would be read as in force from the later one's height, and below
+    /// an earlier one it would bring that one's rules down with it.
+    #[test]
+    fn an_upgrade_scheduled_out_of_its_order_is_refused() {
+        let mainnet = RskHardforkConfig::mainnet;
+        // lovell700 above reed800 (#8,052,200).
+        assert!(mainnet().with_rskj_overrides(&[h("lovell700", 8_500_000)], &[]).is_err());
+        // fingerroot500 below hop400 (#4,598,500).
+        assert!(mainnet().with_rskj_overrides(&[h("fingerroot500", 4_000_000)], &[]).is_err());
+        // reed810 below every upgrade mainnet has above #100.
+        assert!(mainnet().with_rskj_overrides(&[h("reed810", 100)], &[]).is_err());
+        // reed810 above vetiver900 is read at its own height, as rskj reads it.
+        assert!(mainnet().with_rskj_overrides(&[h("reed810", 9_002_504)], &[]).is_ok());
+        // An upgrade moved within its order, and two moved together, are taken.
+        assert!(mainnet().with_rskj_overrides(&[h("fingerroot500", 6_000_000)], &[]).is_ok());
+        assert!(mainnet()
+            .with_rskj_overrides(&[h("lovell700", 8_500_000), h("reed800", 8_600_000)], &[])
+            .is_ok());
+        // At one height with its neighbours, as on a regtest, nothing is out of order.
+        assert!(RskHardforkConfig::rskj_regtest()
+            .with_rskj_overrides(&[h("vetiver900", 0), h("orchid", 0)], &[])
+            .is_ok());
     }
 
     /// rskj's `regtest.conf` has every upgrade but arrowhead631 at block 0,

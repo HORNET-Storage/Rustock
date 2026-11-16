@@ -9,7 +9,7 @@ use alloy_primitives::U256;
 use rustock_core::Transaction;
 
 use super::harness::{create, Chain, GAS, ONE_RBTC, SENDER};
-use crate::hardfork::{RskHardforkConfig, RskNetworkUpgrade};
+use crate::hardfork::RskHardforkConfig;
 
 /// lovell700 on mainnet: RSKIP438.
 const LOVELL: u64 = 7_338_024;
@@ -100,37 +100,4 @@ fn before_rskip438_a_creation_carries_init_code_of_any_size_and_no_gas_for_it() 
     let past = run(MAX_INITCODE + 1, GAS);
     assert!(past.success);
     assert_eq!(past.gas_used, MAX_CREATION_GAS + 4);
-}
-
-/// rskj's tests turn RSKIP438 off by leaving lovell700 unscheduled on their
-/// regtest, where every later upgrade is at block 0: a creation then carries
-/// no gas for its init code, and more than 49,152 bytes of it.
-#[test]
-#[ignore = "rskj leaves RSKIP438 off where lovell700 is unscheduled though a later upgrade is \
-            scheduled (ActivationConfig.isActive reads lovell700's height), so a creation \
-            carries init code of any size and no gas for it (Transaction.transactionCost, \
-            Transaction.isInitCodeSizeInvalidForTx); rustock runs revm's SHANGHAI spec, with \
-            EIP-3860's limit and price, from any upgrade past lovell700 \
-            (hardfork.rs upgrade_to_spec_id)"]
-fn a_creation_carries_init_code_of_any_size_and_no_gas_for_it_where_lovell700_is_unscheduled() {
-    let regtest = RskHardforkConfig::rskj_regtest();
-    let config = regtest.with_hardfork(RskNetworkUpgrade::Lovell700, None);
-    let mut chain = chain(config, 1, ONE_RBTC);
-    let exact = chain.try_block(&creation(MAX_INITCODE, MAX_CREATION_GAS));
-    let test =
-        "testInitCodeSizeTransactionCreationValidationDoesntFailDueNotEnoughGasIfRSKIPNotActivated";
-    let exact = exact
-        .unwrap_or_else(|e| panic!("{test}: {e:?}"))
-        .tx_results
-        .remove(0);
-    assert!(exact.success, "{test}");
-    let test = "testInitCodeSizeTransactionCreationValidationSuccessWithRSKIP438Deactivated";
-    assert_eq!(exact.gas_used, MAX_CREATION_GAS, "{test}");
-    let past = chain.try_block(&creation(MAX_INITCODE + 1, GAS));
-    let test = "testInitCodeSizeTransactionCreationValidationSuccessWithRSKIPDeactivatedWithInitcodeSizeMaxReached";
-    let past = past
-        .unwrap_or_else(|e| panic!("{test}: {e:?}"))
-        .tx_results
-        .remove(0);
-    assert!(past.success, "{test}");
 }

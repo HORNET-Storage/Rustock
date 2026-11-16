@@ -15,7 +15,6 @@ use super::harness::{
     call, compile, hex_word, logged, push_address, Chain, CONTRACT, LOG_TOP, ONE_RBTC, SENDER,
 };
 use crate::executor::TxExecutionResult;
-use crate::hardfork::{RskHardforkConfig, RskNetworkUpgrade};
 
 /// lovell700 on mainnet: RSKIP446.
 const LOVELL: u64 = 7_338_024;
@@ -167,28 +166,6 @@ fn another_contract_reads_none_of_what_a_contract_stored() {
 fn tload_and_tstore_are_invalid_opcodes_before_rskip446() {
     let input = [U256::from(1), bytes32(b"1"), bytes32(b"2")];
     let mut chain = chain_at(LOVELL - 1, &[(CONTRACT, &basic())]);
-    let ran = send(&mut chain, 0, 200_000, &input);
-    let test = "testTransientStorageOpcodesExecutionFailsWithRSKIPDeactivated";
-    assert!(!ran.success, "{test}");
-    assert_eq!(ran.gas_used, 200_000, "{test}");
-}
-
-/// rskj's own case turns RSKIP446 off by leaving lovell700 unscheduled
-/// (`hardforkActivationHeights.lovell700 = -1`) on a regtest whose later
-/// upgrades are all at block 0. rskj activates each rule at its own
-/// upgrade's height (`ActivationConfig.isActive`), so TLOAD and TSTORE are
-/// invalid opcodes there.
-#[test]
-#[ignore = "rskj leaves RSKIP446 off where lovell700 is unscheduled though a later upgrade is \
-            scheduled (ActivationConfig.isActive reads lovell700's height); rustock's has_rskip446 \
-            turns it on from any upgrade past lovell700"]
-fn tload_and_tstore_are_invalid_opcodes_where_lovell700_is_unscheduled() {
-    let regtest = RskHardforkConfig::rskj_regtest();
-    let config = regtest.with_hardfork(RskNetworkUpgrade::Lovell700, None);
-    let mut chain = Chain::new(config, 1);
-    chain.put(SENDER, 0, ONE_RBTC, &[]);
-    chain.put(CONTRACT, 1, U256::ZERO, &basic());
-    let input = [U256::from(1), bytes32(b"1"), bytes32(b"2")];
     let ran = send(&mut chain, 0, 200_000, &input);
     let test = "testTransientStorageOpcodesExecutionFailsWithRSKIPDeactivated";
     assert!(!ran.success, "{test}");
