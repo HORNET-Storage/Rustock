@@ -502,6 +502,16 @@ fn no_transactions_follow(rest: &[u8]) -> bool {
     }
 }
 
+/// Whether bitcoinj reads `rest` as a transaction count above
+/// `Integer.MAX_VALUE`. `BtcBlock.parseTransactions` casts the count to an
+/// `int` and sizes its list of transactions by it, so `new ArrayList` throws
+/// `IllegalArgumentException` for a negative one, where a count it can't
+/// read the transactions of throws `ProtocolException`. Of the widths that
+/// fit in five bytes only the four-byte one counts that high.
+fn transaction_count_is_negative(rest: &[u8]) -> bool {
+    rest.first() == Some(&0xfe) && rest.get(4).is_some_and(|&high| high & 0x80 != 0)
+}
+
 /// rskj `Bridge.receiveHeaders` and `BridgeSupport.receiveHeaders`: every
 /// header, in order, through bitcoinj's `add`, each it can't add skipped.
 pub fn receive_headers<CTX: crate::RskContextTr>(
@@ -544,10 +554,21 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
     {
         return refuse("receiveHeaders: a header is not a header's size");
     }
-    if headers
+    // `makeBlock` parses the headers in order, and the first it can't parse
+    // throws. Only its `ProtocolException` is caught and rethrown as a
+    // `BridgeIllegalArgumentException` (Bridge.java:546-555): the
+    // `IllegalArgumentException` of a negative transaction count reaches
+    // `Bridge.execute`'s last catch and fails the call, before RSKIP88 too.
+    if let Some(rest) = headers
         .iter()
-        .any(|header| !no_transactions_follow(&header[80..]))
+        .map(|header| &header[80..])
+        .find(|rest| !no_transactions_follow(rest))
     {
+        if transaction_count_is_negative(rest) {
+            return Err(PrecompileError::other(
+                "receiveHeaders: a header counts its transactions below zero",
+            ));
+        }
         return refuse("receiveHeaders: a header could not be parsed");
     }
 
@@ -1717,6 +1738,55 @@ mod tests {
         };
         assert!(takes(&[0]));
         assert!(!takes(&[1]));
+    }
+
+    /// Before RSKIP124 a header's trailing transaction count is parsed, and
+    /// rskj's `makeBlock` throws for one above `Integer.MAX_VALUE` an
+    /// `IllegalArgumentException` that `Bridge.receiveHeaders` doesn't catch:
+    /// the call fails, even before RSKIP88, where a header it can't read is
+    /// answered with a success that saves nothing. The first header it can't
+    /// parse decides which.
+    #[test]
+    fn before_rskip88_a_header_counting_transactions_below_zero_fails_the_call() {
+        use crate::abi::encode::{self, Arg};
+        // Mainnet's first block: below RSKIP88 (orchid) and RSKIP124.
+        let (config, cfg) = (BridgeConstants::regtest(), RskHardforkConfig::mainnet());
+        assert!(!cfg.has_rskip88(0) && !cfg.has_rskip124(0));
+        let header = mine_regtest(regtest_genesis(), 0x11);
+        let call = |rests: &[&[u8]]| {
+            let encoded: Vec<Vec<u8>> = rests
+                .iter()
+                .map(|rest| [serialize(&header), rest.to_vec()].concat())
+                .collect();
+            let slices: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+            let args = encode::args(&[Arg::BytesArray(&slices)]);
+            let mut ctx = ctx_at(0);
+            let answer = receive_headers(&mut ctx, &args, 0, &config, false, &cfg);
+            let stored = get_stored_block(&mut ctx, &header.block_hash()).is_some();
+            (answer.map(|output| output.bytes.to_vec()), stored)
+        };
+        let below_zero: &[u8] = &[0xfe, 0, 0, 0, 0x80];
+        let past_its_bytes: &[u8] = &[0xfe, 0xff, 0xff, 0xff, 0x7f];
+        assert!(transaction_count_is_negative(below_zero));
+        assert!(!transaction_count_is_negative(past_its_bytes));
+        assert!(!transaction_count_is_negative(&[0xfe, 0, 0, 0x80]));
+        assert!(matches!(call(&[below_zero]), (Err(_), false)));
+        assert!(matches!(call(&[past_its_bytes]), (Ok(ref out), false) if out.is_empty()));
+        // The first header bitcoinj can't parse decides.
+        assert!(matches!(
+            call(&[past_its_bytes, below_zero]),
+            (Ok(_), false)
+        ));
+        assert!(matches!(
+            call(&[below_zero, past_its_bytes]),
+            (Err(_), false)
+        ));
+        assert!(matches!(call(&[&[0], below_zero]), (Err(_), false)));
+        // From RSKIP88 both fail the call.
+        let mut late = ctx_at(729_000);
+        let encoded = [serialize(&header), past_its_bytes.to_vec()].concat();
+        let args = encode::args(&[Arg::BytesArray(&[&encoded])]);
+        assert!(receive_headers(&mut late, &args, 0, &config, false, &cfg).is_err());
     }
 
     /// From RSKIP199 rskj finds a main-chain block below
