@@ -4333,7 +4333,7 @@ fn pegout_entry_hash(entry: &PegoutWaitingForConfirmations) -> u32 {
     31u32.wrapping_mul(r).wrapping_add(long_hash_code)
 }
 
-/// rskj `BridgeSupport.processFundsMigration` (pre-RSKIP294/376 era).
+/// rskj `BridgeSupport.processFundsMigration`.
 fn process_funds_migration<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
@@ -4408,25 +4408,25 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                     build_federation_redeem_script(&retiring_keys, retiring_keys.len() / 2 + 1)
                 });
         // rskj `migrateFunds` sends the migration to `getActiveFederationAddress()`
-        // = the NEW (active) federation's P2SH address (BridgeSupport.java:1308,
-        // FederationSupportImpl.getActiveFederationAddress -> getAddress()). The
-        // active federation here is the ERP federation committed at #4,652,781, so
-        // its address derives from the (RSKIP201-era non-standard) ERP redeem
-        // script, NOT a plain multisig. Use the committed-federation redeem builder
-        // so this matches whatever federation format was committed (standard pre-
-        // RSKIP201, non-standard ERP, P2SH-ERP, or P2SH-P2WSH-ERP).
+        // = the NEW (active) federation's address (BridgeSupport.java:1308,
+        // FederationSupportImpl.getActiveFederationAddress -> getAddress()), the
+        // federation as it is stored: rskj reads it back in its own format
+        // version (`deserializeFederationAccordingToVersion`), whatever format a
+        // federation committed in this block would take. The first ERP
+        // federation, committed at #4,652,781, is a non-standard ERP one.
         let new_btc_keys = new_fed.btc_keys();
-        let new_redeem = build_committed_federation_redeem_script(
-            &new_btc_keys,
-            config,
-            hardfork_cfg,
-            block_number,
-        );
         // getActiveFederationAddress is format-aware: a P2SH-P2WSH (format 4000,
         // RSKIP305) active federation receives the migration at its P2SH-P2WSH
         // address, not a plain P2SH of the redeem. First hit when the first
         // reed800 segwit federation activates (#8,147,324).
         let new_format = federation_format_version(ctx, super::storage::NEW_FEDERATION_FORMAT_VERSION_KEY);
+        let new_redeem = federation_redeem_for_format(
+            &new_btc_keys,
+            new_format,
+            config,
+            hardfork_cfg,
+            block_number,
+        );
         let active_script = p2sh_output_script(&federation_output_hash160(&new_redeem, new_format));
 
         // The migration spends the retiring (OLD) federation; a P2SH-P2WSH
@@ -4452,14 +4452,26 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                 .unwrap_or(retiring_redeem.as_slice())
         };
 
-        // createMigrationTransaction: target the full balance, halving on
-        // size overflow. rskj ReleaseTransactionBuilder sets version 2 once
-        // RSKIP201 is active (setDefaultTxConfig), but buildMigrationTransaction
-        // forces it back to version 1 until RSKIP376 — from RSKIP376 (arrowhead600)
-        // on, migration txs are version 2 like every other pegout.
+        // createMigrationTransaction: rskj ReleaseTransactionBuilder sets version
+        // 2 once RSKIP201 is active (setDefaultTxConfig), but
+        // buildMigrationTransaction forces it back to version 1 until RSKIP376 —
+        // from RSKIP376 (arrowhead600) on, migration txs are version 2 like every
+        // other pegout.
         let migration_tx_version = if hardfork_cfg.has_rskip376(block_number) { 2 } else { 1 };
+        // It asks for the whole balance and, each time bitcoinj can't build the
+        // transaction (INSUFFICIENT_MONEY, EXCEED_MAX_TRANSACTION_SIZE,
+        // COULD_NOT_ADJUST_DOWNWARDS), for half of it, with no floor. An amount
+        // under the destination's dust limit is DUSTY_SEND_REQUESTED, and
+        // createMigrationTransaction throws ("Retiring federation wallet cannot
+        // be emptied"), as it throws where bitcoinj can't size an input.
+        let dust = super::release_tx::min_non_dust_value(&active_script);
         let mut target = balance;
-        let built = loop {
+        let built: Result<super::release_tx::BuiltPegout, PrecompileError> = loop {
+            if target < dust {
+                break Err(PrecompileError::other(
+                    "createMigrationTransaction: the retiring federation's wallet cannot be emptied",
+                ));
+            }
             let outputs = [super::release_tx::PegoutOutput {
                 script: active_script.clone(),
                 amount_satoshis: target,
@@ -4472,15 +4484,19 @@ fn process_funds_migration<CTX: crate::RskContextTr>(
                 fee_per_kb,
                 migration_tx_version,
                 retiring_is_segwit,
-            )? {
-                Some(b) => break Some(b),
-                None => {
-                    target /= 2;
-                    if target < 10_000 {
-                        break None;
-                    }
-                }
+            ) {
+                Ok(Some(b)) => break Ok(b),
+                Ok(None) => target /= 2,
+                Err(e) => break Err(PrecompileError::from(e)),
             }
+        };
+        // processFundsMigration lets what migrateFunds throws fail the call while
+        // the active federation is in its migration age; past it, it catches the
+        // throw, migrates nothing, and retires the federation all the same.
+        let built = match built {
+            Ok(built) => Some(built),
+            Err(_) if past_migration_age => None,
+            Err(e) => return Err(e),
         };
 
         if let Some(built) = built {
