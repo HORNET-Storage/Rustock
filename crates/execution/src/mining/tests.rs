@@ -169,10 +169,21 @@ fn fixture_with(
 /// rskj's blocks runs (`--skip-pow-validation`), at a difficulty no nonce
 /// search could meet.
 fn fixture_without_pow(height: u64, flush_every: u64, trie_store: Arc<dyn TrieStore>) -> MiningFixture {
+    fixture_without_pow_gated(height, flush_every, trie_store, None)
+}
+
+/// The same chain, its miner's server wired to the node's sync state as a
+/// node wires it: work is refused while `gate` has a better block to fetch.
+fn fixture_without_pow_gated(
+    height: u64,
+    flush_every: u64,
+    trie_store: Arc<dyn TrieStore>,
+    gate: Option<Arc<dyn SyncGate>>,
+) -> MiningFixture {
     let mut config = (*test_chain_config()).clone();
     config.skip_pow_validation = true;
     config.min_difficulty = U256::from(1u64 << 28);
-    fixture_on(height, Arc::new(config), U256::from(1u64 << 28), trie_store, flush_every)
+    fixture_on_gated(height, Arc::new(config), U256::from(1u64 << 28), trie_store, flush_every, gate)
 }
 
 /// Counts the flushes asked of the trie store it wraps.
@@ -209,6 +220,17 @@ fn fixture_on(
     parent_difficulty: U256,
     trie_store: Arc<dyn TrieStore>,
     flush_every: u64,
+) -> MiningFixture {
+    fixture_on_gated(height, chain_config, parent_difficulty, trie_store, flush_every, None)
+}
+
+fn fixture_on_gated(
+    height: u64,
+    chain_config: Arc<ChainConfig>,
+    parent_difficulty: U256,
+    trie_store: Arc<dyn TrieStore>,
+    flush_every: u64,
+    gate: Option<Arc<dyn SyncGate>>,
 ) -> MiningFixture {
     let dir = tempfile::tempdir().unwrap();
     // A store that reads headers under the chain's heights, as a node's does
@@ -263,12 +285,16 @@ fn fixture_on(
         None,
         flush_every,
     ));
-    let server = Arc::new(MinerServer::new(
+    let mut server = MinerServer::new(
         builder,
         chain,
         Arc::new(NoPendingTransactions),
         chain_config.clone(),
-    ));
+    );
+    if let Some(gate) = gate {
+        server = server.with_sync_gate(gate);
+    }
+    let server = Arc::new(server);
 
     MiningFixture { server, store, trie_store, chain_config, parent, _dir: dir }
 }
@@ -452,6 +478,42 @@ fn fork_detection_data_commits_to_height_and_uncles() {
     assert_eq!(data.len(), fork_detection::FORK_DETECTION_DATA_LENGTH);
     assert_eq!(data[7], 32, "uncles outside the 32-block window must not count");
     assert_eq!(&data[8..12], &5_001u32.to_be_bytes(), "the height being mined");
+}
+
+/// rskj `ForkDataDetectionCalculatorTest.calculateWithDivisibleBy64height`:
+/// mining block 512, a multiple of 64, the first seven bytes are the least
+/// significant byte of the hash of the Bitcoin header of the blocks 63, 127,
+/// 191, 255, 319, 383 and 447 below the best, counting the best as 0; then
+/// the uncle count, none here, and the height. rskj's test names 446 for the
+/// last, where `ForkDetectionDataCalculator.buildCommitToParentsVector` reads
+/// 447 (`bestBlockHeight - cpvStartHeight + i * 64`), and passes because its
+/// chain gives twenty blocks one Bitcoin header: #64 and #65 share theirs.
+/// Here each block has its own, so the block read is the one asserted.
+#[test]
+fn fork_detection_data_commits_to_a_bitcoin_header_every_64_blocks() {
+    let chain: Vec<Header> = (0..fork_detection::REQUIRED_MAINCHAIN_BLOCKS)
+        .map(|i| {
+            let mut header = header_at(511 - i as u64, B256::ZERO, B256::ZERO);
+            // A Bitcoin header of each block's own, told apart by its version.
+            let mut bitcoin_header = [0u8; 80];
+            bitcoin_header[..4].copy_from_slice(&(i as u32).to_le_bytes());
+            header.bitcoin_merged_mining_header = Some(Bytes::copy_from_slice(&bitcoin_header));
+            header
+        })
+        .collect();
+    let least_significant_byte = |i: usize| {
+        let raw = chain[i].bitcoin_merged_mining_header.as_ref().unwrap();
+        let header: bitcoin::block::Header = bitcoin::consensus::deserialize(raw).unwrap();
+        // The hash read as a number is little-endian: its low byte is first.
+        header.block_hash().as_byte_array()[0]
+    };
+
+    let data = fork_detection::calculate(&chain).unwrap();
+    for (k, i) in [63, 127, 191, 255, 319, 383, 447].into_iter().enumerate() {
+        assert_eq!(data[k], least_significant_byte(i), "byte {k}: the block {i} below the best");
+    }
+    assert_eq!(data[7], 0, "no uncles");
+    assert_eq!(&data[8..12], &512u32.to_be_bytes(), "the height being mined");
 }
 
 /// The uncle count is one byte, and a chain busy enough to overflow it must
@@ -1107,6 +1169,25 @@ fn the_gas_limit_steps_a_1024th_at_any_size() {
     assert_eq!(step(&(&top - 1u8), Some(U256::MAX)), top);
 }
 
+/// rskj `GasLimitCalculatorTest.NextBlockGasLimitIsDecreasedToTarget`: a
+/// target less than a step below the parent's gas limit is reached in one
+/// block, whatever gas the parent used.
+#[test]
+fn a_target_within_a_step_below_is_reached_in_one_block() {
+    use super::template::next_gas_limit;
+    let target = 3_000_001u32;
+    for gas_used in [u64::from(target) + 1, 0] {
+        let mut parent = header_at(1, B256::ZERO, B256::ZERO);
+        parent.set_gas_limit(&BigUint::from(target + 1));
+        parent.gas_used = gas_used;
+        assert_eq!(
+            next_gas_limit(&parent, Some(U256::from(target)), 1024),
+            BigUint::from(target),
+            "the parent used {gas_used}"
+        );
+    }
+}
+
 /// rskj `GasLimitCalculator` takes a target under the chain's minimum gas
 /// limit as the minimum: from a parent at 6,800,000 on a chain whose
 /// minimum is 6,799,000, a target of 1 steps down only to 6,799,000, not
@@ -1297,6 +1378,33 @@ fn notify_is_reported_once() {
     assert!(!fx.server.get_work().unwrap().notify);
 }
 
+/// rskj `MinerServerTest.gasUnitInDollarsIsInitializedOkAtConstructor`, whose
+/// name is not what it asserts: work built on a new parent is a notify
+/// again, though the work before it was read.
+#[test]
+fn work_on_a_new_parent_is_a_notify_again() {
+    let fx = fixture(20);
+    let first = fx.server.get_work().unwrap();
+    assert!(first.notify);
+    assert!(!fx.server.get_work().unwrap().notify);
+    let info = fx
+        .server
+        .submit_bitcoin_block(&bitcoin::consensus::serialize(&solve(&first)))
+        .unwrap();
+    // The submission built the next work, on the block it imported.
+    let next = fx.server.get_work().unwrap();
+    assert_eq!(next.parent_block_hash, info.block_hash);
+    assert!(next.notify, "work on a new parent must be pushed to the miners");
+}
+
+/// rskj `MinerServerTest.workWithNoTransactionsZeroFees`: work on a block with
+/// no transaction but REMASC's pays its miner nothing.
+#[test]
+fn work_with_no_transactions_pays_the_miner_nothing() {
+    let fx = fixture(20);
+    assert_eq!(fx.server.get_work().unwrap().fees_paid_to_miner, U256::ZERO);
+}
+
 /// The three submit methods differ only in how much of the Bitcoin block the
 /// miner sends; they must all complete the same header.
 #[test]
@@ -1403,6 +1511,35 @@ fn a_solution_that_misses_the_target_is_refused() {
     assert!(matches!(err, SubmitError::SelfCheck(_)), "unexpected error: {err}");
     // Nothing was stored: a refused solution must not leave a block behind.
     assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+}
+
+/// rskj `MainNetMinerTest.submitBitcoinBlockInvalidBlockDoesntEliminateCache`:
+/// a solution that misses the target is refused, and the work it answered
+/// stays on offer, so a solution found after it is taken. rskj asserts the
+/// refusal and leaves the rest commented out, its difficulty too high to
+/// solve in a test; this chain's is low enough.
+#[test]
+fn a_refused_solution_leaves_its_work_answerable() {
+    let fx = fixture(20);
+    let work = fx.server.get_work().unwrap();
+    let coinbase = coinbase::build_coinbase(&work.block_hash_for_merged_mining, 0xDEAD_BEEF);
+    let missed = (0..100_000u32)
+        .map(|nonce| coinbase::build_bitcoin_block(coinbase.clone(), nonce))
+        .find(|block| U256::from_le_slice(block.header.block_hash().as_byte_array()) > work.target)
+        .expect("a nonce that misses the target");
+
+    let err = fx
+        .server
+        .submit_bitcoin_block(&bitcoin::consensus::serialize(&missed))
+        .unwrap_err();
+    assert!(matches!(err, SubmitError::SelfCheck(_)), "unexpected error: {err}");
+    assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+
+    let info = fx
+        .server
+        .submit_bitcoin_block(&bitcoin::consensus::serialize(&solve(&work)))
+        .expect("the work is still on offer");
+    assert_eq!(info.block_imported_result, ImportResult::ImportedBest);
 }
 
 /// `mnr_getWork` hands out the target the Bitcoin hash is compared against,
@@ -3427,6 +3564,92 @@ fn a_timed_miner_mines_blocks_on_its_own() {
     let mined = miner.mined();
     let head = fx.store.header(fx.store.head().unwrap().unwrap()).unwrap().unwrap();
     assert_eq!(head.number, 20 + mined, "the head is the last block it counted");
+}
+
+/// rskj `TimedMinerClientSimpleTest.testMultipleStartStopCycles` and
+/// `TimedMinerClientTest.canStartAndStopMultipleTimes`: the miner starts and
+/// stops again and again. A start right after a stop, while the stopped
+/// thread still sleeps on its draw, runs one thread, not the stopped one
+/// beside the new: each holds a handle on the server, so they are counted.
+#[test]
+fn a_timed_miner_started_again_at_once_runs_one_thread() {
+    use std::time::{Duration, Instant};
+    let fx = fixture_without_pow(20, 10, Arc::new(MemoryTrieStore::new()));
+    let miner = TimedMiner::new(fx.server.clone(), Duration::from_millis(100), Pow::Skip);
+    let without_thread = Arc::strong_count(&fx.server);
+    let threads_settle_at = |threads: usize, when: &str| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Arc::strong_count(&fx.server) != without_thread + threads {
+            assert!(
+                Instant::now() < deadline,
+                "{} threads 60 s {when}, not {threads}",
+                Arc::strong_count(&fx.server) - without_thread
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    for _ in 0..3 {
+        miner.start();
+        miner.stop();
+        assert!(!miner.is_running());
+        miner.start();
+        assert!(miner.is_running());
+        threads_settle_at(1, "after a stop and a start");
+        // Longer than the stopped thread sleeps before it reads its flag.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(Arc::strong_count(&fx.server), without_thread + 1, "the stopped thread ran on");
+        miner.stop();
+        threads_settle_at(0, "after a stop");
+    }
+    // And a start after all that mines.
+    let before = miner.mined();
+    miner.start();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while miner.mined() == before {
+        assert!(Instant::now() < deadline, "no block in 60 s");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    miner.stop();
+    threads_settle_at(0, "after the last stop");
+}
+
+/// rskj `TimedMinerClientMiningTest.handlesMiningErrorsGracefully`: a block
+/// the miner can't build is logged, and the next draw comes as usual. Here
+/// the work is refused because the node has a better block to fetch; once it
+/// has it, the miner mines.
+#[test]
+fn a_timed_miner_rides_out_work_it_cannot_build() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    struct Syncing(AtomicBool);
+    impl SyncGate for Syncing {
+        fn has_better_block_to_sync(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let syncing = Arc::new(Syncing(AtomicBool::new(true)));
+    let gate: Arc<dyn SyncGate> = syncing.clone();
+    let fx = fixture_without_pow_gated(20, 10, Arc::new(MemoryTrieStore::new()), Some(gate));
+    let miner = TimedMiner::new(fx.server.clone(), Duration::from_millis(100), Pow::Skip);
+    let without_thread = Arc::strong_count(&fx.server);
+    miner.start();
+    // Draws come every 100 ms or so, and each fails.
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(miner.is_running(), "a block it couldn't build stopped the miner");
+    assert_eq!(miner.mined(), 0);
+    assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+
+    syncing.0.store(false, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while miner.mined() == 0 {
+        assert!(Instant::now() < deadline, "no block in 60 s once synced");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    miner.stop();
+    while Arc::strong_count(&fx.server) > without_thread {
+        assert!(Instant::now() < deadline, "still running after stop");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// A header whose recomputed hash is not the hash it is stored under: what a
