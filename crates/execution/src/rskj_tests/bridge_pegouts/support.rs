@@ -697,7 +697,7 @@ impl Registration {
     /// up, the one at `height` with `merkle_root` and the network's
     /// confirmations above it, the last the chain's head. The hash of the one
     /// at `height`, as bitcoinj's `Sha256Hash` of it reads.
-    fn store_chain(&mut self, height: u32, merkle_root: [u8; 32]) -> [u8; 32] {
+    pub(super) fn store_chain(&mut self, height: u32, merkle_root: [u8; 32]) -> [u8; 32] {
         use crate::bridge::btc_store::{put_stored_block, store_chain_head, StoredBlock};
         use bitcoin::hashes::Hash;
         let use_v2 = self.cfg.has_stored_block_v2(self.block);

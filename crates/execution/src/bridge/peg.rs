@@ -287,6 +287,10 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // rskj then parses the transaction with bitcoinj and runs its `verify()`
     // on it (BridgeSupport l.400-401). A throw from either fails the
     // transaction too.
+    // The processed transactions' map as the call found it. rskj's `save()`
+    // writes back the map the check below reads, unless the call saves nothing.
+    let processed_map = bridge_storage_key(BTC_TX_HASHES_ALREADY_PROCESSED_KEY);
+    let processed_map_found = bridge_load_raw(ctx, processed_map);
     let validation = if is_btc_tx_processed(ctx, &btc_tx_hash) {
         Err(Invalid::Swallowed("transaction already processed"))
     } else {
@@ -316,6 +320,8 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
             tracing::debug!(
                 "registerBtcTransaction: {m}; before RSKIP88, a success with no output"
             );
+            // The map read above stays as it was found.
+            bridge_store_raw(ctx, processed_map, processed_map_found);
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
         }
         Err(Invalid::Thrown(m) | Invalid::IllegalArgument(m)) => {

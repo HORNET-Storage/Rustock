@@ -11,6 +11,8 @@
 //! sets the state getters read. Before RSKIP88 a call that throws a
 //! `BridgeIllegalArgumentException` is answered with null and saves nothing.
 
+use revm::context_interface::ContextTr;
+
 use super::support::*;
 use crate::abi::encode::{self, Arg};
 use crate::bridge::federation::rsk_address_from_public_key;
@@ -18,6 +20,9 @@ use crate::bridge::federation::rsk_address_from_public_key;
 /// Where these tests schedule wasabi100 on rskj's regtest, and every upgrade
 /// after it.
 const WASABI: u64 = 10;
+
+/// A block of mainnet's before orchid's RSKIP88, at #729,000.
+const BEFORE_RSKIP88: u64 = 700_000;
 
 /// rskj's regtest with wasabi100 and the upgrades after it at [`WASABI`], at
 /// `block`: RSKIP123 off below it and on from it. Upgrades are scheduled in
@@ -109,6 +114,11 @@ fn selector(signature: &str) -> Vec<u8> {
     crate::abi::selector(signature).to_vec()
 }
 
+/// The empty list, as rskj writes a set it read where its cell held nothing.
+fn empty_list() -> Option<Vec<u8>> {
+    Some(rlp_encode_list(&[]))
+}
+
 /// From RSKIP123 a federator's call, which reads the federation to know the
 /// caller, saves it with all three keys of each member and the format
 /// version of a standard multisig federation.
@@ -174,4 +184,55 @@ fn a_call_that_read_another_federation_leaves_the_new_one_as_it_was() {
         named(&mut bridge.ctx, NEW_FEDERATION.0),
         Some(only_btc_keys(&members()))
     );
+}
+
+/// `registerBtcTransaction` of a transaction in the Bitcoin block at
+/// `height`, with `tree` for its tree, on mainnet before RSKIP88. Whether it
+/// returned.
+fn register_before_rskip88(bridge: &mut Registration, height: u32, tree: &[u8]) -> bool {
+    let raw = bitcoin::consensus::serialize(&tx_paying(&[(BTC, user(9))]));
+    let args = encode::args(&[
+        Arg::Bytes(&raw),
+        Arg::Word(encode::int(i64::from(height))),
+        Arg::Bytes(tree),
+    ]);
+    let returned = crate::bridge::peg::register_btc_transaction(
+        &mut bridge.ctx,
+        &args,
+        0,
+        &bridge.constants,
+        &bridge.cfg,
+        &BridgeTxContext::default(),
+    )
+    .is_ok();
+    if returned {
+        bridge.ctx.chain_mut().raw_storage.commit_call();
+    } else {
+        bridge.ctx.chain_mut().raw_storage.discard_call();
+    }
+    returned
+}
+
+/// Before RSKIP88 a transaction whose tree is not of a tree's size, confirmed
+/// enough, throws a `BridgeIllegalArgumentException`, which `Bridge.execute`
+/// answers with null: the call returns and saves nothing, so the processed
+/// transactions' map it read is left as it was.
+#[test]
+fn before_rskip88_a_call_answered_with_null_leaves_the_processed_map_unwritten() {
+    let mut bridge = Registration::mainnet(BEFORE_RSKIP88);
+    bridge.store_chain(1_000, [0x22; 32]);
+    assert!(register_before_rskip88(&mut bridge, 1_000, &[0x01]), "null");
+    assert_eq!(named(&mut bridge.ctx, "btcTxHashesAP"), None);
+}
+
+/// One turned down quietly, from a block above the chain's head, which no
+/// block confirms, saves the map.
+#[test]
+fn before_rskip88_a_call_turned_down_quietly_writes_the_processed_map_back() {
+    let mut bridge = Registration::mainnet(BEFORE_RSKIP88);
+    assert!(
+        register_before_rskip88(&mut bridge, 2_000_000_000, &[0x01]),
+        "turned down"
+    );
+    assert_eq!(named(&mut bridge.ctx, "btcTxHashesAP"), empty_list());
 }
