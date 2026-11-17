@@ -96,7 +96,10 @@ fn logged_federator(number: u64, multikey: bool) -> alloy_primitives::Address {
     assert_eq!(logs[0].address, crate::precompiles::BRIDGE_ADDR);
     let topics = topics(&logs[0]);
     assert_eq!(topics.len(), 3);
-    assert_eq!(topics[0], event_topic("add_signature(bytes32,address,bytes)"));
+    assert_eq!(
+        topics[0],
+        event_topic("add_signature(bytes32,address,bytes)")
+    );
     assert_eq!(topics[1], RELEASE_HASH);
     assert_eq!(
         logs[0].data.data.to_vec(),
@@ -136,7 +139,7 @@ fn add_signature_writes_back_the_set_it_read() {
     assert!(kept.is_some());
     let signature = signing.signature(0);
     signing
-        .add_signatures_as(0, &public_key(&[9]), &[signature.clone()])
+        .add_signatures_as(0, &public_key(&[9]), std::slice::from_ref(&signature))
         .expect("addSignature runs");
     assert_eq!(named(&mut signing.bridge.ctx, "rskTxsWaitingFS"), kept);
 
@@ -650,7 +653,8 @@ impl ToSign {
     /// The first `count` signers of the spent federation sign, each in a call
     /// that returns.
     fn signed_by_the_first(&mut self, count: usize) {
-        for signer in self.spent.signers[..count].to_vec() {
+        for at in 0..count {
+            let signer = self.spent.signers[at].clone();
             self.add_signature_by(&signer).expect("addSignature runs");
         }
     }
@@ -705,7 +709,7 @@ fn a_majority_of_a_segwit_federation_signs_its_pegout_and_it_is_released() {
     to_sign.signed_by_the_first(majority);
     let released = to_sign.released_signed_by_the_first(majority);
     assert!(
-        released.input[0].script_sig.len() > 0,
+        !released.input[0].script_sig.is_empty(),
         "the witness program pushed"
     );
 }
@@ -781,6 +785,85 @@ fn the_svp_spend_transaction_is_signed_only_from_rskip305_and_with_its_value_kep
             assert!(holds_signature(&spend, 0, &first, &to_sign.sighashes[0]));
         }
     }
+}
+
+/// rskj's `addSvpSpendTxSignatures` looks the signer up among the proposed
+/// federation's members and throws where it is none of them
+/// (`getMemberByBtcPublicKey(..).orElseThrow`): a call to sign the SVP spend
+/// transaction with another key fails, though a member sends it, and the
+/// transaction waits as it was.
+#[test]
+fn a_key_of_no_proposed_member_fails_a_call_to_sign_the_svp_spend_transaction() {
+    use crate::abi::encode::{args, Arg};
+    let mut to_sign = ToSign::svp_spend(MAINNET_REED800, true);
+    let waiting = named(&mut to_sign.bridge.ctx, "svpSpendTxWaitingForSignatures");
+    let member = compressed(&to_sign.spent.signers[0]);
+    to_sign.bridge.caller =
+        crate::bridge::federation::rsk_address_from_public_key(&member).expect("an address");
+    let stranger = k256::ecdsa::SigningKey::from_slice(&[7; 32]).expect("a key");
+    let signature = der_signature(&stranger, &to_sign.sighashes[0]);
+    let data = [
+        crate::abi::selector("addSignature(bytes,bytes[],bytes)").to_vec(),
+        args(&[
+            Arg::Bytes(&compressed(&stranger)),
+            Arg::BytesArray(&[signature.as_slice()]),
+            Arg::Bytes(&RELEASE_HASH),
+        ]),
+    ]
+    .concat();
+    assert!(to_sign.bridge.execute(&data).is_err(), "the call fails");
+    assert_eq!(
+        named(&mut to_sign.bridge.ctx, "svpSpendTxWaitingForSignatures"),
+        waiting
+    );
+    assert!(logs(&mut to_sign.bridge.ctx).is_empty());
+}
+
+/// rskj logs `add_signature` with the member's BTC key as the federation
+/// keeps it, compressed (`BridgeEventLoggerImpl.logAddSignature`): a member
+/// that gives its key uncompressed is found, signs in, and is logged with
+/// the compressed key. So does a proposed member signing the SVP spend
+/// transaction.
+#[test]
+fn a_key_given_uncompressed_is_logged_compressed() {
+    use crate::abi::encode::{args, Arg};
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    let uncompressed = |key: &[u8; 33]| {
+        k256::PublicKey::from_sec1_bytes(key)
+            .expect("a key")
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec()
+    };
+    let mut signing = Signing::mainnet_at(FROM_RSKIP326);
+    let key = signing.key(0);
+    let signature = signing.signature(0);
+    signing
+        .add_signatures_as(0, &uncompressed(&key), &[signature])
+        .expect("addSignature runs");
+    let logs = logs(&mut signing.bridge.ctx);
+    assert_eq!(logs.len(), 1, "signed in, and logged");
+    assert_eq!(logs[0].data.data.to_vec(), args(&[Arg::Bytes(&key)]));
+
+    let mut to_sign = ToSign::svp_spend(MAINNET_REED800, true);
+    let signer = to_sign.spent.signers[0].clone();
+    let key = compressed(&signer);
+    to_sign.bridge.caller =
+        crate::bridge::federation::rsk_address_from_public_key(&key).expect("an address");
+    let signature = der_signature(&signer, &to_sign.sighashes[0]);
+    let data = [
+        crate::abi::selector("addSignature(bytes,bytes[],bytes)").to_vec(),
+        args(&[
+            Arg::Bytes(&uncompressed(&key)),
+            Arg::BytesArray(&[signature.as_slice()]),
+            Arg::Bytes(&RELEASE_HASH),
+        ]),
+    ]
+    .concat();
+    to_sign.bridge.execute(&data).expect("addSignature runs");
+    let logs = crate::rskj_tests::bridge_pegouts::support::logs(&mut to_sign.bridge.ctx);
+    assert_eq!(logs.len(), 1, "signed in, and logged");
+    assert_eq!(logs[0].data.data.to_vec(), args(&[Arg::Bytes(&key)]));
 }
 
 /// rskj's nested `MigrationTxSigning` set-up, at vetiver900: a retiring

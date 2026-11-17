@@ -5193,8 +5193,10 @@ pub fn add_signature<CTX: crate::RskContextTr>(
                 &rsk_tx_hash,
             );
         } else if let Some(addr) = super::federation::rsk_address_from_public_key(&federator_addr_key) {
-            // Topic = federatorRskAddress; data = the BTC public key (always).
-            super::events::log_solidity_add_signature(ctx, &rsk_tx_hash, addr, &fed_key);
+            // Topic = federatorRskAddress; data = the member's BTC key as the
+            // federation keeps it, compressed, however the call gave it
+            // (`BridgeEventLoggerImpl.logAddSignature`).
+            super::events::log_solidity_add_signature(ctx, &rsk_tx_hash, addr, &compressed_key);
         }
     };
     if !log_only_when_applied {
@@ -5261,18 +5263,25 @@ fn add_svp_spend_tx_signatures<CTX: crate::RskContextTr>(
 ) -> Result<PrecompileOutput, PrecompileError> {
     let empty = || Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
 
+    // rskj throws where there is no proposed federation, and where the key is
+    // none of its members' (`getMemberByBtcPublicKey(..).orElseThrow`), the
+    // point at infinity among them: the call fails.
     let Some(proposed) = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY)
     else {
-        return empty();
+        return Err(PrecompileError::other(
+            "addSignature: no proposed federation signs the SVP spend transaction",
+        ));
     };
-    let Some(compressed_key) = compress_pubkey(fed_key) else {
-        return empty();
-    };
-    // The federator must belong to the proposed federation.
-    let Some(member_rsk) =
-        proposed.members.iter().find(|m| m.btc == compressed_key).map(|m| m.rsk)
-    else {
-        return empty();
+    let Some((compressed_key, member_rsk)) = compress_pubkey(fed_key).and_then(|key| {
+        proposed
+            .members
+            .iter()
+            .find(|m| m.btc == key)
+            .map(|m| (key, m.rsk))
+    }) else {
+        return Err(PrecompileError::other(
+            "addSignature: the key is no member's of the proposed federation",
+        ));
     };
     let mut spend_tx: BtcTransaction = match deserialize(spend_tx_bytes) {
         Ok(tx) => tx,
@@ -5299,7 +5308,7 @@ fn add_svp_spend_tx_signatures<CTX: crate::RskContextTr>(
         apply_signatures_to_tx(&mut spend_tx, sigs, &compressed_key, prev_values.as_deref())?;
     if applied {
         if let Some(addr) = super::federation::rsk_address_from_public_key(&member_rsk) {
-            super::events::log_solidity_add_signature(ctx, rsk_tx_hash, addr, fed_key);
+            super::events::log_solidity_add_signature(ctx, rsk_tx_hash, addr, &compressed_key);
         }
     }
 
