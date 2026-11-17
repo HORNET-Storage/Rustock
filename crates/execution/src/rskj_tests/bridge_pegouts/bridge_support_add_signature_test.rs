@@ -6,7 +6,9 @@
 //! hop400, with RSKIP146 and before RSKIP326, and at fingerroot500, which
 //! brings it. rskj's tests hand `BridgeSupport` what the Bridge would turn
 //! down before it (no signatures, bytes that are not DER); the ports call
-//! the Bridge, as a member's transaction does.
+//! the Bridge, as a member's transaction does. Its nested `AddSignature` and
+//! `MigrationTxSigning` tests, of P2SH ERP and P2SH-P2WSH ERP federations
+//! with every upgrade on, run at vetiver900.
 
 use super::support::*;
 
@@ -301,4 +303,472 @@ fn a_pegout_of_three_inputs_is_signed_only_by_signatures_for_all_three() {
         released(&logs[3]),
         bitcoin::consensus::serialize(&signing.signed_by(&[0, 1]))
     );
+}
+
+/// A key's compressed public key.
+fn compressed(key: &k256::ecdsa::SigningKey) -> [u8; 33] {
+    key.verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .try_into()
+        .expect("33 bytes")
+}
+
+/// A federation as rskj's nested tests make one: the keys of the private keys
+/// `keccak256(seed)` (`getBtcEcKeysFromSeeds(seeds, true)`), in the order of
+/// their public keys, kept in `format`, P2SH ERP or P2SH-P2WSH ERP.
+struct Seeded {
+    signers: Vec<k256::ecdsa::SigningKey>,
+    keys: Vec<[u8; 33]>,
+    format: u64,
+    redeem: Vec<u8>,
+}
+
+impl Seeded {
+    fn of(seeds: &[String], format: u64, bridge: &Bridge) -> Self {
+        use sha3::Digest;
+        let mut signers: Vec<k256::ecdsa::SigningKey> = seeds
+            .iter()
+            .map(|seed| {
+                let private = sha3::Keccak256::digest(seed.as_bytes());
+                k256::ecdsa::SigningKey::from_slice(&private).expect("a key")
+            })
+            .collect();
+        signers.sort_by_key(compressed);
+        let keys: Vec<[u8; 33]> = signers.iter().map(compressed).collect();
+        let redeem = crate::bridge::peg::federation_redeem_for_format_pub(
+            &keys,
+            format,
+            &bridge.constants,
+            &bridge.cfg,
+            bridge.number(),
+        );
+        Self {
+            signers,
+            keys,
+            format,
+            redeem,
+        }
+    }
+
+    fn segwit(&self) -> bool {
+        self.format == P2SH_P2WSH_ERP
+    }
+
+    fn threshold(&self) -> usize {
+        self.keys.len() / 2 + 1
+    }
+
+    /// The output script of its address.
+    fn output(&self) -> Vec<u8> {
+        p2sh(&crate::bridge::peg::federation_output_hash160(
+            &self.redeem,
+            self.format,
+        ))
+    }
+
+    /// rskj `BitcoinUtils.addSpendingFederationBaseScript`: input `index` of
+    /// `tx` as the Bridge leaves it, spending this federation's output with
+    /// no signature yet.
+    fn leave_unsigned(&self, tx: &mut bitcoin::Transaction, index: usize) {
+        use crate::bridge::release_tx::{placeholder_scriptsig, segwit_base_input};
+        if self.segwit() {
+            let (script_sig, witness) = segwit_base_input(&self.redeem, self.threshold());
+            tx.input[index].script_sig = script_sig;
+            tx.input[index].witness = witness;
+        } else {
+            let script_sig = placeholder_scriptsig(&self.redeem, self.threshold());
+            tx.input[index].script_sig = bitcoin::ScriptBuf::from_bytes(script_sig);
+        }
+    }
+
+    /// What input `index` of `tx`, spending `value` satoshis of this
+    /// federation's, is signed over: its legacy sighash, or its BIP-143 one.
+    fn sighash(&self, tx: &bitcoin::Transaction, index: usize, value: u64) -> [u8; 32] {
+        use crate::bridge::release_tx::{legacy_sighash_all, segwit_sighash_all};
+        if self.segwit() {
+            segwit_sighash_all(tx, index, &self.redeem, value)
+        } else {
+            legacy_sighash_all(tx, index, &self.redeem)
+        }
+    }
+}
+
+/// `signer`'s DER signature of `sighash`.
+fn der_signature(signer: &k256::ecdsa::SigningKey, sighash: &[u8; 32]) -> Vec<u8> {
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    let signature: k256::ecdsa::Signature = signer.sign_prehash(sighash).expect("signed");
+    signature.to_der().as_bytes().to_vec()
+}
+
+/// Whether input `index` of `tx` holds `signer`'s signature of `sighash`, as
+/// bitcoinj writes it, in its witness or its scriptSig.
+fn holds_signature(
+    tx: &bitcoin::Transaction,
+    index: usize,
+    signer: &k256::ecdsa::SigningKey,
+    sighash: &[u8; 32],
+) -> bool {
+    let written = [der_signature(signer, sighash), vec![0x01]].concat();
+    let input = &tx.input[index];
+    input.witness.iter().any(|push| push == written.as_slice())
+        || input.script_sig.instructions().any(|instruction| {
+            matches!(instruction, Ok(bitcoin::script::Instruction::PushBytes(bytes))
+                if bytes.as_bytes() == written.as_slice())
+        })
+}
+
+/// A transaction waiting for signatures under [`RELEASE_HASH`], spending
+/// `spent`'s output of a bitcoin, as rskj's nested tests keep one, and what
+/// each of its inputs is signed over.
+struct ToSign {
+    bridge: Bridge,
+    spent: Seeded,
+    sighashes: Vec<[u8; 32]>,
+}
+
+impl ToSign {
+    /// The transaction `paying` the bitcoin of `spent`'s that it spends, of
+    /// `version`, waiting in `bridge`; with `keep_value`, the bitcoin its
+    /// input spends kept under its hash, as from RSKIP305 the Bridge keeps it
+    /// when it builds the transaction.
+    fn waiting_in(
+        mut bridge: Bridge,
+        spent: Seeded,
+        version: i32,
+        paying: &[(u64, Vec<u8>)],
+        keep_value: bool,
+    ) -> Self {
+        let funding = btc_transaction(vec![], &[(BTC, spent.output())]);
+        let mut tx = btc_transaction(
+            vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(funding.compute_txid(), 0),
+                ..bitcoin::TxIn::default()
+            }],
+            paying,
+        );
+        tx.version = bitcoin::transaction::Version(version);
+        spent.leave_unsigned(&mut tx, 0);
+        use crate::bridge::serialization::{rlp_encode_element, rlp_encode_list};
+        put_named(
+            &mut bridge.ctx,
+            "rskTxsWaitingFS",
+            &rlp_encode_list(&[
+                rlp_encode_element(&RELEASE_HASH),
+                rlp_encode_element(&bitcoin::consensus::serialize(&tx)),
+            ]),
+        );
+        if keep_value {
+            use bitcoin::hashes::Hash;
+            let mut hash = tx.compute_txid().to_raw_hash().to_byte_array();
+            hash.reverse();
+            let hash = crate::bridge::tx::to_hex(&hash);
+            let key = crate::bridge::storage::compound_key("releasesOutpointsValues", "-", &hash);
+            // One bitcoin as bitcoinj's `VarInt` writes it.
+            let value = vec![0xfe, 0x00, 0xe1, 0xf5, 0x05];
+            crate::bridge::storage::bridge_store_raw(&mut bridge.ctx, key, Some(value));
+        }
+        let sighashes = vec![spent.sighash(&tx, 0, BTC)];
+        Self {
+            bridge,
+            spent,
+            sighashes,
+        }
+    }
+
+    /// rskj's nested `AddSignature` set-up, at block `number` of mainnet: a
+    /// federation of the signers `signer1` to `signer<count>` active in
+    /// `format`, and waiting for its signatures a version 2 peg-out of its
+    /// bitcoin, the minimum to the receiver and the rest back to it.
+    fn pegout(number: u64, count: usize, format: u64, keep_value: bool) -> Self {
+        let mut bridge = Bridge::mainnet_at(number);
+        let seeds: Vec<String> = (1..=count).map(|i| format!("signer{i}")).collect();
+        let federation = Seeded::of(&seeds, format, &bridge);
+        store_federation(&mut bridge.ctx, NEW_FEDERATION, &federation.keys, 1, format);
+        let minimum = bridge.constants.minimum_pegout_tx_value;
+        let paying = [(minimum, user(9)), (BTC - minimum, federation.output())];
+        Self::waiting_in(bridge, federation, 2, &paying, keep_value)
+    }
+
+    /// At block `number` of mainnet, the SVP under way: a proposed
+    /// P2SH-P2WSH ERP federation of twenty, made the block before, and its
+    /// SVP spend transaction, a version 2 one of its bitcoin, waiting for its
+    /// signatures (`svpSpendTxWaitingForSignatures`).
+    fn svp_spend(number: u64, keep_value: bool) -> Self {
+        let mut bridge = Bridge::mainnet_at(number);
+        let seeds: Vec<String> = (1..=20).map(|i| format!("signer{i}")).collect();
+        let proposed = Seeded::of(&seeds, P2SH_P2WSH_ERP, &bridge);
+        let slot = ("proposedFederation", "proposedFederationFormatVersion");
+        store_federation(
+            &mut bridge.ctx,
+            slot,
+            &proposed.keys,
+            number - 1,
+            P2SH_P2WSH_ERP,
+        );
+        let mut to_sign = Self::waiting_in(bridge, proposed, 2, &[(BTC, user(9))], keep_value);
+        let entry = named(&mut to_sign.bridge.ctx, "rskTxsWaitingFS").expect("waiting");
+        put_named(
+            &mut to_sign.bridge.ctx,
+            "svpSpendTxWaitingForSignatures",
+            &entry,
+        );
+        to_sign
+    }
+
+    /// `addSignature` by the member `signer` of `federation`, its signatures of
+    /// [`ToSign::sighashes`], from its transaction.
+    fn add_signature_by(
+        &mut self,
+        signer: &k256::ecdsa::SigningKey,
+    ) -> Result<revm::precompile::PrecompileOutput, revm::precompile::PrecompileError> {
+        use crate::abi::encode::{args, Arg};
+        let key = compressed(signer);
+        self.bridge.caller =
+            crate::bridge::federation::rsk_address_from_public_key(&key).expect("an address");
+        let signatures: Vec<Vec<u8>> = self
+            .sighashes
+            .iter()
+            .map(|sighash| der_signature(signer, sighash))
+            .collect();
+        let sent: Vec<&[u8]> = signatures.iter().map(Vec::as_slice).collect();
+        let data = [
+            crate::abi::selector("addSignature(bytes,bytes[],bytes)").to_vec(),
+            args(&[
+                Arg::Bytes(&key),
+                Arg::BytesArray(&sent),
+                Arg::Bytes(&RELEASE_HASH),
+            ]),
+        ]
+        .concat();
+        self.bridge.execute(&data)
+    }
+
+    /// The first `count` signers of the spent federation sign, each in a call
+    /// that returns.
+    fn signed_by_the_first(&mut self, count: usize) {
+        for signer in self.spent.signers[..count].to_vec() {
+            self.add_signature_by(&signer).expect("addSignature runs");
+        }
+    }
+
+    /// The transactions still waiting, by their creation hash.
+    fn still_waiting(&mut self) -> std::collections::BTreeMap<[u8; 32], Vec<u8>> {
+        crate::bridge::peg::deserialize_rsk_txs_waiting_for_signatures(
+            &named(&mut self.bridge.ctx, "rskTxsWaitingFS").unwrap_or_default(),
+        )
+        .into_iter()
+        .collect()
+    }
+
+    /// The transaction as it waits.
+    fn waiting(&mut self) -> bitcoin::Transaction {
+        let raw = self.still_waiting().remove(&RELEASE_HASH).expect("waiting");
+        bitcoin::consensus::deserialize(&raw).expect("a transaction")
+    }
+
+    /// rskj's `assertFederatorSigning` for the first `count` signers and
+    /// `assertLogReleaseBtc`: an `add_signature` event for each, by its
+    /// address, then `release_btc`, of the transaction holding each one's
+    /// signature, which no longer waits. The transaction released.
+    fn released_signed_by_the_first(&mut self, count: usize) -> bitcoin::Transaction {
+        assert!(self.still_waiting().is_empty(), "no longer waiting");
+        let logs = logs(&mut self.bridge.ctx);
+        let add = event_topic("add_signature(bytes32,address,bytes)");
+        let release = event_topic("release_btc(bytes32,bytes)");
+        let firsts: Vec<[u8; 32]> = logs.iter().map(|log| topics(log)[0]).collect();
+        assert_eq!(firsts, [vec![add; count], vec![release]].concat());
+        let released: bitcoin::Transaction =
+            bitcoin::consensus::deserialize(&released(&logs[count])).expect("a transaction");
+        for (signer, log) in self.spent.signers[..count].iter().zip(&logs) {
+            let address =
+                crate::bridge::federation::rsk_address_from_public_key(&compressed(signer))
+                    .expect("an address");
+            assert_eq!(topics(log)[2][12..], address.0);
+            assert!(holds_signature(&released, 0, signer, &self.sighashes[0]));
+        }
+        released
+    }
+}
+
+/// rskj's `AddSignature.addSignature_correctFederator_whenFedIsSegwit_shouldSign`:
+/// a majority of a P2SH-P2WSH ERP federation of twenty signs its peg-out, each
+/// signature over the input's BIP-143 sighash with the value kept for it, in
+/// the input's witness; the peg-out is released.
+#[test]
+fn a_majority_of_a_segwit_federation_signs_its_pegout_and_it_is_released() {
+    let mut to_sign = ToSign::pegout(MAINNET_VETIVER900, 20, P2SH_P2WSH_ERP, true);
+    let majority = to_sign.spent.threshold();
+    to_sign.signed_by_the_first(majority);
+    let released = to_sign.released_signed_by_the_first(majority);
+    assert!(
+        released.input[0].script_sig.len() > 0,
+        "the witness program pushed"
+    );
+}
+
+/// rskj's `AddSignature.addSignature_correctFederator_whenFedIsSegwit_txFullySigned_shouldNotAddExtraSignature`
+/// and `..._whenFedIsLegacy_txFullySigned_shouldNotAddExtraSignature`: once a
+/// peg-out of a P2SH-P2WSH ERP federation of twenty, or of a P2SH ERP one of
+/// nine, is released, another member's signatures change nothing.
+#[test]
+fn a_released_pegout_takes_no_more_signatures() {
+    for (count, format, keep_value) in [(20, P2SH_P2WSH_ERP, true), (9, P2SH_ERP, false)] {
+        let mut to_sign = ToSign::pegout(MAINNET_VETIVER900, count, format, keep_value);
+        let majority = to_sign.spent.threshold();
+        to_sign.signed_by_the_first(majority);
+        let released = to_sign.released_signed_by_the_first(majority);
+        let extra = to_sign.spent.signers[majority + 1].clone();
+        to_sign.add_signature_by(&extra).expect("addSignature runs");
+        assert!(to_sign.still_waiting().is_empty(), "{format}");
+        assert!(logs(&mut to_sign.bridge.ctx).is_empty(), "{format}");
+        assert!(
+            !holds_signature(&released, 0, &extra, &to_sign.sighashes[0]),
+            "{format}"
+        );
+    }
+}
+
+/// rskj reads the value a segwit input spends, which its sighash covers,
+/// with `getReleaseOutpointsValues`: before RSKIP305 it throws, and from it
+/// it finds nothing where nothing is kept under the transaction's hash, and
+/// the call throws. A member's signature of a peg-out with a witness fails
+/// the call before RSKIP305 whatever is kept, and from it where nothing is,
+/// and is signed in where the value is kept.
+#[test]
+fn a_segwit_input_is_signed_only_from_rskip305_and_with_its_value_kept() {
+    let first_signs = |to_sign: &mut ToSign| {
+        let first = to_sign.spent.signers[0].clone();
+        to_sign.add_signature_by(&first).map(|_| ())
+    };
+    let mut before = ToSign::pegout(MAINNET_REED800 - 1, 20, P2SH_P2WSH_ERP, true);
+    assert!(first_signs(&mut before).is_err());
+
+    let mut nothing_kept = ToSign::pegout(MAINNET_REED800, 20, P2SH_P2WSH_ERP, false);
+    assert!(first_signs(&mut nothing_kept).is_err());
+
+    let mut kept = ToSign::pegout(MAINNET_REED800, 20, P2SH_P2WSH_ERP, true);
+    first_signs(&mut kept).expect("addSignature runs");
+    let signer = kept.spent.signers[0].clone();
+    let sighash = kept.sighashes[0];
+    assert!(holds_signature(&kept.waiting(), 0, &signer, &sighash));
+}
+
+/// rskj signs the SVP spend transaction as a peg-out (`addSvpSpendTxSignatures`
+/// runs `processSigning`): a proposed member's signature of its segwit input
+/// fails the call before RSKIP305, and from it where nothing is kept under
+/// its hash, and is signed in where the value is kept.
+#[test]
+fn the_svp_spend_transaction_is_signed_only_from_rskip305_and_with_its_value_kept() {
+    for (number, keep_value, signed) in [
+        (MAINNET_REED800 - 1, true, false),
+        (MAINNET_REED800, false, false),
+        (MAINNET_REED800, true, true),
+    ] {
+        let mut to_sign = ToSign::svp_spend(number, keep_value);
+        let first = to_sign.spent.signers[0].clone();
+        let answered = to_sign.add_signature_by(&first);
+        assert_eq!(answered.is_ok(), signed, "{number} {keep_value}");
+        if signed {
+            use crate::bridge::serialization::rlp_decode_list;
+            let entry = named(&mut to_sign.bridge.ctx, "svpSpendTxWaitingForSignatures");
+            let items = rlp_decode_list(&entry.expect("waiting")).expect("a list");
+            let spend: bitcoin::Transaction =
+                bitcoin::consensus::deserialize(&items[1]).expect("a transaction");
+            assert!(holds_signature(&spend, 0, &first, &to_sign.sighashes[0]));
+        }
+    }
+}
+
+/// rskj's nested `MigrationTxSigning` set-up, at vetiver900: a retiring
+/// federation in `retiring_format` and an active one in `active_format`, of
+/// nine members where P2SH ERP and twenty where P2SH-P2WSH ERP, sharing
+/// `sharedFederator`, the retiring one with `retiringFederator` the active
+/// one hasn't; and waiting for signatures the migration of the retiring
+/// one's bitcoin to the active one, the bitcoin kept under its hash where
+/// the retiring one is P2SH-P2WSH. The shared member's key and the other's.
+fn migrating(retiring_format: u64, active_format: u64) -> (ToSign, [u8; 33], [u8; 33]) {
+    let number = MAINNET_VETIVER900;
+    let mut bridge = Bridge::mainnet_at(number);
+    let seeds = |second: &str, format: u64| -> Vec<String> {
+        let count = if format == P2SH_P2WSH_ERP { 20 } else { 9 };
+        ["sharedFederator".to_string(), second.to_string()]
+            .into_iter()
+            .chain((3..=count).map(|i| format!("signer{i}")))
+            .collect()
+    };
+    let retiring = Seeded::of(
+        &seeds("retiringFederator", retiring_format),
+        retiring_format,
+        &bridge,
+    );
+    let active = Seeded::of(
+        &seeds("activeFederator", active_format),
+        active_format,
+        &bridge,
+    );
+    store_federation(
+        &mut bridge.ctx,
+        OLD_FEDERATION,
+        &retiring.keys,
+        1,
+        retiring_format,
+    );
+    let creation = number - activation_age(number) - 1;
+    store_federation(
+        &mut bridge.ctx,
+        NEW_FEDERATION,
+        &active.keys,
+        creation,
+        active_format,
+    );
+    let key_of = |seed: &str| {
+        use sha3::Digest;
+        let private = sha3::Keccak256::digest(seed.as_bytes());
+        compressed(&k256::ecdsa::SigningKey::from_slice(&private).expect("a key"))
+    };
+    let (shared, only_retiring) = (key_of("sharedFederator"), key_of("retiringFederator"));
+    assert!(retiring.keys.contains(&shared) && active.keys.contains(&shared));
+    assert!(retiring.keys.contains(&only_retiring) && !active.keys.contains(&only_retiring));
+    let paying = [(BTC, active.output())];
+    let keep_value = retiring_format == P2SH_P2WSH_ERP;
+    let to_sign = ToSign::waiting_in(bridge, retiring, 1, &paying, keep_value);
+    (to_sign, shared, only_retiring)
+}
+
+/// rskj's `MigrationTxSigning.addSignature_migrationTx_*_withOneSharedFederatorAndOneOnlyPartOfRetiringFed`,
+/// for the retiring and active federations P2SH ERP and P2SH ERP, P2SH ERP
+/// and P2SH-P2WSH ERP, and P2SH-P2WSH ERP and P2SH-P2WSH ERP: a member of
+/// both federations signs the migration in, then a member of the retiring
+/// one alone, each signature logged.
+#[test]
+fn members_of_the_retiring_federation_sign_its_migration() {
+    for (retiring, active) in [
+        (P2SH_ERP, P2SH_ERP),
+        (P2SH_ERP, P2SH_P2WSH_ERP),
+        (P2SH_P2WSH_ERP, P2SH_P2WSH_ERP),
+    ] {
+        let (mut to_sign, shared, only_retiring) = migrating(retiring, active);
+        for key in [shared, only_retiring] {
+            let signer = to_sign
+                .spent
+                .signers
+                .iter()
+                .find(|signer| compressed(signer) == key)
+                .expect("a retiring member")
+                .clone();
+            to_sign
+                .add_signature_by(&signer)
+                .expect("addSignature runs");
+            let sighash = to_sign.sighashes[0];
+            assert!(
+                holds_signature(&to_sign.waiting(), 0, &signer, &sighash),
+                "{retiring} {active}"
+            );
+            let add = event_topic("add_signature(bytes32,address,bytes)");
+            let logs = logs(&mut to_sign.bridge.ctx);
+            let firsts: Vec<[u8; 32]> = logs.iter().map(|log| topics(log)[0]).collect();
+            assert_eq!(firsts, [add], "{retiring} {active}");
+        }
+    }
 }
