@@ -6118,7 +6118,8 @@ fn get_effective_fee_per_kb<CTX: crate::RskContextTr>(ctx: &mut CTX, config: &Br
 /// the key order in the redeem script, consuming one OP_0 placeholder.
 /// Returns whether at least one signature was applied, and `Err` where rskj
 /// throws: at an input with a witness whose spent value `prev_values`, what
-/// `getReleaseOutpointsValues` read, doesn't hold.
+/// `getReleaseOutpointsValues` read, doesn't hold, and at an input whose
+/// redeem script it can't take.
 fn apply_signatures_to_tx(
     tx: &mut BtcTransaction,
     sigs: &[Vec<u8>],
@@ -6158,8 +6159,12 @@ fn apply_signatures_to_tx(
         } else {
             extract_redeem_script(tx.input[i].script_sig.as_bytes())
         };
+        // `BitcoinUtils.generateSigHashForLegacyTransactionInput` and its
+        // segwit twin throw where they can't take the input's redeem script.
         let Some(redeem) = redeem else {
-            return Ok(false);
+            return Err(PrecompileError::other(
+                "addSignature: an input has no redeem script to sign over",
+            ));
         };
         let sighash = if is_witness[i] {
             segwit_sighash_all(tx, i, &redeem, prev_value)
@@ -7257,6 +7262,44 @@ mod tests {
             apply_signatures_to_tx(&mut tx, &[sig_over(&correct)], pk, None).expect("no throw")
         );
         assert_ne!(tx.input[0].script_sig, before);
+    }
+
+    /// rskj takes every input's sighash before it reads a signature
+    /// (`BridgeSupport.processSigning`), and
+    /// `BitcoinUtils.generateSigHashForLegacyTransactionInput` throws where it
+    /// can't take an input's redeem script from its scriptSig: the call fails,
+    /// whatever the signatures.
+    #[test]
+    fn an_input_with_no_redeem_script_fails_the_call() {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        use k256::ecdsa::{Signature, SigningKey};
+
+        let sk = SigningKey::from_slice(&[1; 32]).unwrap();
+        let pk: [u8; 33] = sk
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        let mut tx = BtcTransaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![],
+        };
+        let sig: Signature = sk.sign_prehash(&[0x5a; 32]).unwrap();
+        let signed =
+            apply_signatures_to_tx(&mut tx, &[sig.to_der().as_bytes().to_vec()], &pk, None);
+        assert!(
+            signed.is_err(),
+            "rskj throws where an input has no redeem script"
+        );
+        assert!(tx.input[0].script_sig.is_empty(), "nothing may be written");
     }
 
     /// Regression for mainnet #2,448,984: a federator whose key is NOT in an
