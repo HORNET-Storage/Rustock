@@ -108,9 +108,12 @@ pub struct NodeSection {
     pub data_dir: Option<String>,
     pub network_id: Option<u64>,
     pub secret_key: Option<String>,
-    /// Parsed as an IP address, matching the flag's type -- a malformed value
-    /// is rejected when the file is read rather than misused later.
-    pub external_ip: Option<std::net::IpAddr>,
+    /// Parsed as an IPv4 address, matching the flag's type -- an IPv6 or
+    /// malformed value is rejected when the file is read rather than misused
+    /// later.
+    pub external_ip: Option<std::net::Ipv4Addr>,
+    /// `"off"` or an `https://` URL, as the flag takes.
+    pub ip_check_url: Option<String>,
     pub supply_check: Option<String>,
     /// `"on"` / `"off"`, as the flag takes.
     pub rskj_multisig_senders: Option<String>,
@@ -462,6 +465,7 @@ pub const CONFIGURABLE: &[&str] = &[
     "network_id",
     "secret_key",
     "external_ip",
+    "ip_check_url",
     "supply_check",
     "execution_threads",
     "rskj_multisig_senders",
@@ -682,6 +686,34 @@ mod tests {
         let file = write("[node]\nport = \"thirty thousand\"\n");
         let err = FileConfig::load(file.path().to_str().unwrap()).unwrap_err();
         assert!(err.to_string().contains("port"), "{err}");
+    }
+
+    #[test]
+    fn an_ipv6_external_ip_is_rejected_on_the_command_line() {
+        let err = Args::command()
+            .try_get_matches_from(["rustock", "--external-ip", "::1"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--external-ip") && err.contains("IPv4"), "{err}");
+    }
+
+    #[test]
+    fn an_ipv6_external_ip_is_rejected_in_the_file() {
+        let file = write("[node]\nexternal_ip = \"2606:4700::1111\"\n");
+        let err = format!("{:#}", FileConfig::load(file.path().to_str().unwrap()).unwrap_err());
+        assert!(err.contains("external_ip") && err.contains("IPv4"), "{err}");
+    }
+
+    #[test]
+    fn private_ipv4_external_addresses_are_accepted() {
+        for ip in ["10.1.2.3", "192.168.0.5", "127.0.0.1"] {
+            let (_, args) = parse(&["rustock", "--external-ip", ip]);
+            assert_eq!(args.external_ip, Some(ip.parse().unwrap()));
+        }
+        let file = write("[node]\nexternal_ip = \"10.1.2.3\"\n");
+        let (m, mut a) = parse(&["rustock"]);
+        crate::apply_file_config(&m, &FileConfig::load(file.path().to_str().unwrap()).unwrap(), &mut a);
+        assert_eq!(a.external_ip, Some("10.1.2.3".parse().unwrap()));
     }
 
     /// A missing file is an error naming the path, not a silent fallback to
