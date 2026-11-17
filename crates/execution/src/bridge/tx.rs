@@ -433,8 +433,9 @@ pub fn get_btc_transaction_confirmations<CTX: crate::RskContextTr>(
         root
     };
     let root_valid = computed_root == block_merkle_root
-        || get_coinbase_information(ctx, &block_hash_bytes)
-            .is_some_and(|witness_root| witness_root == computed_root);
+        || (hardfork_cfg.has_rskip143(block_number)
+            && get_coinbase_information(ctx, &block_hash_bytes)
+                .is_some_and(|witness_root| witness_root == computed_root));
     if !root_valid {
         return Ok(encode_int_output(
             gas_cost,

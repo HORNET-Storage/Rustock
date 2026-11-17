@@ -136,6 +136,20 @@ fn before_rskip143_a_branch_from_the_witness_hash_proves_nothing() {
     assert_eq!(answer, INVALID_MERKLE_BRANCH);
 }
 
+/// rskj's `isBlockMerkleRootValid` reads the witness root registered for a
+/// block only from RSKIP143: before it, a branch to the root kept with the
+/// block's coinbase proves nothing, and from it the transaction is proven
+/// (`from_rskip143_a_branch_to_the_registered_witness_root_proves_the_transaction`).
+/// No chain shows it, since a coinbase can be registered only from RSKIP143;
+/// the root is put in place as `registerBtcCoinbaseTransaction` keeps it.
+#[test]
+fn before_rskip143_a_registered_witness_root_proves_nothing() {
+    let tx = transaction(&key_from_seed("k1"), a_witness());
+    let (mut ctx, config, cfg, header) = holding(Wasabi100, id_of(&tx), Some(hash_of(&tx)));
+    let answer = confirmations(&mut ctx, &config, &cfg, hash_of(&tx), &header);
+    assert_eq!(answer, INVALID_MERKLE_BRANCH);
+}
+
 /// `getBtcTransactionConfirmations_accepts_tx_with_witness_after_rskip_143`
 /// and `isBlockMerkleRootValid_coinbase_information_not_null_and_equal_mroots_after_rskip_143`.
 #[test]
