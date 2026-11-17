@@ -3023,17 +3023,17 @@ pub fn release_btc<CTX: crate::RskContextTr>(
     let use_tx_hash_format = hardfork_cfg.has_rskip146(block_number);
 
     if use_tx_hash_format {
-        // Post-RSKIP146: store in releaseRequestQueueWithTxHash (triple format)
-        let key = bridge_storage_key(RELEASE_REQUEST_QUEUE_WITH_TXHASH_KEY);
-        let existing = bridge_load_bytes(ctx, key);
-        let mut queue = deserialize_release_queue_with_hash(&existing);
+        // Post-RSKIP146: rskj's `getReleaseRequestQueue` reads both cells,
+        // `releaseRequestQueue` and `releaseRequestQueueWithTxHash`, the
+        // request goes in with its hash, and `saveReleaseRequestQueue` writes
+        // both back, the legacy one as the empty list where it held nothing.
+        let mut queue = load_release_request_queue(ctx, true);
         queue.push(ReleaseRequest {
             btc_dest_hash160: btc_dest,
             amount_satoshis,
             rsk_tx_hash: Some(tx_ctx.rsk_tx_hash),
         });
-        let updated = serialize_release_queue_with_hash(&queue);
-        bridge_store_bytes(ctx, key, &updated);
+        save_release_request_queue(ctx, &queue, true);
     } else {
         // Pre-RSKIP146: store in releaseRequestQueue (pair format)
         let key = bridge_storage_key(RELEASE_REQUEST_QUEUE_KEY);
@@ -6141,6 +6141,7 @@ pub fn get_queued_pegouts_count<CTX: crate::RskContextTr>(
     // only exists from RSKIP271 (hop400), which is well past RSKIP146, so the
     // with-txhash half is always in scope here.
     let entries = load_release_request_queue(ctx, true);
+    write_back_release_request_queue(ctx, true);
     let count = U256::from(entries.len());
     Ok(PrecompileOutput::new(gas_cost, count.to_be_bytes::<32>().to_vec().into()))
 }
@@ -6183,6 +6184,17 @@ fn save_release_request_queue<CTX: crate::RskContextTr>(
             &serialize_release_queue_with_hash(&with_hash),
         );
     }
+}
+
+/// rskj's `Bridge.execute` ends a method that returns with `teardown`, whose
+/// `BridgeStorageProvider.save` writes the release-request queue back if the
+/// method read it (`saveReleaseRequestQueue`): `releaseRequestQueue`, and
+/// from RSKIP146 `releaseRequestQueueWithTxHash`, each as rskj serializes
+/// what it read, the empty list where a cell held nothing. The getters that
+/// read the queue write it back so too.
+fn write_back_release_request_queue<CTX: crate::RskContextTr>(ctx: &mut CTX, rskip146: bool) {
+    let queue = load_release_request_queue(ctx, rskip146);
+    save_release_request_queue(ctx, &queue, rskip146);
 }
 
 /// rskj `BridgeStorageProvider.getReleaseRequestQueue` (l.168-193): the legacy
@@ -6386,6 +6398,9 @@ pub fn get_estimated_fees_for_next_pegout<CTX: crate::RskContextTr>(
 ) -> Result<PrecompileOutput, PrecompileError> {
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let fee = estimated_fees_for_next_pegout(ctx, config, hardfork_cfg, block_number)?;
+    // The method exists from RSKIP271, where `getQueuedPegoutsCount` reads
+    // the queue.
+    write_back_release_request_queue(ctx, hardfork_cfg.has_rskip146(block_number));
     let out = U256::from(fee).to_be_bytes::<32>();
     Ok(PrecompileOutput::new(gas_cost, out.to_vec().into()))
 }
@@ -6444,6 +6459,7 @@ pub fn get_estimated_fees_for_pegout_amount<CTX: crate::RskContextTr>(
         .ok_or_else(|| {
             PrecompileError::other("getEstimatedFeesForPegOutAmount: cannot simulate peg-out")
         })?;
+    write_back_release_request_queue(ctx, hardfork_cfg.has_rskip146(block_number));
     let out = U256::from(fee).to_be_bytes::<32>();
     Ok(PrecompileOutput::new(gas_cost, out.to_vec().into()))
 }

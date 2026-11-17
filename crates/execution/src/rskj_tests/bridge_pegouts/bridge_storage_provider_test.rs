@@ -151,7 +151,6 @@ fn from_rskip146_a_peg_out_request_is_queued_with_its_hash_after_the_legacy_ones
 /// and `releaseBtc` loads it to add the request. Where `releaseRequestQueue`
 /// never held anything, it is written as the empty list.
 #[test]
-#[ignore = "rskj writes releaseRequestQueue back on every save that loaded the queue, the empty list where it held nothing; rustock's releaseBtc writes releaseRequestQueueWithTxHash alone from RSKIP146"]
 fn from_rskip146_a_peg_out_request_writes_the_legacy_queue_back_too() {
     let mut bridge = Bridge::mainnet_at(MAINNET_PAPYRUS200);
     bridge.release(BTC);
@@ -161,6 +160,56 @@ fn from_rskip146_a_peg_out_request_writes_the_legacy_queue_back_too() {
         Some(vec![0xc0]),
         "the empty list, RLP.encodeList()"
     );
+}
+
+/// The getters that read the queue from RSKIP271, `getQueuedPegoutsCount`
+/// and `getEstimatedFeesForNextPegOutEvent`, end as every Bridge method that
+/// returns does in rskj: `teardown` saves what they read, both of the
+/// queue's cells, the empty list where they held nothing.
+#[test]
+fn from_rskip271_the_getters_that_read_the_queue_write_it_back() {
+    for method in [
+        "getQueuedPegoutsCount()",
+        "getEstimatedFeesForNextPegOutEvent()",
+    ] {
+        let mut bridge = Bridge::mainnet_at(MAINNET_HOP400);
+        bridge
+            .execute(&crate::abi::selector(method))
+            .expect("the getter answers");
+        for cell in ["releaseRequestQueue", "releaseRequestQueueWithTxHash"] {
+            assert_eq!(
+                named(&mut bridge.ctx, cell),
+                Some(vec![0xc0]),
+                "{method} writes {cell} back"
+            );
+        }
+    }
+}
+
+/// From RSKIP540 `getEstimatedFeesForPegOutAmount` simulates the peg-out
+/// over the queue it reads, and when it answers, `teardown` writes the
+/// queue back as the other getters do.
+#[test]
+fn from_rskip540_the_estimate_for_an_amount_writes_the_queue_back() {
+    let mut collections = Collections::mainnet_at(MAINNET_VETIVER900);
+    collections.active(1, 10);
+    let wei = alloy_primitives::U256::from(BTC) * alloy_primitives::U256::from(10_000_000_000u64);
+    let data = [
+        crate::abi::selector("getEstimatedFeesForPegOutAmount(uint256)").to_vec(),
+        wei.to_be_bytes::<32>().to_vec(),
+    ]
+    .concat();
+    collections
+        .bridge
+        .execute(&data)
+        .expect("the estimate answers");
+    for cell in ["releaseRequestQueue", "releaseRequestQueueWithTxHash"] {
+        assert_eq!(
+            named(&mut collections.bridge.ctx, cell),
+            Some(vec![0xc0]),
+            "{cell} is written back"
+        );
+    }
 }
 
 /// rskj's `getPegoutsWaitingForConfirmations_before_rskip_146_activation`
