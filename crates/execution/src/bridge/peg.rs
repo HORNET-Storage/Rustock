@@ -6398,7 +6398,10 @@ fn save_release_request_queue<CTX: crate::RskContextTr>(
 /// from RSKIP146 `releaseRequestQueueWithTxHash`, each as rskj serializes
 /// what it read, the empty list where a cell held nothing. The getters that
 /// read the queue write it back so too.
-fn write_back_release_request_queue<CTX: crate::RskContextTr>(ctx: &mut CTX, rskip146: bool) {
+pub(crate) fn write_back_release_request_queue<CTX: crate::RskContextTr>(
+    ctx: &mut CTX,
+    rskip146: bool,
+) {
     let queue = load_release_request_queue(ctx, rskip146);
     save_release_request_queue(ctx, &queue, rskip146);
 }

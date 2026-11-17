@@ -846,6 +846,10 @@ pub fn get_state_for_btc_release_client<CTX: crate::RskContextTr>(
     let data = bridge_load_bytes_named(ctx, PEGOUTS_WAITING_FOR_SIGNATURES_KEY);
     let waiting = super::peg::deserialize_rsk_txs_waiting_for_signatures(&data);
     let serialized = super::peg::serialize_rsk_txs_waiting_for_signatures(&waiting);
+    // rskj's `save()` writes back the set the call read, the empty list where
+    // the cell held nothing. Only a transaction's call keeps that, so only one
+    // before RSKIP88, which made this a local call.
+    bridge_store_bytes_named(ctx, PEGOUTS_WAITING_FOR_SIGNATURES_KEY, &serialized);
     let encoded = serialization::rlp_encode_list(&[serialized]);
     Ok(PrecompileOutput::new(gas_cost, abi_encode_bytes(&encoded).into()))
 }
@@ -940,6 +944,23 @@ pub fn get_state_for_debugging<CTX: crate::RskContextTr>(
     let confirmations_bytes =
         super::peg::serialize_pegouts_waiting_for_confirmations(&confirmations, papyrus);
     let next_pegout = bridge_load_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY).to::<u64>();
+
+    // rskj's `save()` writes back what the call read, each as rskj serializes
+    // it, the empty list where a cell held nothing; the next peg-out height
+    // only where RSKIP271 has it read. Only a transaction's call keeps that,
+    // so only one before RSKIP88, which made this a local call.
+    store_federation_utxos(ctx, hardfork_cfg, block_number, &utxos);
+    bridge_store_bytes_named(
+        ctx,
+        PEGOUTS_WAITING_FOR_SIGNATURES_KEY,
+        &waiting_for_signatures,
+    );
+    super::peg::write_back_release_request_queue(ctx, papyrus);
+    let all_confirmations = super::peg::load_pegout_confirmation_set(ctx, papyrus);
+    super::peg::store_pegout_confirmation_set(ctx, &all_confirmations, papyrus);
+    if hardfork_cfg.has_rskip271(block_number) {
+        bridge_store_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY, U256::from(next_pegout));
+    }
 
     let encoded = serialization::rlp_encode_list(&[
         // encodeBigInteger, not encodeElement: a minimal-length integer.

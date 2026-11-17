@@ -308,3 +308,36 @@ fn a_peg_out_paying_neither_federation_writes_back_the_utxos_it_read() {
         empty_list()
     );
 }
+
+/// Before RSKIP88 a transaction may ask for the state the federators sign
+/// from, which reads the peg-outs waiting for signatures; the call writes
+/// them back.
+#[test]
+fn before_rskip88_a_call_for_the_signing_state_writes_back_what_it_read() {
+    let mut bridge = Bridge::mainnet_at(BEFORE_RSKIP88);
+    bridge
+        .execute(&selector("getStateForBtcReleaseClient()"))
+        .expect("the state");
+    assert_eq!(named(&mut bridge.ctx, "rskTxsWaitingFS"), empty_list());
+}
+
+/// And for the whole state, which reads the new federation's UTXOs, the
+/// peg-outs waiting for signatures, the release request queue and the
+/// peg-outs waiting for confirmations, each written back; the next peg-out
+/// height is read only from RSKIP271.
+#[test]
+fn before_rskip88_a_call_for_the_whole_state_writes_back_what_it_read() {
+    let mut bridge = Bridge::mainnet_at(BEFORE_RSKIP88);
+    bridge
+        .execute(&selector("getStateForDebugging()"))
+        .expect("the state");
+    for cell in [
+        "newFederationBtcUTXOs",
+        "rskTxsWaitingFS",
+        "releaseRequestQueue",
+        "releaseTransactionSet",
+    ] {
+        assert_eq!(named(&mut bridge.ctx, cell), empty_list(), "{cell}");
+    }
+    assert_eq!(named(&mut bridge.ctx, "nextPegoutHeight"), None);
+}
