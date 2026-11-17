@@ -8,7 +8,9 @@
 //! down before it (no signatures, bytes that are not DER); the ports call
 //! the Bridge, as a member's transaction does. Its nested `AddSignature` and
 //! `MigrationTxSigning` tests, of P2SH ERP and P2SH-P2WSH ERP federations
-//! with every upgrade on, run at vetiver900.
+//! with every upgrade on, run at vetiver900. Its parameterized `addSignature`,
+//! of the address the event names a federator by, which RSKIP415 changes,
+//! runs on each side of arrowhead600.
 
 use super::support::*;
 
@@ -53,6 +55,107 @@ fn a_federator_signing_twice_is_logged_twice_before_rskip326_and_once_from_it() 
 fn a_federators_signature_is_logged() {
     assert_eq!(add_signature_events(BEFORE_RSKIP326, true, 1), 1);
     assert_eq!(add_signature_events(FROM_RSKIP326, true, 1), 1);
+}
+
+/// The federator `addSignature`'s event names at block `number` when the
+/// member of the private key 350 signs, in a federation of 150 and 250, each
+/// stored with the RSK key of the private key after its own and the MST key
+/// of the one after that. The signer is stored so too where `multikey`, and
+/// with its BTC key for all three where not. One signature of the two needed
+/// is kept, and logged alone, by the Bridge, with the peg-out's creation hash
+/// and the federator's BTC key.
+fn logged_federator(number: u64, multikey: bool) -> alloy_primitives::Address {
+    use crate::abi::encode::{args, Arg};
+    use crate::bridge::federation::StoredMember;
+    let member = |btc: u16, rsk: u16, mst: u16| {
+        let mut private = [0u8; 32];
+        private[30..].copy_from_slice(&btc.to_be_bytes());
+        let stored = StoredMember {
+            btc: public_key(&btc.to_be_bytes()),
+            rsk: public_key(&rsk.to_be_bytes()),
+            mst: public_key(&mst.to_be_bytes()),
+        };
+        (stored, private)
+    };
+    let signer = if multikey {
+        member(350, 351, 352)
+    } else {
+        member(350, 350, 350)
+    };
+    let members = vec![member(150, 151, 152), member(250, 251, 252), signer];
+    let mut signing = Signing::of_members(number, members, 1);
+    let index = (0..3)
+        .find(|&i| signing.key(i) == signer.0.btc)
+        .expect("the signer is a member");
+    let signature = signing.signature(index);
+    signing
+        .add_signature(index, &signature)
+        .expect("addSignature runs");
+    let logs = logs(&mut signing.bridge.ctx);
+    assert_eq!(logs.len(), 1, "one signature of two, logged alone");
+    assert_eq!(logs[0].address, crate::precompiles::BRIDGE_ADDR);
+    let topics = topics(&logs[0]);
+    assert_eq!(topics.len(), 3);
+    assert_eq!(topics[0], event_topic("add_signature(bytes32,address,bytes)"));
+    assert_eq!(topics[1], RELEASE_HASH);
+    assert_eq!(
+        logs[0].data.data.to_vec(),
+        args(&[Arg::Bytes(&signer.0.btc)]),
+        "the federator's BTC key"
+    );
+    alloy_primitives::Address::from_slice(&topics[2][12..])
+}
+
+/// rskj's `addSignature`, `addSignatureArgProvider`'s four cases: from
+/// RSKIP415 the `add_signature` event names a federator by the address of its
+/// RSK key, and before it by its BTC key's, which is the same where a
+/// member's keys are one. The two addresses are rskj's, of the private keys
+/// 350 and 351.
+#[test]
+fn from_rskip415_a_federator_is_logged_at_its_rsk_keys_address() {
+    let of_btc_key = alloy_primitives::address!("dbc29273d4de3d5645e308c7e629d28d4499b3d3");
+    let of_rsk_key = alloy_primitives::address!("74891a05ad4d7ec87c1cffe9bd00bb4e1382b586");
+    let before = MAINNET_ARROWHEAD600 - 1;
+    assert_eq!(logged_federator(before, false), of_btc_key);
+    assert_eq!(logged_federator(before, true), of_btc_key);
+    assert_eq!(logged_federator(MAINNET_ARROWHEAD600, false), of_btc_key);
+    assert_eq!(logged_federator(MAINNET_ARROWHEAD600, true), of_rsk_key);
+}
+
+/// rskj's `save()` writes back the set of peg-outs waiting for signatures
+/// whenever a call read it (`BridgeStorageProvider
+/// .savePegoutsWaitingForSignatures`), and `addSignature` reads it first
+/// (`addReleaseSignatures`): where it was never written, a call for a
+/// peg-out it does not hold leaves the empty list there. Where it is
+/// written, a call that signs nothing, here by the key of no member, leaves
+/// it as it was.
+#[test]
+fn add_signature_writes_back_the_set_it_read() {
+    let mut signing = Signing::mainnet_at(FROM_RSKIP326);
+    let kept = named(&mut signing.bridge.ctx, "rskTxsWaitingFS");
+    assert!(kept.is_some());
+    let signature = signing.signature(0);
+    signing
+        .add_signatures_as(0, &public_key(&[9]), &[signature.clone()])
+        .expect("addSignature runs");
+    assert_eq!(named(&mut signing.bridge.ctx, "rskTxsWaitingFS"), kept);
+
+    let mut signing = Signing::mainnet_at(FROM_RSKIP326);
+    crate::bridge::storage::bridge_store_raw(
+        &mut signing.bridge.ctx,
+        crate::bridge::storage::bridge_storage_key("rskTxsWaitingFS"),
+        None,
+    );
+    assert_eq!(named(&mut signing.bridge.ctx, "rskTxsWaitingFS"), None);
+    signing
+        .add_signature(0, &signature)
+        .expect("addSignature runs");
+    assert_eq!(
+        named(&mut signing.bridge.ctx, "rskTxsWaitingFS"),
+        Some(vec![0xc0]),
+        "the empty list"
+    );
+    assert!(logs(&mut signing.bridge.ctx).is_empty());
 }
 
 /// rskj's `addSignature_invalidSignatureBeforeRSKIP326_eventStillEmitted` and

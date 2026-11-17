@@ -5077,6 +5077,16 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     let wfs_key = bridge_storage_key(PEGOUTS_WAITING_FOR_SIGNATURES_KEY);
     let wfs_data = bridge_load_bytes(ctx, wfs_key);
     let mut wfs = deserialize_rsk_txs_waiting_for_signatures(&wfs_data);
+    // rskj `BridgeStorageProvider.savePegoutsWaitingForSignatures`: `save()`
+    // writes back the set the call read, whatever the call does next, so a
+    // cell never written takes the empty list.
+    if wfs_data.is_empty() {
+        bridge_store_bytes(
+            ctx,
+            wfs_key,
+            &serialize_rsk_txs_waiting_for_signatures(&wfs),
+        );
+    }
 
     // Find the BTC tx by RSK tx hash
     let btc_tx_raw = match wfs.get(&rsk_tx_hash) {

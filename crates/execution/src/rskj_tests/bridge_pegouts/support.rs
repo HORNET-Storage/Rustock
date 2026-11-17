@@ -276,17 +276,30 @@ pub(super) const OLD_FEDERATION: (&str, &str) = ("oldFederation", "oldFederation
 /// format, made at RSK block `creation_block`, with its format version.
 pub(super) fn store_federation(
     ctx: &mut Ctx,
-    (key_name, format_key): (&str, &str),
+    slot: (&str, &str),
     keys: &[[u8; 33]],
     creation_block: u64,
     format: u64,
 ) {
-    use crate::bridge::federation::{serialize_federation_multikey, StoredMember};
+    use crate::bridge::federation::StoredMember;
     let members: Vec<StoredMember> = keys.iter().copied().map(StoredMember::from_btc).collect();
+    store_members(ctx, slot, &members, creation_block, format);
+}
+
+/// Stores a federation of `members`, each with its own RSK and MST keys, as
+/// [`store_federation`] stores one of BTC keys alone.
+pub(super) fn store_members(
+    ctx: &mut Ctx,
+    (key_name, format_key): (&str, &str),
+    members: &[crate::bridge::federation::StoredMember],
+    creation_block: u64,
+    format: u64,
+) {
+    use crate::bridge::federation::serialize_federation_multikey;
     put_named(
         ctx,
         key_name,
-        &serialize_federation_multikey(&members, 0, creation_block),
+        &serialize_federation_multikey(members, 0, creation_block),
     );
     put_named(ctx, format_key, &serialize_long(format));
 }
@@ -999,6 +1012,10 @@ pub(super) const RELEASE_HASH: [u8; 32] = [0x2b; 32];
 pub(super) struct Signing {
     pub(super) bridge: Bridge,
     privates: Vec<[u8; 32]>,
+    /// Where each member's transaction comes from: the address of its RSK
+    /// key, which rskj's `addSignature` asks a sender to be a member's
+    /// (`BridgeUtils.isFromFederateMember`).
+    senders: Vec<Address>,
     pub(super) redeem: Vec<u8>,
     pub(super) unsigned: bitcoin::Transaction,
 }
@@ -1013,18 +1030,31 @@ impl Signing {
     /// federation's outputs, each input's scriptSig the federation's with no
     /// signature yet.
     pub(super) fn spending(number: u64, inputs: u8) -> Self {
-        let mut members: Vec<([u8; 33], [u8; 32])> = (1..=3u8)
+        use crate::bridge::federation::StoredMember;
+        let members = (1..=3u8)
             .map(|i| {
                 let mut private = [0u8; 32];
                 private[31] = i;
-                (public_key(&[i]), private)
+                (StoredMember::from_btc(public_key(&[i])), private)
             })
             .collect();
+        Self::of_members(number, members, inputs)
+    }
+
+    /// At block `number` of mainnet, the peg-out spending `inputs` of the
+    /// outputs of a federation of `members`, each stored with its own RSK and
+    /// MST keys and signing with the private key of its BTC key.
+    pub(super) fn of_members(
+        number: u64,
+        mut members: Vec<(crate::bridge::federation::StoredMember, [u8; 32])>,
+        inputs: u8,
+    ) -> Self {
         members.sort();
-        let publics: Vec<[u8; 33]> = members.iter().map(|(public, _)| *public).collect();
+        let publics: Vec<[u8; 33]> = members.iter().map(|(member, _)| member.btc).collect();
         let redeem = standard_redeem(&publics);
         let mut bridge = Bridge::mainnet_at(number);
-        store_federation(&mut bridge.ctx, NEW_FEDERATION, &publics, 1, 1000);
+        let stored: Vec<_> = members.iter().map(|(member, _)| *member).collect();
+        store_members(&mut bridge.ctx, NEW_FEDERATION, &stored, 1, 1000);
         let threshold = usize::from(redeem[0] - 0x50);
         let script_sig = [vec![0x00; threshold + 1], push(&redeem)].concat();
         let spent = (1..=inputs)
@@ -1040,9 +1070,17 @@ impl Signing {
             ]),
         );
         let privates = members.iter().map(|(_, private)| *private).collect();
+        let senders = members
+            .iter()
+            .map(|(member, _)| {
+                crate::bridge::federation::rsk_address_from_public_key(&member.rsk)
+                    .expect("an address")
+            })
+            .collect();
         Self {
             bridge,
             privates,
+            senders,
             redeem,
             unsigned,
         }
@@ -1106,9 +1144,7 @@ impl Signing {
         signatures: &[Vec<u8>],
     ) -> Result<PrecompileOutput, PrecompileError> {
         use crate::abi::encode::{args, Arg};
-        self.bridge.caller =
-            crate::bridge::federation::rsk_address_from_public_key(&self.key(member))
-                .expect("an address");
+        self.bridge.caller = self.senders[member];
         let sent: Vec<&[u8]> = signatures.iter().map(Vec::as_slice).collect();
         let data = [
             crate::abi::selector("addSignature(bytes,bytes[],bytes)").to_vec(),
