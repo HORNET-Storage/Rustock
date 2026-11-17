@@ -3158,6 +3158,11 @@ pub fn update_collections<CTX: crate::RskContextTr>(
     // `newFederationFormatVersion` (mainnet #1,591,009).
     super::federation::save_new_federation_multikey(ctx, hardfork_cfg, block_number);
 
+    // rskj reads the peg-outs waiting for confirmations once in the call,
+    // before the call adds any; how many it read sizes the set
+    // `processConfirmedPegouts` walks (`next_pegout_with_enough_confirmations`).
+    let loaded_pegouts = load_pegout_confirmation_set(ctx, use_tx_hash).len();
+
     // -----------------------------------------------------------------------
     // Step 0: Funds migration (rskj processFundsMigration) — while the new
     // federation is in its migration window, each updateCollections call
@@ -3461,6 +3466,7 @@ pub fn update_collections<CTX: crate::RskContextTr>(
             &waiting,
             block_number,
             min_confirmations,
+            loaded_pegouts,
         );
 
         if let Some(pos) = confirmed_pos {
@@ -4189,23 +4195,28 @@ fn build_svp_fund_transaction<CTX: crate::RskContextTr>(
 /// `new PegoutsWaitingForConfirmations(entries)` →
 /// `this.entries = new HashSet<>(entries)` (constructor, NOT incremental). The
 /// `HashSet(Collection)` constructor pre-sizes the table to
-/// `tableSizeFor(max((int)(n / 0.75f) + 1, 16))`, so for `n` final entries the
-/// capacity is the next power of two `>= max((int)(n / 0.75) + 1, 16)`. This
-/// differs from an incremental default-16 fill exactly at the resize boundaries
-/// (e.g. `n = 12` -> cap 32 here, but an incremental fill would stay at 16;
-/// `n = 24` -> 64 vs 32), and getting it wrong reshuffles the bucket walk and
-/// forks the pegout selection (mainnet #3,344,303). Returns the index into
-/// `entries`.
-fn next_pegout_with_enough_confirmations(
+/// `tableSizeFor(max((int)(n / 0.75f) + 1, 16))`, so for the `loaded` entries
+/// the call read the capacity is the next power of two
+/// `>= max((int)(n / 0.75) + 1, 16)`. This differs from an incremental
+/// default-16 fill exactly at the resize boundaries (e.g. `n = 12` -> cap 32
+/// here, but an incremental fill would stay at 16; `n = 24` -> 64 vs 32), and
+/// getting it wrong reshuffles the bucket walk and forks the pegout selection
+/// (mainnet #3,344,303). The migration and the peg-outs the same call built
+/// went into that same set one at a time (`PegoutsWaitingForConfirmations.add`),
+/// and `HashMap.putVal` doubled its table whenever one left it more than
+/// three quarters full (`walked_hashset_capacity`); `entries` holds them too.
+/// Returns the index into `entries`.
+pub(crate) fn next_pegout_with_enough_confirmations(
     entries: &[PegoutWaitingForConfirmations],
     current_block: u64,
     min_confirmations: u64,
+    loaded: usize,
 ) -> Option<usize> {
     if entries.is_empty() {
         return None;
     }
 
-    let cap = java_hashset_capacity(entries.len());
+    let cap = walked_hashset_capacity(loaded, entries.len());
 
     // Bucket each entry; within a bucket preserve insertion (storage) order.
     let mut buckets: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
@@ -4235,6 +4246,20 @@ fn next_pegout_with_enough_confirmations(
 fn java_hashset_capacity(n: usize) -> u32 {
     let init_cap = std::cmp::max((n as f32 / 0.75) as u32 + 1, 16);
     init_cap.next_power_of_two()
+}
+
+/// The capacity of a set built from `loaded` entries (`java_hashset_capacity`)
+/// once it holds `now`, the rest added one at a time: `HashMap.putVal` doubles
+/// the table whenever an insertion leaves more than three quarters of it
+/// taken (`++size > threshold`, the threshold `0.75` of the capacity).
+fn walked_hashset_capacity(loaded: usize, now: usize) -> u32 {
+    let mut capacity = java_hashset_capacity(loaded);
+    for size in loaded + 1..=now {
+        if size as u64 > u64::from(capacity) * 3 / 4 {
+            capacity *= 2;
+        }
+    }
+    capacity
 }
 
 /// rskj `PegoutsWaitingForConfirmations.Entry.hashCode()`:
@@ -7764,7 +7789,7 @@ mod tests {
             entries.push(mk(&[1, 0, 0, 0, i], 3_345_000));
         }
 
-        let pos = next_pegout_with_enough_confirmations(&entries, 3_345_557, 4000)
+        let pos = next_pegout_with_enough_confirmations(&entries, 3_345_557, 4000, entries.len())
             .expect("one confirmed entry");
         assert_eq!(
             entries[pos].btc_tx_raw, selected_btc,
@@ -7801,6 +7826,24 @@ mod tests {
         assert_eq!(java_hashset_capacity(48), 128);
     }
 
+    /// rskj adds the peg-outs a call builds to the set it read
+    /// (`PegoutsWaitingForConfirmations.add`), one at a time, and
+    /// `HashMap.putVal` doubles the table once the set holds more than three
+    /// quarters of it: eleven read and one added stay at 16, where a set read
+    /// with twelve is 32, and a second added takes it to 32.
+    #[test]
+    fn a_set_grows_by_the_entries_added_after_it_was_read() {
+        assert_eq!(walked_hashset_capacity(11, 11), 16);
+        assert_eq!(walked_hashset_capacity(11, 12), 16);
+        assert_eq!(walked_hashset_capacity(11, 13), 32);
+        assert_eq!(walked_hashset_capacity(12, 12), 32);
+        assert_eq!(walked_hashset_capacity(0, 12), 16);
+        assert_eq!(walked_hashset_capacity(0, 13), 32);
+        assert_eq!(walked_hashset_capacity(23, 24), 32);
+        assert_eq!(walked_hashset_capacity(23, 25), 64);
+        assert_eq!(walked_hashset_capacity(24, 25), 64);
+    }
+
     /// Resize-boundary selection: with the two real h=3,341,556 entries plus
     /// fillers totalling exactly 13 entries the capacity is 32 (a7c69a46→bucket 9,
     /// 0260d432→bucket 20), so the a7c69a46 tx is selected — the #3,345,557
@@ -7827,7 +7870,7 @@ mod tests {
         }
         assert_eq!(entries.len(), 13);
         assert_eq!(java_hashset_capacity(entries.len()), 32);
-        let pos = next_pegout_with_enough_confirmations(&entries, 3_345_557, 4000)
+        let pos = next_pegout_with_enough_confirmations(&entries, 3_345_557, 4000, entries.len())
             .expect("one confirmed entry");
         assert_eq!(entries[pos].btc_tx_raw, selected_btc);
     }
@@ -7869,7 +7912,7 @@ mod tests {
         assert_eq!(entries.len(), 12);
         // n=12 → the HashSet(Collection) constructor pre-sizes to 32.
         assert_eq!(java_hashset_capacity(12), 32);
-        let pos = next_pegout_with_enough_confirmations(&entries, 3_344_303, 4000)
+        let pos = next_pegout_with_enough_confirmations(&entries, 3_344_303, 4000, entries.len())
             .expect("a confirmed entry");
         assert_eq!(
             entries[pos].btc_tx_raw, rskj_btc,
