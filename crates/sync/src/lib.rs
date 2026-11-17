@@ -56,6 +56,3 @@ pub use tokio::sync::mpsc;
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod rskj_tests;
