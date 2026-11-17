@@ -444,6 +444,62 @@ async fn test_follow_buffer_keeps_waiting_on_a_same_height_reorg() {
 }
 
 #[tokio::test]
+async fn test_follow_mode_counts_from_block_0_on_a_new_database() {
+    // A node that runs blocks, on a new database, has no executed head
+    // recorded: its state is block 0's, which `load_or_build_state` builds, and
+    // the sync decision takes block 0 for the head. The follow path returned at
+    // once with no head recorded, so a node started near its peer's tip, as on
+    // a young chain, ran nothing that came until its watchdog moved it to a
+    // batch, minutes later; rskj connects block 1 as it arrives. A node that
+    // runs no blocks keeps them buffered (`tip_node`'s tests).
+    let dir = tempdir().unwrap();
+    let store = Arc::new(BlockStore::open(dir.path()).unwrap());
+    let genesis = dummy_header(0, B256::ZERO, U256::from(1));
+    store.update_head(&genesis, U256::from(1)).unwrap();
+    assert!(store.exec_head().unwrap().is_none(), "no executed head is recorded");
+
+    let trie = Arc::new(rustock_trie::MemoryTrieStore::new()) as Arc<dyn rustock_trie::TrieStore>;
+    let verifier = Arc::new(HeaderVerifier::new());
+    let peer_store = Arc::new(rustock_networking::peers::PeerStore::new());
+    let manager = Arc::new(SyncManager::new(store.clone(), verifier, peer_store.clone()));
+    let (_tx, event_rx) = mpsc::unbounded_channel();
+    let processor = rustock_execution::BlockProcessor::new(
+        rustock_execution::RskHardforkConfig::mainnet(),
+        store.clone(),
+    );
+    let mut service = SyncService::new(manager, peer_store, event_rx).with_block_processor(
+        processor,
+        trie,
+        rustock_trie::TrieNode::empty(),
+    );
+    service.state = SyncState::Following;
+
+    // Block 1, on block 0, is taken up to run (a header made for the test, so
+    // its run goes no further).
+    let b1 = dummy_header(1, genesis.hash(), U256::from(1));
+    service.follow_buffer.insert(1, (b1.hash(), b1.clone(), vec![], vec![]));
+    service.drain_follow_buffer().await;
+    assert!(
+        service.follow_buffer.is_empty(),
+        "block 1 builds on block 0, the head, and is taken up"
+    );
+
+    // Block 2 with block 1 missing is a gap above block 0, re-fetched once it
+    // has outlived any response still on its way.
+    let b2 = dummy_header(2, b1.hash(), U256::from(1));
+    service.follow_buffer.insert(2, (b2.hash(), b2.clone(), vec![], vec![]));
+    service.last_body_height = 2;
+    service.drain_follow_buffer().await;
+    assert_eq!(service.follow_buffer.len(), 1, "a fresh gap is given time");
+    service.follow_gap_since =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
+    service.drain_follow_buffer().await;
+    assert!(service.follow_buffer.is_empty(), "the buffer is dropped for the missing range");
+    assert_eq!(service.last_body_height, 0, "the body cursor rewinds to block 0");
+    assert!(matches!(service.state, SyncState::Idle), "and a sync round starts");
+}
+
+#[tokio::test]
 async fn test_execution_watchdog_restarts_a_stalled_pipeline() {
     // Nothing in this service measured execution itself. Header download, the
     // "fell behind" check and the resync trigger all compare the *downloaded*

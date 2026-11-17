@@ -5670,8 +5670,22 @@ impl SyncService {
             return;
         }
         loop {
+            // A node that runs blocks, on a new database, has no executed head
+            // recorded. The state this path runs on is then block 0's, which
+            // `load_or_build_state` built, and the head is block 0, as
+            // `try_start_sync` takes it. Returning here ran nothing in follow
+            // mode: a node started within reach of its peer's tip, as on a young
+            // chain, stored every block that came and ran none until its
+            // watchdog moved it to a batch, minutes later, where rskj connects
+            // block 1 as it arrives. A node that runs no blocks keeps them.
             let head_hash = match self.manager.store.exec_head().ok().flatten() {
                 Some((hash, _)) => hash,
+                None if self.block_processor.is_some() => {
+                    match self.manager.store.canonical_hash(0).ok().flatten() {
+                        Some(hash) => hash,
+                        None => return,
+                    }
+                }
                 None => return,
             };
             let next_num = match self.follow_buffer.keys().next().copied() {
