@@ -2948,11 +2948,13 @@ pub fn release_btc<CTX: crate::RskContextTr>(
         let (active_keys, active_redeem) =
             active_federation_keys_and_redeem(ctx, config, hardfork_cfg, block_number);
         let num_sigs_required = (active_keys.len() / 2 + 1) as u64;
+        let segwit = active_federation_format(ctx, config, hardfork_cfg, block_number) >= 4000;
         let require_funds_for_fee = require_funds_for_fee(
             &active_redeem,
             num_sigs_required,
             fee_per_kb,
             hardfork_cfg.has_rskip271(block_number),
+            segwit,
             config,
         );
         let min_value = config.minimum_pegout_tx_value.max(require_funds_for_fee);
@@ -5926,12 +5928,18 @@ pub(crate) fn load_federation_member_keys<CTX: crate::RskContextTr>(ctx: &mut CT
 ///
 /// - Pre-RSKIP271: `BridgeUtilsLegacy.calculatePegoutTxSize` — an analytic
 ///   approximation parameterised by the script-sig chunk size.
-/// - Post-RSKIP271: `BridgeUtils.calculateLegacyTxSize` — the exact
+/// - Post-RSKIP271: `BridgeUtils.calculatePegoutTxSize`, by the federation's
+///   format: `calculateSegwitTxSize` for a P2SH-P2WSH ERP federation,
+///   `calculateLegacyTxSize` for any other -- the exact
 ///   `BtcTransaction.bitcoinSerialize()` length of a 2-in/2-out legacy tx whose
 ///   inputs carry the redeem script as their scriptSig, plus
-///   `numSigsRequired * inputsCount * 72`. (Mainnet federations are never
-///   segwit at the heights rustock handles, so only the legacy branch applies.)
-fn regular_pegout_tx_size(redeem: &[u8], num_sigs_required: u64, rskip271: bool) -> u64 {
+///   `numSigsRequired * inputsCount * 72`.
+fn regular_pegout_tx_size(
+    redeem: &[u8],
+    num_sigs_required: u64,
+    rskip271: bool,
+    segwit: bool,
+) -> u64 {
     const INPUTS: u64 = 2;
     const OUTPUTS: u64 = 2;
 
@@ -5949,29 +5957,20 @@ fn regular_pegout_tx_size(redeem: &[u8], num_sigs_required: u64, rskip271: bool)
             + (OUTPUT_SIZE + 1 + OUTPUT_ADDITIONAL_DATA_SIZE) * OUTPUTS;
     }
 
-    // Post-RSKIP271: exact bitcoinSerialize() length of the legacy tx that
-    // BridgeUtils.calculateLegacyTxSize builds (input scriptSig = redeem,
-    // output scriptPubKey = the 23-byte P2SH-to-federation script).
-    const P2SH_SCRIPT_LEN: u64 = 23;
-    let r = redeem.len() as u64;
-    let base_size = 4 // version
-        + varint_size(INPUTS)
-        + INPUTS * (36 + varint_size(r) + r + 4)
-        + varint_size(OUTPUTS)
-        + OUTPUTS * (8 + varint_size(P2SH_SCRIPT_LEN) + P2SH_SCRIPT_LEN)
-        + 4; // locktime
-    let signing_size = num_sigs_required * INPUTS * 72;
-    base_size + signing_size
-}
-
-/// bitcoinj `VarInt` serialized length.
-fn varint_size(n: u64) -> u64 {
-    match n {
-        0..=0xfc => 1,
-        0xfd..=0xffff => 3,
-        0x1_0000..=0xffff_ffff => 5,
-        _ => 9,
-    }
+    // The outputs pay the federation's address, a P2SH output script of 23
+    // bytes whatever the format; only its length counts.
+    let fed_script = p2sh_output_script(&[0; 20]);
+    let (threshold, inputs, outputs) = (
+        num_sigs_required as usize,
+        INPUTS as usize,
+        OUTPUTS as usize,
+    );
+    let size = if segwit {
+        pegout_tx_size_segwit(redeem, &fed_script, threshold, inputs, outputs)
+    } else {
+        pegout_tx_size_legacy(redeem, &fed_script, threshold, inputs, outputs)
+    };
+    size as u64
 }
 
 /// rskj `BridgeSupport.requestRelease` minimum-fee estimate (post-RSKIP219):
@@ -5981,9 +5980,10 @@ fn require_funds_for_fee(
     num_sigs_required: u64,
     fee_per_kb: u64,
     rskip271: bool,
+    segwit: bool,
     config: &BridgeConstants,
 ) -> u64 {
-    let pegout_size = regular_pegout_tx_size(redeem, num_sigs_required, rskip271);
+    let pegout_size = regular_pegout_tx_size(redeem, num_sigs_required, rskip271, segwit);
     let base = fee_per_kb * pegout_size / 1000;
     base + base * config.minimum_pegout_value_percentage_to_receive_after_fee / 100
 }
@@ -8859,10 +8859,13 @@ mod tests {
         let redeem = build_federation_redeem_script(&keys, threshold);
 
         // Post-RSKIP271: exact match against rskj's 2058.
-        assert_eq!(regular_pegout_tx_size(&redeem, threshold as u64, true), 2058);
+        assert_eq!(
+            regular_pegout_tx_size(&redeem, threshold as u64, true, false),
+            2058
+        );
 
         // Pre-RSKIP271: within 2% of the real-world 2076-byte tx.
-        let legacy = regular_pegout_tx_size(&redeem, threshold as u64, false) as i64;
+        let legacy = regular_pegout_tx_size(&redeem, threshold as u64, false, false) as i64;
         let orig = 2076i64;
         assert!(
             (orig - legacy).abs() as f64 <= orig as f64 * 0.02,
@@ -8880,7 +8883,7 @@ mod tests {
         let keys = genesis_federation_keys(&config);
         let threshold = keys.len() / 2 + 1;
         let redeem = build_federation_redeem_script(&keys, threshold);
-        let fee = require_funds_for_fee(&redeem, threshold as u64, 30_000, true, &config);
+        let fee = require_funds_for_fee(&redeem, threshold as u64, 30_000, true, false, &config);
         assert!(
             fee < config.minimum_pegout_tx_value,
             "require_funds_for_fee {fee} should be below {} so reason is LOW_AMOUNT",

@@ -95,7 +95,11 @@ fn from_rskip185_a_request_below_the_minimum_is_refunded_and_logged() {
     assert!(logs(&mut bridge.ctx).is_empty());
 
     let mut bridge = Bridge::mainnet_at(FROM_RSKIP185);
-    put_named(&mut bridge.ctx, "feePerKb", &rlp_encode_element(&[0x13, 0x88]));
+    put_named(
+        &mut bridge.ctx,
+        "feePerKb",
+        &rlp_encode_element(&[0x13, 0x88]),
+    );
     bridge.release(LOW);
     assert_eq!(queued(&mut bridge), 0);
     assert_eq!(bridge.balance(STRANGER), wei(LOW));
@@ -105,6 +109,47 @@ fn from_rskip185_a_request_below_the_minimum_is_refunded_and_logged() {
     assert_eq!(topics(&logs[0]), [rejected, as_topic(STRANGER)]);
     assert_eq!(word(&logs[0].data.data, 0), U256::from(LOW));
     assert_eq!(word(&logs[0].data.data, 1), U256::from(1), "LOW_AMOUNT");
+}
+
+/// From RSKIP271 rskj sizes the peg-out whose fee a request must cover by
+/// the active federation's format (`BridgeUtils.calculatePegoutTxSize`): a
+/// P2SH-P2WSH ERP federation's spend weighs its witness at a quarter, a P2SH
+/// ERP federation's counts it whole. At 0.02 BTC a kilobyte, a request of
+/// 0.03 BTC covers the first and not the second, which turns it down with
+/// the reason FEE_ABOVE_VALUE.
+#[test]
+fn from_rskip271_a_segwit_federations_pegout_is_sized_by_its_weight() {
+    let rejected = event_topic("release_request_rejected(address,uint256,int256)");
+    for (format, accepted) in [(P2SH_ERP, false), (P2SH_P2WSH_ERP, true)] {
+        let mut bridge = Bridge::mainnet_at(MAINNET_VETIVER900);
+        store_federation(&mut bridge.ctx, NEW_FEDERATION, &active(), 1, format);
+        put_named(
+            &mut bridge.ctx,
+            "feePerKb",
+            &rlp_encode_element(&[0x1e, 0x84, 0x80]),
+        );
+        bridge.release(3 * CENT);
+        assert_eq!(
+            queued(&mut bridge),
+            usize::from(accepted),
+            "format {format}"
+        );
+        let logs = logs(&mut bridge.ctx);
+        let turned_down: Vec<_> = logs
+            .iter()
+            .filter(|log| topics(log)[0] == rejected)
+            .collect();
+        if accepted {
+            assert!(turned_down.is_empty());
+        } else {
+            assert_eq!(turned_down.len(), 1);
+            assert_eq!(
+                word(&turned_down[0].data.data, 1),
+                U256::from(3),
+                "FEE_ABOVE_VALUE"
+            );
+        }
+    }
 }
 
 /// rskj's `release_after_papyrus_before_iris_rejected_contractCaller_throws_exception`

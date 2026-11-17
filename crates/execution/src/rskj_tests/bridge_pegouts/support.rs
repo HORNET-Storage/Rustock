@@ -1255,6 +1255,9 @@ pub(super) const STANDARD_MULTISIG: u64 = 1000;
 /// rskj's `FederationFormatVersion.P2SH_ERP_FEDERATION`.
 pub(super) const P2SH_ERP: u64 = 3000;
 
+/// rskj's `FederationFormatVersion.P2SH_P2WSH_ERP_FEDERATION`.
+pub(super) const P2SH_P2WSH_ERP: u64 = 4000;
+
 /// Mainnet's Bridge at a block, about to run `updateCollections` as rskj's
 /// `updateCollections` tests set it up: a fee per kilobyte of a millicoin,
 /// and the federations, UTXOs and requests a test gives it.
