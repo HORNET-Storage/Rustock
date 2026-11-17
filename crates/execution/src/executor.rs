@@ -2165,6 +2165,9 @@ impl RskExecutor {
                                 .unwrap_or_default();
                             let use_v2 = self.hardfork_cfg.has_stored_block_v2(header.number);
                             let checkpoint = evm.ctx.journal_mut().checkpoint();
+                            // The logs the journal holds before the call, to tell
+                            // the call's own apart if it throws (below).
+                            let logs_before = evm.ctx.journal().logs().len();
                             let outcome = crate::bridge::execute_bridge(
                                 &mut evm.ctx,
                                 tx.input.as_ref(),
@@ -2205,8 +2208,14 @@ impl RskExecutor {
                                 }
                                 Err(e) if crate::bridge::is_invisible_exception(&e) => {
                                     // rskj invisible exception: receipt SUCCESS with
-                                    // the spent gas, no logs, no endowment — but the
-                                    // sender is charged the FULL gas limit.
+                                    // the spent gas and no endowment, but the sender is
+                                    // charged the FULL gas limit. What the method logged
+                                    // before it threw stays in the receipt: the Bridge
+                                    // writes its logs straight into the result's list,
+                                    // which only the VM's path clears on a throw
+                                    // (`TransactionExecutor.go` returns at `vm == null`),
+                                    // and the receipt takes that list.
+                                    let kept = evm.ctx.journal().logs()[logs_before..].to_vec();
                                     evm.ctx.chain_mut().raw_storage.discard_call();
                                     // RSKIP-144: the writes this call attempted are
                                     // about to be popped off the journal. The EVM's
@@ -2223,7 +2232,7 @@ impl RskExecutor {
                                         evm.ctx.journal_mut().inner.journal.len(),
                                     );
                                     invisible_exception = true;
-                                    (true, Vec::new(), Vec::new())
+                                    (true, Vec::new(), kept)
                                 }
                                 Err(e) => {
                                     evm.ctx.chain_mut().raw_storage.discard_call();
@@ -13092,6 +13101,87 @@ mod tests {
             Err(error) => assert!(error.to_string().contains("Not enough gas"), "{error}"),
             Ok(_) => panic!("the block executes"),
         }
+    }
+
+    /// A free Bridge call that throws after it logged keeps its logs in the
+    /// receipt, as rskj keeps them: the Bridge writes its logs straight into
+    /// the result's list, which only the VM's path clears on a throw
+    /// (`TransactionExecutor.go` returns at `vm == null`). On rskj's regtest a
+    /// federator's Bridge transactions are always free; federator1's
+    /// `updateCollections` logs `update_collections` and then refuses a
+    /// confirmed peg-out of no creation hash, made before RSKIP146, as RSKIP375
+    /// refuses it. The receipt is a success at no gas with that one log, and the
+    /// call's writes are dropped.
+    #[test]
+    fn a_free_bridge_call_that_throws_keeps_what_it_logged() {
+        use crate::bridge::peg::{
+            serialize_pegouts_waiting_for_confirmations, PegoutWaitingForConfirmations,
+        };
+        use crate::bridge::storage::{bridge_storage_key, PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY};
+        let federator1 = rsk_address_from_pubkey_hex(
+            "0362634ab57dae9cb373a5d536e66a8c4f67468bbcfb063809bab643072d78a124",
+        )
+        .unwrap();
+        let store = Arc::new(MemoryTrieStore::new());
+        let root = put_account(&TrieNode::empty(), store.as_ref(), &federator1, 0, U256::ZERO);
+        // A peg-out of one input and one output, kept in the cell of no hashes
+        // since block 0.
+        let mut pegout = vec![1, 0, 0, 0, 1];
+        pegout.extend_from_slice(&[0x11; 32]);
+        pegout.extend_from_slice(&[0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 1]);
+        pegout.extend_from_slice(&100_000_000u64.to_le_bytes());
+        pegout.extend_from_slice(&[1, 0x51, 0, 0, 0, 0]);
+        let cell = serialize_pegouts_waiting_for_confirmations(
+            &[PegoutWaitingForConfirmations {
+                btc_tx_raw: pegout,
+                rsk_block_height: 0,
+                rsk_tx_hash: None,
+            }],
+            false,
+        );
+        let key = rustock_trie::storage_key(
+            &crate::precompiles::BRIDGE_ADDR,
+            &B256::from(bridge_storage_key(PEGOUTS_WAITING_FOR_CONFIRMATIONS_KEY)),
+        );
+        let root = root.put(&TrieKeySlice::from_key(&key), &cell, store.as_ref());
+        let tx = rustock_core::Transaction {
+            nonce: 0,
+            gas_price: U256::ZERO,
+            gas_limit: U256::ZERO,
+            to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+            value: U256::ZERO,
+            input: Bytes::copy_from_slice(&block_header_selector("updateCollections()")),
+            v: 28,
+            r: U256::from(1),
+            s: U256::from(1),
+            cached_rlp: None,
+        };
+        let block_store = Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+        let executor = RskExecutor::new(RskHardforkConfig::rskj_regtest(), block_store)
+            .with_bridge_constants(crate::bridge::constants::BridgeConstants::rskj_regtest());
+        let header = Header {
+            difficulty: U256::from(1),
+            ..dummy_header(10)
+        };
+        let result = executor
+            .execute_block(&header, &[(tx, federator1)], &root, store)
+            .expect("a refused updateCollections fails the call, never the block");
+        let outcome = &result.tx_results[0];
+        assert!(outcome.success, "the throw is invisible in the receipt");
+        assert_eq!(outcome.gas_used, 0, "a free transaction");
+        assert_eq!(outcome.logs.len(), 1, "update_collections, logged before the throw");
+        assert_eq!(
+            outcome.logs[0].topics()[0],
+            alloy_primitives::keccak256("update_collections(address)")
+        );
+        assert!(
+            !result
+                .markers
+                .raw_storage
+                .iter()
+                .any(|(address, _, _)| *address == crate::precompiles::BRIDGE_ADDR),
+            "the call's writes are dropped"
+        );
     }
 
     /// rskj reads every ABI offset, length and count with `intValue()`: the
