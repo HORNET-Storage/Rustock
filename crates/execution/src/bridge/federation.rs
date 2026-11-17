@@ -760,7 +760,10 @@ pub fn load_stored_federation<CTX: crate::RskContextTr>(
     storage_key: &str,
 ) -> Option<StoredFederation> {
     use super::serialization::{rlp_decode_list, rlp_decode_u64};
-    use super::storage::bridge_load_bytes_named;
+    use super::storage::{bridge_load_bytes_named, NEW_FEDERATION_KEY};
+    if storage_key == NEW_FEDERATION_KEY {
+        ctx.chain_mut().new_federation_read = true;
+    }
     let data = bridge_load_bytes_named(ctx, storage_key);
     if data.is_empty() {
         return None;

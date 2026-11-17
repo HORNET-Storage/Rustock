@@ -94,6 +94,11 @@ pub struct RskChainExt {
     /// 2^128 or more. rskj carries whatever price a call names, and GASPRICE
     /// pushes it whole.
     pub whole_gas_price: Option<U256>,
+    /// Whether the Bridge call running has read the federation stored as the
+    /// new one. rskj's `FederationStorageProviderImpl.getNewFederation` keeps
+    /// what it read, and `saveNewFederation` writes it back as a call that
+    /// read it returns; the Bridge clears this as each call begins.
+    pub new_federation_read: bool,
 }
 
 /// What accounts owe: each one's balance in rskj is what the journal holds

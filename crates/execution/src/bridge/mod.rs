@@ -709,7 +709,17 @@ pub fn execute_bridge<CTX: crate::RskContextTr>(
         return Err(marker_with_gas(INTERNAL_BRIDGE_THROW_MARKER, gas_cost));
     }
 
+    // What this call reads of the federation stored as the new one is what
+    // rskj's `save()` writes back, not what was read before it.
+    ctx.chain_mut().new_federation_read = false;
     let result = execute_method(ctx, method.name, args, gas_cost, config, block_store, use_v2, hardfork_cfg, tx_ctx, caller, call_depth, call_value);
+    // rskj `Bridge.execute` ends a method that returns with `teardown`, whose
+    // `FederationStorageProviderImpl.saveNewFederation` writes back the new
+    // federation the method read, from RSKIP123 with all three keys of each
+    // member and its format version, however the cell held it.
+    if matches!(&result, Ok(output) if !output.reverted) && ctx.chain().new_federation_read {
+        federation::save_new_federation_multikey(ctx, hardfork_cfg, block_number);
+    }
     // rskj `Bridge.execute` wraps any method `RuntimeException` in a
     // `VMException`, which `TransactionExecutor.call` / `Program` then handle
     // by spending only `requiredGas` (the `getGasForData` cost) — NOT all the
