@@ -7,6 +7,7 @@ mod bridge_support_add_signature_test;
 mod bridge_support_pegout_transaction_created_event_test;
 mod bridge_support_process_funds_migration_test;
 mod bridge_support_register_btc_transaction_test;
+mod bridge_support_release_btc_test;
 mod bridge_support_sig_hash_test;
 mod peg_utils_all_utxos_to_fed_are_above_minimum_pegin_value_test;
 mod peg_utils_get_transaction_type_test;
