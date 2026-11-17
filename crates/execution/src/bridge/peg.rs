@@ -4067,7 +4067,7 @@ const MAX_FEDERATION_SIGNATURES: i64 = 20;
 /// It is also the answer when an input asks for more signatures than a
 /// federation can, whose stripped transaction couldn't match. `Err` is an
 /// exception nothing between it and `Bridge.execute` catches.
-fn without_multisig_signatures(
+pub(crate) fn without_multisig_signatures(
     tx: &BtcTransaction,
     before_rskip305: bool,
 ) -> Result<Option<BtcTransaction>, &'static str> {
@@ -4119,7 +4119,7 @@ fn without_multisig_signatures(
 /// a segwit transaction's own txid, else the txid of its copy with every
 /// input's signatures stripped (display order, as the SVP hashes are stored).
 /// `Ok(None)` and `Err` are `without_multisig_signatures`'s.
-fn multisig_tx_hash_without_signatures(
+pub(crate) fn multisig_tx_hash_without_signatures(
     tx: &BtcTransaction,
     rskip305: bool,
 ) -> Result<Option<[u8; 32]>, &'static str> {

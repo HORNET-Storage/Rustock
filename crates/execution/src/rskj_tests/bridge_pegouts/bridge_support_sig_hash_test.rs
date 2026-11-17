@@ -2,7 +2,9 @@
 //! sighash of the first input of each peg-out `updateCollections` builds, a
 //! batch or a migration, goes to the pegout index; before it, under
 //! fingerroot500, none does. The ports run mainnet's Bridge at a block of
-//! each and read the index.
+//! each and read the index. The SVP fund transaction, which
+//! `updateCollections` builds from RSKIP419 (lovell700) and settles as it
+//! settles a peg-out, goes there too.
 
 use super::support::*;
 
@@ -68,4 +70,36 @@ fn from_rskip379_a_migration_and_a_pegout_batch_built_together_both_go_to_the_pe
             assert_eq!(collections.indexed(tx, redeem), rskip379, "{number}");
         }
     }
+}
+
+/// From RSKIP419, with a federation proposed the block before and no SVP
+/// value kept, `updateCollections` builds the SVP fund transaction
+/// (`processSvpFundTransactionUnsigned`), keeps its hash as
+/// `svpFundTxHashUnsigned`, and settles it as a peg-out
+/// (`settleReleaseRequest`): it waits for its confirmations, and its first
+/// input's sighash goes to the pegout index (`savePegoutTxSigHash`), which
+/// RSKIP379 has on wherever RSKIP419 is.
+#[test]
+fn from_rskip419_the_svp_fund_transaction_built_goes_to_the_pegout_index() {
+    let number = MAINNET_LOVELL700;
+    let mut collections = Collections::mainnet_at(number);
+    collections.active(1, 10);
+    store_federation(
+        &mut collections.bridge.ctx,
+        ("proposedFederation", "proposedFederationFormatVersion"),
+        &keys(30, 5),
+        number - 1,
+        P2SH_ERP,
+    );
+    collections.update();
+    let waiting = collections.waiting();
+    assert_eq!(waiting.len(), 1);
+    let fund = &waiting[0];
+    assert!(collections.indexed(fund, &standard_redeem(&active())));
+    let mut hash = txid(fund);
+    hash.reverse();
+    assert_eq!(
+        named(&mut collections.bridge.ctx, "svpFundTxHashUnsigned"),
+        Some(rlp_encode_element(&hash))
+    );
 }

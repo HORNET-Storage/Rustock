@@ -1,5 +1,6 @@
 //! The Bridge's storage, peg-outs, signatures and events.
 
+mod bitcoin_utils_legacy_test;
 mod bridge_event_logger_impl_test;
 mod bridge_event_logger_legacy_impl_test;
 mod bridge_storage_provider_test;
