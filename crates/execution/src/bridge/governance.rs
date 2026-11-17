@@ -1321,7 +1321,7 @@ pub fn set_lock_whitelist_disable_block_delay<CTX: crate::RskContextTr>(
     // rskj `BridgeSupport.setLockWhitelistDisableBlockDelay` reads the BTC
     // chain's height before anything asks who is calling, and seeds the chain
     // where nothing has yet (`ensureBtcBlockStore`), whoever calls.
-    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg);
+    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg)?;
     let best_height = super::btc_store::load_chain_head(ctx)
         .map(|h| h.height as i32)
         .unwrap_or(0);

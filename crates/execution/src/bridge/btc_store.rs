@@ -54,6 +54,14 @@ impl StoredBlock {
         self.header.block_hash()
     }
 
+    /// Whether the chain work fits the legacy format's 12 bytes. bitcoinj's
+    /// `StoredBlock.serializeCompactLegacy` throws for one that does not
+    /// (`Utils.bigIntegerToBytes`), where [`Self::serialize_compact_legacy`]
+    /// keeps its low 12 bytes.
+    pub fn fits_legacy(&self) -> bool {
+        self.chain_work.bit_len() <= LEGACY_CHAIN_WORK_SIZE * 8
+    }
+
     /// Serialize in the legacy compact format (96 bytes).
     /// Layout: `[chain_work: 12B BE][height: 4B BE][header: 80B]`
     pub fn serialize_compact_legacy(&self) -> Vec<u8> {

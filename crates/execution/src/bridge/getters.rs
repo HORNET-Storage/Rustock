@@ -904,7 +904,7 @@ pub fn get_state_for_debugging<CTX: crate::RskContextTr>(
 ) -> Result<PrecompileOutput, PrecompileError> {
     // rskj builds the state from `getBtcBlockchainBestChainHeight()`, which
     // seeds a store nothing has seeded yet (`ensureBtcBlockStore`).
-    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg);
+    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg)?;
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     // rskj `BridgeState.shouldUsePapyrusEncoding` == RSKIP146.
     let papyrus = hardfork_cfg.has_rskip146(block_number);

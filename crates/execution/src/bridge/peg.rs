@@ -273,9 +273,7 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // A fresh bridge BTC store must be seeded with the rskj checkpoint
     // before any chain lookups.
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let use_v2 = hardfork_cfg.has_stored_block_v2(block_number);
-    let rskip199 = hardfork_cfg.has_rskip199(block_number);
-    super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
+    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg)?;
 
     // rskj wraps the registerBtcTransaction body in
     // `try { ... } catch (RegisterBtcTransactionException e) { log }`: an
@@ -2042,9 +2040,10 @@ pub fn register_fast_bridge_btc_transaction<CTX: crate::RskContextTr>(
     let btc_tx_hash = calculate_btc_tx_hash(&btc_tx_data);
 
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
-    let use_v2 = hardfork_cfg.has_stored_block_v2(block_number);
-    let rskip199 = hardfork_cfg.has_rskip199(block_number);
-    super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
+    // A store that can't be seeded throws, which rskj answers as any throw.
+    if super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg).is_err() {
+        return ok(flyover_code_output(flyover_codes::GENERIC_ERROR));
+    }
 
     // getFlyoverDerivationHash (over the raw 21-byte address args; see helper).
     let flyover_hash = flyover_derivation_hash(

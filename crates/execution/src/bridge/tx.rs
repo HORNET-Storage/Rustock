@@ -202,7 +202,7 @@ pub fn register_btc_coinbase_transaction<CTX: crate::RskContextTr>(
 
     // rskj `ensureBtcBlockStore` comes first, so a store nothing has seeded
     // yet is seeded even where the call then returns without registering.
-    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg);
+    super::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg)?;
 
     // Compute BTC tx hash (double-SHA256)
     let btc_tx_hash = calculate_btc_tx_hash(&btc_tx_data);
@@ -360,7 +360,7 @@ pub fn get_btc_transaction_confirmations<CTX: crate::RskContextTr>(
         revm::context_interface::Block::number(revm::context_interface::ContextTr::block(ctx))
             .to::<u64>();
     let rskip199 = hardfork_cfg.has_rskip199(block_number);
-    super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
+    super::btc_chain::ensure_btc_chain_seeded(ctx, config, use_v2, rskip199)?;
 
     // 1. Block must exist (rskj `getBlockKeepingTestnetConsensus`, which at
     //    testnet's block #5,148,285 answers a hard-coded block).

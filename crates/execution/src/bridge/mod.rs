@@ -834,8 +834,9 @@ fn btc_tx_confirmations_cost<CTX: crate::RskContextTr>(
     // the checkpoint are found. A transaction's own call keeps the seeding
     // though it then runs out of gas, since rskj's `TransactionExecutor.go`
     // commits what the store wrote (`btc_store::store_raw_bytes`); a
-    // contract's call that runs out of gas drops it.
-    crate::bridge::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg);
+    // contract's call that runs out of gas drops it. A store that can't be
+    // seeded is priced as it stands; the call then throws as it seeds.
+    let _ = crate::bridge::btc_chain::ensure_btc_block_store(ctx, config, hardfork_cfg);
     let block_hash = crate::bridge::btc_chain::b256_to_bitcoin_hash(&block_hash);
     let Some(block) =
         crate::bridge::btc_store::get_block_keeping_testnet_consensus(ctx, config, &block_hash)

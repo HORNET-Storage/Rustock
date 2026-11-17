@@ -3122,10 +3122,84 @@ mod tests {
                 .expect("block executes");
             (result.tx_results[0].success, result.tx_results[0].gas_used)
         };
-        assert_eq!(run(2_060_499), (false, 1_000_000), "the contract fails with all its gas");
+        assert_eq!(
+            run(2_060_499),
+            (false, 1_000_000),
+            "the contract fails with all its gas"
+        );
         let (succeeded, used) = run(2_060_500);
         assert!(succeeded, "from iris300 the contract goes on");
-        assert!(used < 150_000, "from iris300 it pays what it used (got {used})");
+        assert!(
+            used < 150_000,
+            "from iris300 it pays what it used (got {used})"
+        );
+    }
+
+    /// The Bridge's Bitcoin store is written in bitcoinj's legacy format before
+    /// RSKIP454 and in its 32-byte one from it
+    /// (`RepositoryBtcBlockStoreWithCache.serializeBlock`), on both of the
+    /// executor's paths to the Bridge: the EVM's, which a paid call takes from
+    /// RSKIP136, and the one a call takes before it (mainnet #3,397). `receiveHeaders`,
+    /// called by a member of mainnet's genesis federation, seeds an empty store
+    /// in the format its call is given; the head's cell is 96 bytes in the
+    /// legacy format and 116 in the other.
+    #[test]
+    fn the_btc_store_is_written_in_the_blocks_format_on_both_paths_to_the_bridge() {
+        use crate::abi::encode::{args, Arg};
+        let config = crate::bridge::constants::BridgeConstants::mainnet();
+        let federator = crate::bridge::federation::rsk_address_from_public_key(
+            &crate::bridge::peg::genesis_federation_keys(&config)[0],
+        )
+        .expect("an address");
+        let receive_headers = [
+            crate::abi::selector("receiveHeaders(bytes[])").to_vec(),
+            args(&[Arg::BytesArray(&[&[0u8; 80]])]),
+        ]
+        .concat();
+        let head_cell = |number: u64| -> usize {
+            let store = Arc::new(MemoryTrieStore::new());
+            let root = put_account(
+                &TrieNode::empty(),
+                store.as_ref(),
+                &federator,
+                0,
+                U256::from(10u64).pow(U256::from(18)),
+            );
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::mainnet(), block_store);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::from(receive_headers.clone()),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            let result = executor
+                .execute_block(&dummy_header(number), &[(tx, federator)], &root, store)
+                .expect("block executes");
+            let head = crate::bridge::storage::bridge_storage_key("blockStoreChainHead");
+            result
+                .markers
+                .raw_storage
+                .iter()
+                .rev()
+                .find(|(address, key, _)| {
+                    *address == crate::precompiles::BRIDGE_ADDR && *key == head
+                })
+                .and_then(|(_, _, value)| value.as_ref())
+                .map_or(0, Vec::len)
+        };
+        // Mainnet's lovell700, which brings RSKIP454.
+        let lovell700 = 7_338_024;
+        assert_eq!(head_cell(lovell700 - 1), 96, "the EVM's path, legacy");
+        assert_eq!(head_cell(lovell700), 116, "the EVM's path, 32 bytes");
+        assert_eq!(head_cell(3_000), 96, "before RSKIP136, legacy");
     }
 
     /// Runs the same contract on both sides of testnet iris300 (#2,060,500)

@@ -74,7 +74,7 @@ pub fn receive_header<CTX: crate::RskContextTr>(
     // call by `2 * input.len()` (mainnet #6,223,762 tx[2]: 2*164 = 328 gas).
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let rskip199 = hardfork_cfg.has_rskip199(block_number);
-    ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
+    ensure_btc_chain_seeded(ctx, config, use_v2, rskip199)?;
 
     let header_bytes = crate::abi::Args::new(args)
         .bytes(0)
@@ -433,17 +433,22 @@ pub fn main_chain_block_at_height<CTX: crate::RskContextTr>(
 /// `BridgeConstants::btc_checkpoint`) and moves the head to it. BOTH
 /// stored-block entries remain in bridge storage (mainnet block #457), and
 /// from RSKIP199 both heads are in the height index.
+///
+/// Before RSKIP454 bitcoinj writes the checkpoint in the legacy format, which
+/// throws for a chain work past 12 bytes (`StoredBlock.serializeCompactLegacy`):
+/// the genesis block stays the head, and the error is the call's to answer as
+/// its method answers a throw.
 pub fn ensure_btc_chain_seeded<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
     use_v2: bool,
     rskip199: bool,
-) {
+) -> Result<(), PrecompileError> {
     let head = load_chain_head(ctx);
     // rskj checkpoints a store whose head is still its genesis block, the
     // only block at height 0, so a head above it has been through both steps.
     if head.as_ref().is_some_and(|head| head.height > 0) {
-        return;
+        return Ok(());
     }
     if head.is_none() {
         let network = match config.btc_network {
@@ -458,19 +463,25 @@ pub fn ensure_btc_chain_seeded<CTX: crate::RskContextTr>(
     }
 
     let Some((header_hex, height, chain_work_hex)) = config.btc_checkpoint else {
-        return;
+        return Ok(());
     };
     let Some(header) = alloy_primitives::hex::decode(header_hex)
         .ok()
         .and_then(|bytes| deserialize::<BtcHeader>(&bytes).ok())
     else {
-        return;
+        return Ok(());
     };
     let work =
         U256::from_be_slice(&alloy_primitives::hex::decode(chain_work_hex).unwrap_or_default());
     let checkpoint = StoredBlock::new(header, height, work);
+    if !use_v2 && !checkpoint.fits_legacy() {
+        return Err(PrecompileError::other(
+            "The given number does not fit in 12",
+        ));
+    }
     put_stored_block(ctx, &checkpoint, use_v2);
     set_chain_head(ctx, &checkpoint, use_v2, rskip199);
+    Ok(())
 }
 
 /// rskj `BridgeSupport.ensureBtcBlockStore`, which every Bridge method that
@@ -481,10 +492,10 @@ pub fn ensure_btc_block_store<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
-) {
+) -> Result<(), PrecompileError> {
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let use_v2 = hardfork_cfg.has_stored_block_v2(block_number);
-    ensure_btc_chain_seeded(ctx, config, use_v2, hardfork_cfg.has_rskip199(block_number));
+    ensure_btc_chain_seeded(ctx, config, use_v2, hardfork_cfg.has_rskip199(block_number))
 }
 
 /// Whether bitcoinj's `BtcBlock.parseTransactions` reads `rest`, the at most
@@ -577,7 +588,7 @@ pub fn receive_headers<CTX: crate::RskContextTr>(
     let rskip434 = hardfork_cfg.has_rskip434(block_number);
     let rskip199 = hardfork_cfg.has_rskip199(block_number);
 
-    ensure_btc_chain_seeded(ctx, config, use_v2, rskip199);
+    ensure_btc_chain_seeded(ctx, config, use_v2, rskip199)?;
     let is_mainnet = matches!(config.btc_network, super::constants::BtcNetwork::Mainnet);
 
     // However many there are.
@@ -653,7 +664,7 @@ pub fn get_block_locator<CTX: crate::RskContextTr>(
     /// rskj `maxHashesToInform`.
     const MAX_HASHES: usize = 100;
 
-    ensure_btc_block_store(ctx, config, hardfork_cfg);
+    ensure_btc_block_store(ctx, config, hardfork_cfg)?;
     let Some(head) = load_chain_head(ctx) else {
         return Err(PrecompileError::other("getBtcBlockchainBlockLocator: no BTC chain head"));
     };
@@ -751,7 +762,7 @@ pub fn get_block_hash_at_depth<CTX: crate::RskContextTr>(
             .int_value(),
     );
 
-    ensure_btc_block_store(ctx, config, hardfork_cfg);
+    ensure_btc_block_store(ctx, config, hardfork_cfg)?;
     let head = load_chain_head(ctx).ok_or_else(|| {
         PrecompileError::other("getBtcBlockchainBlockHashAtDepth: no BTC chain head")
     })?;
@@ -794,7 +805,7 @@ pub fn get_best_chain_height<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    ensure_btc_block_store(ctx, config, hardfork_cfg);
+    ensure_btc_block_store(ctx, config, hardfork_cfg)?;
     let height = match load_chain_head(ctx) {
         Some(head) => head.height as i64,
         None => 0,
@@ -809,7 +820,14 @@ pub fn get_best_block_header<CTX: crate::RskContextTr>(
     config: &BridgeConstants,
     hardfork_cfg: &RskHardforkConfig,
 ) -> Result<PrecompileOutput, PrecompileError> {
-    ensure_btc_block_store(ctx, config, hardfork_cfg);
+    // rskj's `Bridge` answers what the four header getters throw, a store
+    // that can't be seeded among it, with `EMPTY_BYTE_ARRAY`.
+    if ensure_btc_block_store(ctx, config, hardfork_cfg).is_err() {
+        return Ok(PrecompileOutput::new(
+            gas_cost,
+            encode_abi_bytes(&[]).into(),
+        ));
+    }
     // A seeded store always has a head; rskj's `serializeBlockHeader` of none
     // is `EMPTY_BYTE_ARRAY`, ABI-encoded like any other `byte[]`.
     let header_bytes = load_chain_head(ctx)
@@ -833,7 +851,12 @@ pub fn get_block_header_by_hash<CTX: crate::RskContextTr>(
         .bytes32(0)
         .ok_or_else(|| PrecompileError::other("getBlockHeaderByHash: no hash"))?;
     let hash = b256_to_bitcoin_hash(&alloy_primitives::B256::from(hash));
-    ensure_btc_block_store(ctx, config, hardfork_cfg);
+    if ensure_btc_block_store(ctx, config, hardfork_cfg).is_err() {
+        return Ok(PrecompileOutput::new(
+            gas_cost,
+            encode_abi_bytes(&[]).into(),
+        ));
+    }
 
     // rskj's `serializeBlockHeader` answers a block it does not hold with
     // `EMPTY_BYTE_ARRAY`, which `Bridge.execute` ABI-encodes like any other
@@ -867,7 +890,12 @@ pub fn get_block_header_by_height<CTX: crate::RskContextTr>(
         .int(0)
         .ok_or_else(|| PrecompileError::other("getBlockHeaderByHeight: no height"))?
         .int_value();
-    ensure_btc_block_store(ctx, config, hardfork_cfg);
+    if ensure_btc_block_store(ctx, config, hardfork_cfg).is_err() {
+        return Ok(PrecompileOutput::new(
+            gas_cost,
+            encode_abi_bytes(&[]).into(),
+        ));
+    }
     let block_number = revm::context_interface::Block::number(ctx.block()).to::<u64>();
     let rskip199 = hardfork_cfg.has_rskip199(block_number);
     // A negative height is below every search limit, or walks off the stored
@@ -899,7 +927,12 @@ pub fn get_parent_block_header_by_hash<CTX: crate::RskContextTr>(
         .bytes32(0)
         .ok_or_else(|| PrecompileError::other("getParentBlockHeaderByHash: no hash"))?;
     let hash = b256_to_bitcoin_hash(&alloy_primitives::B256::from(hash));
-    ensure_btc_block_store(ctx, config, hardfork_cfg);
+    if ensure_btc_block_store(ctx, config, hardfork_cfg).is_err() {
+        return Ok(PrecompileOutput::new(
+            gas_cost,
+            encode_abi_bytes(&[]).into(),
+        ));
+    }
 
     // As in `get_block_header_by_height`, an absent block yields rskj's
     // `EMPTY_BYTE_ARRAY`, which `Bridge.execute` still ABI-encodes as an empty
@@ -1353,7 +1386,7 @@ mod tests {
         // In the block's layout and with its index: block 0 is before RSKIP199,
         // so the checkpoint's height isn't indexed.
         let mut ctx = empty_ctx();
-        ensure_btc_block_store(&mut ctx, &config, &cfg);
+        ensure_btc_block_store(&mut ctx, &config, &cfg).expect("seeded");
         assert_eq!(
             crate::bridge::storage::bridge_load_btc_block_hash_by_height(&mut ctx, height),
             None
@@ -1390,7 +1423,7 @@ mod tests {
         let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin).header;
 
         let mut ctx = empty_ctx();
-        ensure_btc_chain_seeded(&mut ctx, &config, true, true);
+        ensure_btc_chain_seeded(&mut ctx, &config, true, true).expect("seeded");
         let head = load_chain_head(&mut ctx).unwrap();
         assert_eq!(head.height, height);
         assert_eq!(
@@ -1403,14 +1436,14 @@ mod tests {
         );
 
         let mut ctx = empty_ctx();
-        ensure_btc_chain_seeded(&mut ctx, &config, true, false);
+        ensure_btc_chain_seeded(&mut ctx, &config, true, false).expect("seeded");
         assert_eq!(indexed(&mut ctx, 0), None, "no index before RSKIP199");
 
         let mut ctx = empty_ctx();
         let stored = StoredBlock::new(genesis, 0, compute_work(genesis.bits));
         put_stored_block(&mut ctx, &stored, true);
         crate::bridge::btc_store::store_chain_head(&mut ctx, &stored, true);
-        ensure_btc_chain_seeded(&mut ctx, &config, true, true);
+        ensure_btc_chain_seeded(&mut ctx, &config, true, true).expect("seeded");
         assert_eq!(
             load_chain_head(&mut ctx).map(|head| head.height),
             Some(height)
@@ -1420,8 +1453,8 @@ mod tests {
         // its genesis block, and keeps it out of the index after.
         let regtest = BridgeConstants::regtest();
         let mut ctx = empty_ctx();
-        ensure_btc_chain_seeded(&mut ctx, &regtest, true, false);
-        ensure_btc_chain_seeded(&mut ctx, &regtest, true, true);
+        ensure_btc_chain_seeded(&mut ctx, &regtest, true, false).expect("seeded");
+        ensure_btc_chain_seeded(&mut ctx, &regtest, true, true).expect("seeded");
         assert_eq!(indexed(&mut ctx, 0), None);
     }
 
@@ -1442,7 +1475,7 @@ mod tests {
             for _ in 0..frames {
                 ctx.journal_mut().checkpoint();
             }
-            ensure_btc_chain_seeded(&mut ctx, &config, true, true);
+            ensure_btc_chain_seeded(&mut ctx, &config, true, true).expect("seeded");
             let raw = &mut ctx.chain_mut().raw_storage;
             if ended_well {
                 raw.commit_call();
