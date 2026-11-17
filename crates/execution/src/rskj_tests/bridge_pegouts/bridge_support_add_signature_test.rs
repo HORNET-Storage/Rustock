@@ -819,51 +819,74 @@ fn a_key_of_no_proposed_member_fails_a_call_to_sign_the_svp_spend_transaction() 
     assert!(logs(&mut to_sign.bridge.ctx).is_empty());
 }
 
-/// rskj logs `add_signature` with the member's BTC key as the federation
-/// keeps it, compressed (`BridgeEventLoggerImpl.logAddSignature`): a member
-/// that gives its key uncompressed is found, signs in, and is logged with
-/// the compressed key. So does a proposed member signing the SVP spend
-/// transaction.
-#[test]
-fn a_key_given_uncompressed_is_logged_compressed() {
-    use crate::abi::encode::{args, Arg};
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
-    let uncompressed = |key: &[u8; 33]| {
-        k256::PublicKey::from_sec1_bytes(key)
-            .expect("a key")
-            .to_encoded_point(false)
-            .as_bytes()
-            .to_vec()
-    };
-    let mut signing = Signing::mainnet_at(FROM_RSKIP326);
-    let key = signing.key(0);
-    let signature = signing.signature(0);
-    signing
-        .add_signatures_as(0, &uncompressed(&key), &[signature])
-        .expect("addSignature runs");
-    let logs = logs(&mut signing.bridge.ctx);
-    assert_eq!(logs.len(), 1, "signed in, and logged");
-    assert_eq!(logs[0].data.data.to_vec(), args(&[Arg::Bytes(&key)]));
+/// A key in the two other forms Bouncy Castle reads: uncompressed, and
+/// hybrid, whose first byte is 06 or 07 as its y is even or odd.
+fn other_forms(key: &[u8; 33]) -> [Vec<u8>; 2] {
+    let uncompressed = bitcoin::secp256k1::PublicKey::from_slice(key)
+        .expect("a key")
+        .serialize_uncompressed();
+    let mut hybrid = uncompressed;
+    hybrid[0] = 0x06 | (uncompressed[64] & 1);
+    [uncompressed.to_vec(), hybrid.to_vec()]
+}
 
-    let mut to_sign = ToSign::svp_spend(MAINNET_REED800, true);
-    let signer = to_sign.spent.signers[0].clone();
-    let key = compressed(&signer);
-    to_sign.bridge.caller =
-        crate::bridge::federation::rsk_address_from_public_key(&key).expect("an address");
-    let signature = der_signature(&signer, &to_sign.sighashes[0]);
-    let data = [
-        crate::abi::selector("addSignature(bytes,bytes[],bytes)").to_vec(),
-        args(&[
-            Arg::Bytes(&uncompressed(&key)),
-            Arg::BytesArray(&[signature.as_slice()]),
-            Arg::Bytes(&RELEASE_HASH),
-        ]),
-    ]
-    .concat();
-    to_sign.bridge.execute(&data).expect("addSignature runs");
-    let logs = crate::rskj_tests::bridge_pegouts::support::logs(&mut to_sign.bridge.ctx);
-    assert_eq!(logs.len(), 1, "signed in, and logged");
-    assert_eq!(logs[0].data.data.to_vec(), args(&[Arg::Bytes(&key)]));
+/// rskj finds the federation a peg-out is signed for by
+/// `Federation.hasBtcPublicKey`, which compares the key's bytes as the call
+/// gave them with each member's compressed key: a member that gives its key
+/// uncompressed or hybrid is no member's, and the call returns without
+/// signing, and without the event rskj logs before signing until RSKIP326.
+#[test]
+fn a_peg_out_takes_no_signature_under_a_key_given_uncompressed_or_hybrid() {
+    for number in [BEFORE_RSKIP326, FROM_RSKIP326] {
+        for form in 0..2 {
+            let mut signing = Signing::mainnet_at(number);
+            let given = other_forms(&signing.key(0))[form].clone();
+            let waiting = named(&mut signing.bridge.ctx, "rskTxsWaitingFS");
+            let signature = signing.signature(0);
+            signing
+                .add_signatures_as(0, &given, &[signature])
+                .expect("addSignature returns");
+            let what = format!("block {number}, key {:02x}", given[0]);
+            assert_eq!(
+                named(&mut signing.bridge.ctx, "rskTxsWaitingFS"),
+                waiting,
+                "{what}"
+            );
+            assert!(logs(&mut signing.bridge.ctx).is_empty(), "{what}");
+        }
+    }
+}
+
+/// To sign the SVP spend transaction rskj finds the proposed member by
+/// `getMemberByBtcPublicKey`, which reads the key again and compares the
+/// points: a member that gives its key uncompressed or hybrid is found, signs
+/// in, and is logged with its key as the federation keeps it, compressed
+/// (`BridgeEventLoggerImpl.logAddSignature`).
+#[test]
+fn the_svp_spend_transaction_takes_a_signature_under_a_key_given_uncompressed_or_hybrid() {
+    use crate::abi::encode::{args, Arg};
+    for form in 0..2 {
+        let mut to_sign = ToSign::svp_spend(MAINNET_REED800, true);
+        let signer = to_sign.spent.signers[0].clone();
+        let key = compressed(&signer);
+        let given = other_forms(&key)[form].clone();
+        to_sign.bridge.caller =
+            crate::bridge::federation::rsk_address_from_public_key(&key).expect("an address");
+        let signature = der_signature(&signer, &to_sign.sighashes[0]);
+        let data = [
+            crate::abi::selector("addSignature(bytes,bytes[],bytes)").to_vec(),
+            args(&[
+                Arg::Bytes(&given),
+                Arg::BytesArray(&[signature.as_slice()]),
+                Arg::Bytes(&RELEASE_HASH),
+            ]),
+        ]
+        .concat();
+        to_sign.bridge.execute(&data).expect("addSignature runs");
+        let logs = crate::rskj_tests::bridge_pegouts::support::logs(&mut to_sign.bridge.ctx);
+        assert_eq!(logs.len(), 1, "signed in, and logged: key {:02x}", given[0]);
+        assert_eq!(logs[0].data.data.to_vec(), args(&[Arg::Bytes(&key)]));
+    }
 }
 
 /// rskj's nested `MigrationTxSigning` set-up, at vetiver900: a retiring

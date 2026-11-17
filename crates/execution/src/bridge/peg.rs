@@ -5177,10 +5177,11 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     if federation_keys.is_empty() {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
-    let Some(compressed_key) = member_key_of(&fed_key) else {
+    // rskj getFederationFromPublicKey: active first, then retiring, each asked
+    // whether it holds the key as the call gave it (`hasBtcPublicKey`).
+    let Some(compressed_key) = member_key_as_given(&fed_key) else {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     };
-    // rskj getFederationFromPublicKey: active first, then retiring.
     let is_member = federation_keys.contains(&compressed_key)
         || retiring_federation_keys(ctx, config, hardfork_cfg, block_number)
             .is_some_and(|keys| keys.contains(&compressed_key));
@@ -5362,23 +5363,29 @@ fn btc_txid_event_bytes(tx: &BtcTransaction) -> [u8; 32] {
     bytes
 }
 
-/// Compress a SEC1 public key (33- or 65-byte) to its 33-byte form.
-fn compress_pubkey(key: &[u8]) -> Option<[u8; 33]> {
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
-    let parsed = k256::PublicKey::from_sec1_bytes(key).ok()?;
-    let point = parsed.to_encoded_point(true);
-    point.as_bytes().try_into().ok()
-}
-
-/// The member key a federator's key names, as rskj looks a member up by it
-/// (`Federation.hasBtcPublicKey`, `getMemberByBtcPublicKey`): the point at
+/// The member key a federator's key names where rskj compares points, as
+/// `Federation.getMemberByBtcPublicKey` does, reading the key again and
+/// comparing it with each member's by `BtcECKey.equals`: the point at
 /// infinity ([`super::federation::INFINITY_KEY`]) for the one byte 00 Bouncy
-/// Castle decodes as it, the compressed form of any other key.
+/// Castle decodes as it, and the compressed form of a key in any other form
+/// it reads, compressed, uncompressed or hybrid.
 fn member_key_of(key: &[u8]) -> Option<[u8; 33]> {
     if key == [0x00] {
         return Some(super::federation::INFINITY_KEY);
     }
-    compress_pubkey(key)
+    bitcoin::secp256k1::PublicKey::from_slice(key)
+        .ok()
+        .map(|key| key.serialize())
+}
+
+/// The member key a federator's key names where rskj compares bytes, as
+/// `Federation.hasBtcPublicKey` does, by which `getFederationFromPublicKey`
+/// finds the federation a peg-out is signed for: the key's bytes as the call
+/// gave them against each member's compressed key. So a key given compressed,
+/// or the one byte 00, names its member, and one given uncompressed or hybrid
+/// names none.
+fn member_key_as_given(key: &[u8]) -> Option<[u8; 33]> {
+    member_key_of(key).filter(|member| super::federation::key_encoding(member) == key)
 }
 
 /// RIPEMD160(SHA256(pubkey)) — bitcoinj `ECKey.getPubKeyHash` over the key
@@ -8689,7 +8696,7 @@ mod tests {
                 let _ = p2sh_script_hash160(script);
                 let _ = is_der_signature(script);
                 let _ = is_btc_public_key(script);
-                let _ = compress_pubkey(script);
+                let _ = member_key_as_given(script);
                 let _ = super::super::rskj_sender_compat::is_sent_to_multisig(script);
                 let _ = super::super::rskj_sender_compat::signatures_required_to_spend(script);
                 let _ = super::super::rskj_sender_compat::redeem_script_of_input(script, None);
