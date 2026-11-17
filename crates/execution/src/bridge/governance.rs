@@ -345,8 +345,12 @@ fn federation_change_code<CTX: crate::RskContextTr>(
     // FederationMember stores all keys COMPRESSED, however they were passed:
     // compressed, uncompressed or hybrid, which Bouncy Castle's `decodePoint`
     // reads alike. It reads the one byte 00 too, as the point at infinity,
-    // which is no key a member is stored with here.
+    // and a member keeps that key, whose encoding stays the one byte
+    // (`federation::INFINITY_KEY`).
     let parse_key = |bytes: &[u8]| -> Option<[u8; 33]> {
+        if bytes == [0x00] {
+            return Some(super::federation::INFINITY_KEY);
+        }
         let parsed = bitcoin::secp256k1::PublicKey::from_slice(bytes).ok()?;
         Some(parsed.serialize())
     };
@@ -1429,7 +1433,7 @@ fn serialize_pending_federation_btc_keys(members: &[StoredMember]) -> Vec<u8> {
     keys.sort();
     let encoded_keys: Vec<Vec<u8>> = keys
         .iter()
-        .map(|k| serialization::rlp_encode_element(k))
+        .map(|k| serialization::rlp_encode_element(super::federation::key_encoding(k)))
         .collect();
     serialization::rlp_encode_list(&encoded_keys)
 }
@@ -2339,6 +2343,76 @@ mod tests {
         assert!(redeem.len() <= 3600 - 34);
         assert_eq!(votes(p2sh_p2wsh, 20), committed);
         assert_eq!(votes(p2sh_p2wsh, 21), thrown);
+    }
+
+    /// A member whose key is the point at infinity takes two bytes of a redeem
+    /// script where another takes 34: bitcoinj's `ScriptBuilder.data` pushes
+    /// its encoding, the one byte 00. So a P2SH ERP federation of a key more
+    /// than a scriptSig holds is built, and committed, when one of its keys is
+    /// that point.
+    #[test]
+    fn the_point_at_infinity_takes_two_bytes_of_the_redeem_scripts_size() {
+        use crate::precompiles::BridgeTxContext;
+        use revm::MainContext;
+        use sha3::{Digest, Keccak256};
+
+        let config = super::super::constants::BridgeConstants::mainnet();
+        let cfg = crate::hardfork::RskHardforkConfig::mainnet();
+        let block = 5_000_000u64;
+        assert_eq!(federation_format_version(&cfg, block), 3000);
+        let member = |i: u8| {
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            let secret = bitcoin::secp256k1::SecretKey::from_slice(&[i + 1; 32]).unwrap();
+            let key = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret);
+            StoredMember::from_btc(key.serialize())
+        };
+        // Nine members of 33-byte keys fit what a scriptSig holds, ten don't.
+        let size = |n: u8| {
+            let mut keys: Vec<[u8; 33]> = (0..n).map(|i| member(i).btc).collect();
+            keys.sort();
+            super::super::peg::build_committed_federation_redeem_script(&keys, &config, &cfg, block)
+                .len()
+        };
+        assert!(size(9) <= MAX_P2SH_REDEEM_SCRIPT_SIZE && size(10) > MAX_P2SH_REDEEM_SCRIPT_SIZE);
+        let authorizers = federation_change_authorizers(&config);
+        let deciding = authorizers.len() / 2 + 1;
+        let votes = |members: &[StoredMember]| -> Vec<Option<i64>> {
+            let mut ctx = revm::Context::mainnet()
+                .with_block(revm::context::BlockEnv {
+                    number: alloy_primitives::U256::from(block),
+                    ..Default::default()
+                })
+                .with_chain(crate::raw_storage::RskChainExt::default());
+            store_pending_federation(&mut ctx, Some(members), true);
+            let hash = Keccak256::digest(serialize_pending_federation_btc_keys(members));
+            let args = crate::abi::encode::args(&[crate::abi::encode::Arg::Bytes(&hash)]);
+            authorizers[..deciding]
+                .iter()
+                .map(|authorizer| {
+                    let tx_ctx = BridgeTxContext {
+                        rsk_sender: *authorizer,
+                        ..BridgeTxContext::default()
+                    };
+                    commit_federation(&mut ctx, &args, 0, &config, &cfg, &tx_ctx)
+                        .ok()
+                        .map(|out| i64::from_be_bytes(out.bytes[24..32].try_into().unwrap()))
+                })
+                .collect()
+        };
+        let committed = vec![Some(1); deciding];
+        let mut thrown = committed.clone();
+        *thrown.last_mut().unwrap() = None;
+        let ten: Vec<StoredMember> = (0..10).map(member).collect();
+        assert_eq!(votes(&ten), thrown, "ten keys of 33 bytes");
+        let mut nine_and_infinity: Vec<StoredMember> = (0..9).map(member).collect();
+        nine_and_infinity.push(StoredMember::from_btc(
+            super::super::federation::INFINITY_KEY,
+        ));
+        assert_eq!(
+            votes(&nine_and_infinity),
+            committed,
+            "nine, and the point at infinity"
+        );
     }
 
     /// A Bridge call that reads the whitelist writes it back as the call

@@ -789,7 +789,9 @@ pub fn redeem_script_keys(redeem_script: &[u8]) -> Vec<[u8; 33]> {
 /// a P2SH input. For an ERP redeem a normal (`OP_NOTIF` default-branch) spend
 /// uses only the DEFAULT-federation multisig, so the emergency keys after
 /// `OP_ELSE` must be excluded; otherwise sig insertion indexes against the wrong
-/// key set. For a plain (or flyover-plain) redeem this is every 33-byte push.
+/// key set. For a plain (or flyover-plain) redeem this is every key push:
+/// 33 bytes, or the one byte 00 of the point at infinity, kept as
+/// `federation::INFINITY_KEY`.
 pub fn spending_redeem_keys(redeem_script: &[u8]) -> Vec<[u8; 33]> {
     let Some(chunks) = parse_chunks(redeem_script) else {
         return Vec::new();
@@ -798,8 +800,8 @@ pub fn spending_redeem_keys(redeem_script: &[u8]) -> Vec<[u8; 33]> {
     for c in &chunks {
         match c {
             Chunk::Op(0x67) => break, // OP_ELSE: emergency keys follow
-            Chunk::Data(d) if d.len() == 33 => {
-                if let Ok(k) = d.as_slice().try_into() {
+            Chunk::Data(d) if d.len() == 33 || d.as_slice() == [0x00] => {
+                if let Some(k) = super::federation::member_key_from_encoding(d) {
                     out.push(k);
                 }
             }
@@ -878,53 +880,68 @@ pub fn update_script_with_signature(
 
 /// bitcoinj `Script.getSigInsertionIndex`: position for this federator's
 /// signature among the existing ones, ordered by key index in the redeem
-/// script.
+/// script. `None` where bitcoinj throws looking an existing signature up
+/// ([`find_sig_key_index`]).
 pub fn sig_insertion_index(
     script_sig: &[u8],
     sighash: &[u8; 32],
     signing_key: &[u8; 33],
     redeem_script: &[u8],
-) -> usize {
+) -> Option<usize> {
     let keys = spending_redeem_keys(redeem_script);
     let my_index = keys
         .iter()
         .position(|k| k == signing_key)
         .unwrap_or(usize::MAX);
     let Some(chunks) = parse_chunks(script_sig) else {
-        return 0;
+        return Some(0);
     };
     if chunks.len() < 2 {
-        return 0;
+        return Some(0);
     }
     // Skip the trailing redeem (and the ERP OP_NOTIF flag) when scanning sigs.
     let suffix = if input_redeem_is_erp(&chunks) { 2 } else { 1 };
     if chunks.len() < 1 + suffix {
-        return 0;
+        return Some(0);
     }
 
     let mut sig_index = 0;
     for chunk in &chunks[1..chunks.len() - suffix] {
         if let Chunk::Data(sig) = chunk {
-            let sig_key_index = find_sig_key_index(sig, sighash, &keys);
+            let sig_key_index = find_sig_key_index(sig, sighash, &keys)?;
             if my_index < sig_key_index {
-                return sig_index;
+                return Some(sig_index);
             }
             sig_index += 1;
         }
     }
-    sig_index
+    Some(sig_index)
 }
 
 /// bitcoinj `Script.findSigInRedeem`: index of the redeem-script key that
-/// verifies this encoded signature (DER + sighash byte) for `sighash`.
-fn find_sig_key_index(sig_with_hashtype: &[u8], sighash: &[u8; 32], keys: &[[u8; 33]]) -> usize {
+/// verifies this encoded signature (DER + sighash byte) for `sighash`, the
+/// keys tried in order. `None` where it meets the point at infinity before a
+/// key that verifies: `BtcECKey.verify` throws for it (Bouncy Castle's
+/// `ECPublicKeyParameters` refuses it), an `IllegalArgumentException` that
+/// nothing on the way to the Bridge catches, so the call fails.
+fn find_sig_key_index(
+    sig_with_hashtype: &[u8],
+    sighash: &[u8; 32],
+    keys: &[[u8; 33]],
+) -> Option<usize> {
     if sig_with_hashtype.len() < 2 {
-        return keys.len();
+        return Some(keys.len());
     }
     let der = &sig_with_hashtype[..sig_with_hashtype.len() - 1];
-    keys.iter()
-        .position(|k| verify_der_signature(der, sighash, k))
-        .unwrap_or(keys.len())
+    for (index, key) in keys.iter().enumerate() {
+        if *key == super::federation::INFINITY_KEY {
+            return None;
+        }
+        if verify_der_signature(der, sighash, key) {
+            return Some(index);
+        }
+    }
+    Some(keys.len())
 }
 
 /// Verify a DER-encoded ECDSA signature over a 32-byte message hash against a
@@ -1113,31 +1130,32 @@ pub fn witness_update_with_signature(
     Some(result)
 }
 
-/// Witness equivalent of `sig_insertion_index`.
+/// Witness equivalent of `sig_insertion_index` (`TransactionWitness
+/// .getSigInsertionIndex`), `None` where bitcoinj throws alike.
 pub fn witness_sig_insertion_index(
     pushes: &[Vec<u8>],
     sighash: &[u8; 32],
     signing_key: &[u8; 33],
     redeem_script: &[u8],
-) -> usize {
+) -> Option<usize> {
     let keys = spending_redeem_keys(redeem_script);
     let my_index = keys.iter().position(|k| k == signing_key).unwrap_or(usize::MAX);
     let total = pushes.len();
     let suffix = if witness_redeem_is_erp(pushes) { 2 } else { 1 };
     if total < 1 + suffix {
-        return 0;
+        return Some(0);
     }
     let mut sig_index = 0;
     for item in &pushes[1..total - suffix] {
         if !item.is_empty() {
-            let sig_key_index = find_sig_key_index(item, sighash, &keys);
+            let sig_key_index = find_sig_key_index(item, sighash, &keys)?;
             if my_index < sig_key_index {
-                return sig_index;
+                return Some(sig_index);
             }
             sig_index += 1;
         }
     }
-    sig_index
+    Some(sig_index)
 }
 
 /// Witness equivalent of `input_signed_by`.
@@ -2023,7 +2041,8 @@ mod tests {
             .as_bytes()
             .try_into()
             .unwrap();
-        let idx = sig_insertion_index(tx.input[0].script_sig.as_bytes(), &sighash, &key1, &redeem);
+        let idx = sig_insertion_index(tx.input[0].script_sig.as_bytes(), &sighash, &key1, &redeem)
+            .expect("no point at infinity");
         assert_eq!(idx, 0);
         let updated =
             update_script_with_signature(tx.input[0].script_sig.as_bytes(), &sign(first_sk), idx)
@@ -2040,7 +2059,8 @@ mod tests {
             .try_into()
             .unwrap();
         assert!(!input_signed_by(&tx, 0, &key0, &sighash));
-        let idx0 = sig_insertion_index(tx.input[0].script_sig.as_bytes(), &sighash, &key0, &redeem);
+        let idx0 = sig_insertion_index(tx.input[0].script_sig.as_bytes(), &sighash, &key0, &redeem)
+            .expect("no point at infinity");
         assert_eq!(idx0, 0);
         let updated0 =
             update_script_with_signature(tx.input[0].script_sig.as_bytes(), &sign(second_sk), idx0)
@@ -2056,6 +2076,58 @@ mod tests {
         };
         assert!(verify_der_signature(&s0[..s0.len() - 1], &sighash, &key0));
         assert!(verify_der_signature(&s1[..s1.len() - 1], &sighash, &key1));
+    }
+
+    /// bitcoinj's `findSigInRedeem` tries a redeem script's keys in order,
+    /// verifying the signature with each, and `BtcECKey.verify` throws for
+    /// the point at infinity, the one byte 00, which sorts first: looking up
+    /// a signature an input holds fails, in its scriptSig and in its witness
+    /// alike. With none held nothing is looked up, and the signer's own index
+    /// is found among keys that count the point at infinity.
+    #[test]
+    fn looking_up_a_held_signature_meets_the_point_at_infinity_first() {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        use k256::ecdsa::{Signature, SigningKey};
+
+        let signer = SigningKey::from_bytes(&[1u8; 32].into()).unwrap();
+        let key: [u8; 33] = signer
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        // One of the point at infinity and the key.
+        let redeem = [&[0x51, 0x01, 0x00, 0x21][..], &key, &[0x52, 0xae]].concat();
+        assert_eq!(
+            spending_redeem_keys(&redeem),
+            vec![super::super::federation::INFINITY_KEY, key]
+        );
+        let sighash = [0x11; 32];
+        let signature: Signature = signer.sign_prehash(&sighash).unwrap();
+        let held = [signature.to_der().as_bytes(), &[0x01]].concat();
+        let script_sig = |slot: &[u8]| {
+            let mut script = vec![0x00];
+            push_data(&mut script, slot);
+            push_data(&mut script, &redeem);
+            script
+        };
+        assert_eq!(
+            sig_insertion_index(&script_sig(&[]), &sighash, &key, &redeem),
+            Some(0)
+        );
+        assert_eq!(
+            sig_insertion_index(&script_sig(&held), &sighash, &key, &redeem),
+            None
+        );
+        let witness = |slot: &[u8]| vec![Vec::new(), slot.to_vec(), redeem.clone()];
+        assert_eq!(
+            witness_sig_insertion_index(&witness(&[]), &sighash, &key, &redeem),
+            Some(0)
+        );
+        assert_eq!(
+            witness_sig_insertion_index(&witness(&held), &sighash, &key, &redeem),
+            None
+        );
     }
 
     /// `parse_chunks` is the script parser the peg-in sender classifier runs on

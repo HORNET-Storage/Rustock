@@ -4874,7 +4874,7 @@ pub(crate) fn is_sender_active_or_retiring_fed_member<CTX: crate::RskContextTr>(
     block_number: u64,
     sender: alloy_primitives::Address,
 ) -> bool {
-    use super::federation::{rsk_address_from_public_key, StoredFederation};
+    use super::federation::{member_rsk_address, rsk_address_from_public_key, StoredFederation};
 
     let new = super::federation::load_stored_federation(ctx, NEW_FEDERATION_KEY);
     let old = super::federation::load_stored_federation(ctx, OLD_FEDERATION_KEY);
@@ -4897,9 +4897,9 @@ pub(crate) fn is_sender_active_or_retiring_fed_member<CTX: crate::RskContextTr>(
         };
 
     let member_match = |fed: &StoredFederation| {
-        fed.members.iter().any(|m| {
-            rsk_address_from_public_key(&m.rsk) == Some(sender)
-        })
+        fed.members
+            .iter()
+            .any(|m| member_rsk_address(&m.rsk) == Some(sender))
     };
 
     if active.as_ref().map(member_match).unwrap_or(false) {
@@ -4929,14 +4929,14 @@ pub(crate) fn is_sender_proposed_fed_member<CTX: crate::RskContextTr>(
     block_number: u64,
     sender: alloy_primitives::Address,
 ) -> bool {
-    use super::federation::rsk_address_from_public_key;
+    use super::federation::member_rsk_address;
     hardfork_cfg.has_rskip419(block_number)
         && super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY).is_some_and(
             |proposed| {
                 proposed
                     .members
                     .iter()
-                    .any(|m| rsk_address_from_public_key(&m.rsk) == Some(sender))
+                    .any(|m| member_rsk_address(&m.rsk) == Some(sender))
             },
         )
 }
@@ -5153,7 +5153,7 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     if federation_keys.is_empty() {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     }
-    let Some(compressed_key) = compress_pubkey(&fed_key) else {
+    let Some(compressed_key) = member_key_of(&fed_key) else {
         return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
     };
     // rskj getFederationFromPublicKey: active first, then retiring.
@@ -5175,10 +5175,11 @@ pub fn add_signature<CTX: crate::RskContextTr>(
     // rskj `BridgeEventLoggerImpl.getFederatorRskPublicKey`: the add_signature
     // event's federatorRskAddress topic derives from the member's BTC public
     // key before RSKIP415 (arrowhead600) and from its RSK public key after.
-    // For legacy single-key members the two keys are identical.
+    // For legacy single-key members the two keys are identical. A member's
+    // RSK key may be the point at infinity, whose address is that of `00`.
     let federator_addr_key: Vec<u8> = if hardfork_cfg.has_rskip415(block_number) {
         federator_rsk_key_for_btc(ctx, config, hardfork_cfg, block_number, &compressed_key)
-            .map(|k| k.to_vec())
+            .map(|k| super::federation::key_encoding(&k).to_vec())
             .unwrap_or_else(|| fed_key.clone())
     } else {
         fed_key.clone()
@@ -5264,15 +5265,16 @@ fn add_svp_spend_tx_signatures<CTX: crate::RskContextTr>(
     let empty = || Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
 
     // rskj throws where there is no proposed federation, and where the key is
-    // none of its members' (`getMemberByBtcPublicKey(..).orElseThrow`), the
-    // point at infinity among them: the call fails.
+    // none of its members' (`getMemberByBtcPublicKey(..).orElseThrow`): the
+    // call fails. A member whose key is the point at infinity is found by its
+    // key, 00, as any other is by its own.
     let Some(proposed) = super::federation::load_stored_federation(ctx, PROPOSED_FEDERATION_KEY)
     else {
         return Err(PrecompileError::other(
             "addSignature: no proposed federation signs the SVP spend transaction",
         ));
     };
-    let Some((compressed_key, member_rsk)) = compress_pubkey(fed_key).and_then(|key| {
+    let Some((compressed_key, member_rsk)) = member_key_of(fed_key).and_then(|key| {
         proposed
             .members
             .iter()
@@ -5307,7 +5309,7 @@ fn add_svp_spend_tx_signatures<CTX: crate::RskContextTr>(
     let applied =
         apply_signatures_to_tx(&mut spend_tx, sigs, &compressed_key, prev_values.as_deref())?;
     if applied {
-        if let Some(addr) = super::federation::rsk_address_from_public_key(&member_rsk) {
+        if let Some(addr) = super::federation::member_rsk_address(&member_rsk) {
             super::events::log_solidity_add_signature(ctx, rsk_tx_hash, addr, &compressed_key);
         }
     }
@@ -5342,6 +5344,17 @@ fn compress_pubkey(key: &[u8]) -> Option<[u8; 33]> {
     let parsed = k256::PublicKey::from_sec1_bytes(key).ok()?;
     let point = parsed.to_encoded_point(true);
     point.as_bytes().try_into().ok()
+}
+
+/// The member key a federator's key names, as rskj looks a member up by it
+/// (`Federation.hasBtcPublicKey`, `getMemberByBtcPublicKey`): the point at
+/// infinity ([`super::federation::INFINITY_KEY`]) for the one byte 00 Bouncy
+/// Castle decodes as it, the compressed form of any other key.
+fn member_key_of(key: &[u8]) -> Option<[u8; 33]> {
+    if key == [0x00] {
+        return Some(super::federation::INFINITY_KEY);
+    }
+    compress_pubkey(key)
 }
 
 /// RIPEMD160(SHA256(pubkey)) — bitcoinj `ECKey.getPubKeyHash` over the key
@@ -5659,15 +5672,18 @@ fn p2pkh_output_script(hash160: &[u8; 20]) -> bitcoin::ScriptBuf {
 /// m-of-n multisig: <m> <key1> ... <keyn> <n> OP_CHECKMULTISIG, the counts
 /// written as bitcoinj-thin's `ScriptBuilder.number` writes them
 /// ([`script_number`]). Keys are sorted (matching bitcoinj's
-/// createRedeemScript behavior).
+/// createRedeemScript behavior), and each is pushed as `ScriptBuilder.data`
+/// pushes its encoding: 33 compressed bytes, or for the point at infinity
+/// the one byte 00, which is a one-byte push (`01 00`), not OP_0.
 pub fn build_federation_redeem_script(keys: &[[u8; 33]], threshold: usize) -> Vec<u8> {
     let mut sorted_keys = keys.to_vec();
     sorted_keys.sort();
 
     let mut script = script_number(threshold);
     for key in &sorted_keys {
-        script.push(33); // OP_PUSHBYTES_33
-        script.extend_from_slice(key);
+        let encoded = super::federation::key_encoding(key);
+        script.push(encoded.len() as u8); // OP_PUSHBYTES_33, or _1
+        script.extend_from_slice(encoded);
     }
     script.extend_from_slice(&script_number(sorted_keys.len()));
     script.push(0xAE); // OP_CHECKMULTISIG
@@ -6118,8 +6134,19 @@ fn get_effective_fee_per_kb<CTX: crate::RskContextTr>(ctx: &mut CTX, config: &Br
 /// the key order in the redeem script, consuming one OP_0 placeholder.
 /// Returns whether at least one signature was applied, and `Err` where rskj
 /// throws: at an input with a witness whose spent value `prev_values`, what
-/// `getReleaseOutpointsValues` read, doesn't hold, and at an input whose
-/// redeem script it can't take.
+/// `getReleaseOutpointsValues` read, doesn't hold, at an input whose
+/// redeem script it can't take, and where a signature is checked against the
+/// point at infinity.
+///
+/// The point at infinity verifies nothing in rskj: Bouncy Castle refuses it
+/// as a verifying key (`ECPublicKeyParameters` throws "point at infinity"),
+/// and `BtcECKey.verify` lets that `IllegalArgumentException` through.
+/// `getTransactionSignatures` doesn't catch it, so a call with that key fails
+/// at its first signature; nor does `BridgeSupport.sign`, which catches
+/// `IllegalStateException` alone, so once an input holds a signature, any
+/// member's call that signs it fails at `findSigInRedeem`, which tries the
+/// redeem script's keys in order and meets that key, sorted first, before
+/// any other.
 fn apply_signatures_to_tx(
     tx: &mut BtcTransaction,
     sigs: &[Vec<u8>],
@@ -6175,6 +6202,13 @@ fn apply_signatures_to_tx(
         redeems.push(redeem);
     }
 
+    // getTransactionSignatures: the federator's key is the point at infinity,
+    // whose verification throws (see above): the call fails.
+    if *fed_key == super::federation::INFINITY_KEY {
+        return Err(PrecompileError::other(
+            "addSignature: a signature is verified with the point at infinity",
+        ));
+    }
     // getTransactionSignatures: a signature bitcoinj cannot read, that does
     // not verify, or whose s is in the upper half of the order aborts
     // without applying anything; each is applied as bitcoinj writes it
@@ -6187,6 +6221,12 @@ fn apply_signatures_to_tx(
         encodings.push(encoded);
     }
 
+    // `findSigInRedeem` met the point at infinity (see above): the call fails.
+    let meets_infinity = || {
+        PrecompileError::other(
+            "addSignature: a signature is looked up against the point at infinity",
+        )
+    };
     // sign(): stop at the first input already signed by this federator.
     let mut signed = false;
     for i in 0..n {
@@ -6212,15 +6252,21 @@ fn apply_signatures_to_tx(
         let encoded = encodings[i].clone();
         if is_witness[i] {
             let pushes: Vec<Vec<u8>> = tx.input[i].witness.iter().map(|p| p.to_vec()).collect();
-            let index =
-                witness_sig_insertion_index(&pushes, &sighashes[i], fed_key, &redeems[i]);
+            let Some(index) =
+                witness_sig_insertion_index(&pushes, &sighashes[i], fed_key, &redeems[i])
+            else {
+                return Err(meets_infinity());
+            };
             let Some(updated) = witness_update_with_signature(&pushes, &encoded, index) else {
                 return Ok(false); // no placeholder left (bitcoinj throws)
             };
             tx.input[i].witness = bitcoin::Witness::from_slice(&updated);
         } else {
             let script_sig = tx.input[i].script_sig.as_bytes().to_vec();
-            let index = sig_insertion_index(&script_sig, &sighashes[i], fed_key, &redeems[i]);
+            let Some(index) = sig_insertion_index(&script_sig, &sighashes[i], fed_key, &redeems[i])
+            else {
+                return Err(meets_infinity());
+            };
             let Some(updated) = update_script_with_signature(&script_sig, &encoded, index) else {
                 return Ok(false); // no placeholder left (bitcoinj throws)
             };

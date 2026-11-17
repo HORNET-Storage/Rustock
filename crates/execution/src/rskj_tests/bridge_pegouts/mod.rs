@@ -16,5 +16,6 @@ mod peg_utils_get_transaction_type_test;
 mod peg_utils_legacy_get_transaction_type_test;
 mod pegouts_waiting_for_confirmations_test;
 mod poc_sighash_test;
+mod point_at_infinity_signer_test;
 mod release_transaction_builder_test;
 mod support;

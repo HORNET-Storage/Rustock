@@ -132,13 +132,15 @@ fn sign(
         let signature = signature(signer, &sighash);
         if witness {
             let pushes: Vec<Vec<u8>> = tx.input[index].witness.iter().map(<[u8]>::to_vec).collect();
-            let at = release_tx::witness_sig_insertion_index(&pushes, &sighash, &public, redeem);
+            let at = release_tx::witness_sig_insertion_index(&pushes, &sighash, &public, redeem)
+                .expect("no point at infinity");
             let signed = release_tx::witness_update_with_signature(&pushes, &signature, at)
                 .expect("a slot left");
             tx.input[index].witness = bitcoin::Witness::from_slice(&signed);
         } else {
             let script_sig = tx.input[index].script_sig.as_bytes().to_vec();
-            let at = release_tx::sig_insertion_index(&script_sig, &sighash, &public, redeem);
+            let at = release_tx::sig_insertion_index(&script_sig, &sighash, &public, redeem)
+                .expect("no point at infinity");
             let signed = release_tx::update_script_with_signature(&script_sig, &signature, at)
                 .expect("a slot left");
             tx.input[index].script_sig = bitcoin::ScriptBuf::from_bytes(signed);

@@ -483,12 +483,16 @@ fn parse_key_type(value: &str) -> Option<KeyType> {
     }
 }
 
-fn member_key(member: &super::federation::StoredMember, key_type: KeyType) -> [u8; 33] {
-    match key_type {
-        KeyType::Btc => member.btc,
-        KeyType::Rsk => member.rsk,
-        KeyType::Mst => member.mst,
-    }
+/// The member's key of `key_type` as rskj answers it (`getPubKey`, or
+/// `getPubKey(true)` for the RSK and MST keys): 33 compressed bytes, or the
+/// one byte `00` for the point at infinity.
+fn member_key(member: &super::federation::StoredMember, key_type: KeyType) -> Vec<u8> {
+    let key = match key_type {
+        KeyType::Btc => &member.btc,
+        KeyType::Rsk => &member.rsk,
+        KeyType::Mst => &member.mst,
+    };
+    super::federation::key_encoding(key).to_vec()
 }
 
 /// The `(index, keyType)` pair the `*PublicKeyOfType` methods take: the index
@@ -515,7 +519,7 @@ fn member_key_at(
     index: i32,
     key_type: KeyType,
     who: &'static str,
-) -> Result<[u8; 33], PrecompileError> {
+) -> Result<Vec<u8>, PrecompileError> {
     usize::try_from(index)
         .ok()
         .and_then(|index| members.get(index))

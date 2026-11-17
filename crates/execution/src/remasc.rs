@@ -581,7 +581,9 @@ fn pay_null_address<CTX: crate::RskContextTr>(ctx: &mut CTX, value: U256) {
 /// .getFederationActivationAge`). From RSKIP415, also read at the executing
 /// block (`Remasc.activations = forBlock(executionBlock.getNumber())`), a
 /// federator is paid at the address of its RSK public key, and before it at
-/// its BTC key's (`RemascFederationProvider.getFederatorAddress`).
+/// its BTC key's (`RemascFederationProvider.getFederatorAddress`). A member
+/// whose key is the point at infinity is paid too, at that key's address
+/// (`federation::member_rsk_address`).
 fn federation_rsk_addresses<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     bridge_config: &crate::bridge::constants::BridgeConstants,
@@ -622,7 +624,7 @@ fn federation_rsk_addresses<CTX: crate::RskContextTr>(
     };
     members
         .iter()
-        .filter_map(|k| crate::bridge::federation::rsk_address_from_public_key(k))
+        .filter_map(crate::bridge::federation::member_rsk_address)
         .collect()
 }
 
