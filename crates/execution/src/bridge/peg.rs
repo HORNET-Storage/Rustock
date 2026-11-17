@@ -629,6 +629,17 @@ pub fn register_btc_transaction<CTX: crate::RskContextTr>(
     // vacuously satisfied by an empty set (a valid amount-0 peg-in, #5,171,600).
     // It applies to every peg-in, whichever rules classified it.
     let evaluated = rskip379 && !not_a_peg_in;
+    // rskj `registerPegIn` and `legacyRegisterPegin` begin with
+    // `computeTotalAmountSent`, which reads the active federation's UTXOs and,
+    // while one retires, the retiring federation's: `save()` writes them back
+    // as the call returns, whatever becomes of the peg-in.
+    if !not_a_peg_in {
+        let active_utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, rsk_height);
+        write_back_utxos(ctx, active_utxo_key);
+        if retiring.is_some() {
+            write_back_utxos(ctx, super::storage::OLD_FEDERATION_BTC_UTXOS_KEY);
+        }
+    }
     let below_min = not_a_peg_in
         || (evaluated
             && (live_output_values.is_empty()
@@ -1821,7 +1832,9 @@ fn whitelist_allows_and_consume<CTX: crate::RskContextTr>(
 }
 
 /// rskj `BridgeSupport.registerNewUtxos`: register every output paying the
-/// given federation script into the given UTXO storage set.
+/// given federation script into the given UTXO storage set. rskj reads the
+/// set whether or not the transaction pays the federation, and `save()`
+/// writes it back, the empty list where the cell held nothing.
 fn register_federation_outputs<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     btc_tx: &BtcTransaction,
@@ -1842,9 +1855,6 @@ fn register_federation_outputs<CTX: crate::RskContextTr>(
             coinbase: btc_tx.is_coinbase(),
         })
         .collect();
-    if new_utxos.is_empty() {
-        return;
-    }
     let mut utxos = load_utxos_at(ctx, utxo_key);
     utxos.extend(new_utxos);
     store_utxos_at(ctx, utxo_key, &utxos);
@@ -4687,6 +4697,14 @@ fn store_utxos_at<CTX: crate::RskContextTr>(ctx: &mut CTX, key: &str, utxos: &[B
     bridge_store_bytes_named(ctx, key, &super::storage::serialize_utxo_list(utxos));
 }
 
+/// rskj `FederationStorageProviderImpl.saveNewFederationBtcUTXOs` and
+/// `saveOldFederationBtcUTXOs`: a call that read a federation's UTXOs writes
+/// them back as it returns, the empty list where the cell held nothing.
+fn write_back_utxos<CTX: crate::RskContextTr>(ctx: &mut CTX, key: &str) {
+    let utxos = load_utxos_at(ctx, key);
+    store_utxos_at(ctx, key, &utxos);
+}
+
 /// Active federation keys together with the redeem script built from the
 /// federation's STORED format version (rskj `getActiveFederation().getRedeemScript()`).
 /// During the activation window the active federation is still the OLD one, so its
@@ -6527,6 +6545,10 @@ fn simulate_pegout_fee<CTX: crate::RskContextTr>(
 
     let utxo_key = active_federation_utxo_key(ctx, config, hardfork_cfg, block_number);
     let available = load_utxos_at(ctx, utxo_key);
+    // rskj reads them with `getActiveFederationBtcUTXOs`, and `save()` writes
+    // them back as the call returns, the empty list where the cell held
+    // nothing.
+    store_utxos_at(ctx, utxo_key, &available);
 
     // Same FlyoverCompatibleBtcWallet resolution updateCollections uses.
     let mut candidate_fed_redeems = vec![redeem_script.clone()];

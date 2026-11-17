@@ -236,3 +236,75 @@ fn before_rskip88_a_call_turned_down_quietly_writes_the_processed_map_back() {
     );
     assert_eq!(named(&mut bridge.ctx, "btcTxHashesAP"), empty_list());
 }
+
+/// The fee estimate builds a peg-out of the active federation's UTXOs, and
+/// writes them back as it returns: on a new regtest, where nothing wrote
+/// them, the empty list.
+#[test]
+fn the_fee_estimate_writes_back_the_utxos_it_read() {
+    let mut bridge = Bridge::new(
+        RskHardforkConfig::rskj_regtest(),
+        BridgeConstants::rskj_regtest(),
+        1,
+    );
+    bridge
+        .execute(&selector("getEstimatedFeesForNextPegOutEvent()"))
+        .expect("an estimate");
+    assert_eq!(
+        named(&mut bridge.ctx, "newFederationBtcUTXOs"),
+        empty_list()
+    );
+}
+
+/// A peg-in turned down for its amount: `registerPegIn` first computes what
+/// the transaction sent, which reads the active federation's UTXOs and the
+/// retiring one's, and the call writes both back.
+#[test]
+fn a_peg_in_turned_down_writes_back_the_utxos_it_read() {
+    let mut bridge = RSKIP379_INDEXED.bridge(true);
+    let tx = tx_paying(&[(minimum_pegin() - 1, address_of(&active()))]);
+    let outcome = bridge.register(&tx, RSKIP379_INDEXED.height);
+    assert!(outcome.returned);
+    assert!(outcome.active_utxos.is_empty());
+    assert_eq!(
+        named(&mut bridge.ctx, "newFederationBtcUTXOs"),
+        empty_list()
+    );
+    assert_eq!(
+        named(&mut bridge.ctx, "oldFederationBtcUTXOs"),
+        empty_list()
+    );
+}
+
+/// A transaction the legacy rules take for no peg-in, paying the federation
+/// too little before RSKIP379, is left alone: nothing reads the UTXOs.
+#[test]
+fn a_transaction_that_is_no_peg_in_leaves_the_utxos_unwritten() {
+    let mut bridge = BEFORE_RSKIP379.bridge(true);
+    let tx = tx_paying(&[(minimum_pegin() - 1, address_of(&active()))]);
+    let outcome = bridge.register(&tx, BEFORE_RSKIP379.height);
+    assert!(outcome.returned);
+    assert_eq!(named(&mut bridge.ctx, "newFederationBtcUTXOs"), None);
+    assert_eq!(named(&mut bridge.ctx, "oldFederationBtcUTXOs"), None);
+}
+
+/// A peg-out paying neither federation: `registerNewUtxos` reads both
+/// federations' UTXOs whatever the transaction pays them, and the call
+/// writes both back.
+#[test]
+fn a_peg_out_paying_neither_federation_writes_back_the_utxos_it_read() {
+    let redeem = standard_redeem(&active());
+    let tx = btc_transaction(vec![input(1, multisig_spend(&redeem))], &[(BTC, user(9))]);
+    let mut bridge = RSKIP379_INDEXED.bridge(true);
+    index_pegout(&mut bridge.ctx, &index_sighash(&tx, &redeem));
+    let outcome = bridge.register(&tx, RSKIP379_INDEXED.height);
+    assert!(outcome.returned);
+    assert_eq!(
+        named(&mut bridge.ctx, "newFederationBtcUTXOs"),
+        empty_list()
+    );
+    assert_eq!(
+        named(&mut bridge.ctx, "oldFederationBtcUTXOs"),
+        empty_list()
+    );
+}
