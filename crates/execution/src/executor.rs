@@ -3067,6 +3067,67 @@ mod tests {
         assert!(after < 150_000, "post-RSKIP197 the caller continues (got {after})");
     }
 
+    /// A contract's `releaseBtc` before RSKIP185: rskj's
+    /// `BridgeSupport.releaseBtc` throws `Program.OutOfGasException` for a
+    /// contract's request, `Bridge.releaseBtc` lets it through, and
+    /// `Bridge.execute` wraps it in a `VMException` as it wraps any other
+    /// throw. Before RSKIP197, which testnet's iris300 (#2,060,500) brings with
+    /// RSKIP185, that fails the contract that made the call with all its gas,
+    /// though it forwarded only 50,000. From iris300 the request is turned down
+    /// (CALLER_CONTRACT) and the contract goes on to its end.
+    #[test]
+    fn a_contracts_release_before_rskip185_fails_the_contract_with_all_its_gas() {
+        let run = |height: u64| {
+            let store = Arc::new(MemoryTrieStore::new());
+            let sender = Address::repeat_byte(0xAA);
+            let contract = Address::repeat_byte(0xBB);
+            // CALL the Bridge with no data and no value, `releaseBtc`,
+            // forwarding 50,000 gas, then STOP.
+            let mut code: Vec<u8> = vec![
+                0x60, 0x00, // retSize
+                0x60, 0x00, // retOffset
+                0x60, 0x00, // argsSize
+                0x60, 0x00, // argsOffset
+                0x60, 0x00, // value
+                0x73, // PUSH20
+            ];
+            code.extend_from_slice(crate::precompiles::BRIDGE_ADDR.as_slice());
+            code.extend_from_slice(&[0x62, 0x00, 0xc3, 0x50, 0xf1, 0x00]);
+            let root = put_account(
+                &TrieNode::empty(),
+                store.as_ref(),
+                &sender,
+                0,
+                U256::from(10u64).pow(U256::from(18)),
+            );
+            let root =
+                put_account_with_code(&root, store.as_ref(), &contract, 1, U256::ZERO, &code);
+            let block_store =
+                Arc::new(BlockStore::open(tempfile::tempdir().unwrap().path()).unwrap());
+            let executor = RskExecutor::new(RskHardforkConfig::testnet(), block_store);
+            let tx = rustock_core::Transaction {
+                nonce: 0,
+                gas_price: U256::from(0),
+                gas_limit: U256::from(1_000_000),
+                to: Bytes::copy_from_slice(contract.as_slice()),
+                value: U256::ZERO,
+                input: Bytes::new(),
+                v: 0,
+                r: U256::ZERO,
+                s: U256::ZERO,
+                cached_rlp: None,
+            };
+            let result = executor
+                .execute_block(&dummy_header(height), &[(tx, sender)], &root, store)
+                .expect("block executes");
+            (result.tx_results[0].success, result.tx_results[0].gas_used)
+        };
+        assert_eq!(run(2_060_499), (false, 1_000_000), "the contract fails with all its gas");
+        let (succeeded, used) = run(2_060_500);
+        assert!(succeeded, "from iris300 the contract goes on");
+        assert!(used < 150_000, "from iris300 it pays what it used (got {used})");
+    }
+
     /// Runs the same contract on both sides of testnet iris300 (#2,060,500)
     /// and returns the gas each transaction used.
     fn bridge_throw_gas_either_side_of_iris300() -> (u64, u64) {

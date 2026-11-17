@@ -158,17 +158,16 @@ fn from_rskip271_a_segwit_federations_pegout_is_sized_by_its_weight() {
 
 /// rskj's `release_after_papyrus_before_iris_rejected_contractCaller_throws_exception`
 /// and `release_after_iris_rejected_contractCaller_emits_rejection_event`: a
-/// contract's request fails the call before RSKIP185, rskj's
-/// `OutOfGasException`; from it the call returns, the value is not sent back,
-/// and `release_request_rejected` logs the contract with the reason
+/// contract's request throws before RSKIP185, rskj's `OutOfGasException`,
+/// which `Bridge.execute` wraps as any other throw (not a want of gas); from
+/// it the call returns, the value is not sent back, and
+/// `release_request_rejected` logs the contract with the reason
 /// CALLER_CONTRACT.
 #[test]
 fn from_rskip185_a_contracts_request_is_logged_and_not_refunded() {
     let mut bridge = Bridge::mainnet_at(BEFORE_RSKIP185);
-    assert!(matches!(
-        release_from_a_contract(&mut bridge, BTC),
-        Err(PrecompileError::OutOfGas)
-    ));
+    let thrown = release_from_a_contract(&mut bridge, BTC).expect_err("releaseBtc throws");
+    assert!(!thrown.is_oog(), "a throw, not a want of gas: {thrown:?}");
 
     let rejected = event_topic("release_request_rejected(address,uint256,int256)");
     let mut bridge = Bridge::mainnet_at(FROM_RSKIP185);

@@ -2938,8 +2938,15 @@ pub fn release_btc<CTX: crate::RskContextTr>(
             );
             return Ok(PrecompileOutput::new(gas_cost, Bytes::new()));
         }
-        // Pre-RSKIP185: rskj throws Program.OutOfGasException (no event, no refund).
-        return Err(PrecompileError::OutOfGas);
+        // Before RSKIP185 rskj throws `Program.OutOfGasException`: no event, no
+        // refund. `Bridge.releaseBtc` lets it through and `Bridge.execute`
+        // wraps it in a `VMException`, as it wraps any other throw, so the
+        // call fails as a throw does: before RSKIP197, which comes with
+        // RSKIP185 on every network, the contract that made the call fails
+        // with all its gas.
+        return Err(PrecompileError::other(
+            "releaseBtc: a contract asked for a peg-out",
+        ));
     }
 
     // rskj BridgeSupport.requestRelease: post-RSKIP219 the minimum is INCLUSIVE
