@@ -4888,35 +4888,12 @@ pub(crate) fn genesis_federation_keys(config: &BridgeConstants) -> Vec<[u8; 33]>
 /// bitcoinj reads one ASN.1 object and casts it to a sequence, then casts the
 /// first two elements to integers; anything else throws. It does *not* check
 /// for trailing data, and it reads r and s with `getPositiveValue()`, so a
-/// negative encoding is tolerated rather than rejected. This mirrors that: a
-/// DER SEQUENCE whose first two elements are INTEGERs, with lengths that stay
-/// inside the buffer. Stricter checks would reject signatures rskj accepts.
+/// negative encoding is tolerated rather than rejected. Bouncy Castle reads
+/// a length's long form as well as its short one, and refuses an integer
+/// whose first byte only repeats the sign of the next
+/// (`release_tx::der_signature_integers`).
 fn is_der_signature(sig: &[u8]) -> bool {
-    // SEQUENCE tag plus a definite-length byte.
-    if sig.len() < 2 || sig[0] != 0x30 {
-        return false;
-    }
-    let (seq_len, mut i) = match sig[1] {
-        n if n < 0x80 => (n as usize, 2usize),
-        0x81 if sig.len() >= 3 => (sig[2] as usize, 3usize),
-        _ => return false, // longer forms never appear in a 32-byte-scalar signature
-    };
-    if seq_len > sig.len() - i {
-        return false;
-    }
-    let end = i + seq_len;
-    // Two INTEGERs.
-    for _ in 0..2 {
-        if i + 2 > end || sig[i] != 0x02 {
-            return false;
-        }
-        let len = sig[i + 1] as usize;
-        if len == 0 || len >= 0x80 || i + 2 + len > end {
-            return false;
-        }
-        i += 2 + len;
-    }
-    true
+    super::release_tx::der_signature_integers(sig).is_some()
 }
 
 /// Does `key` parse the way rskj's `BtcECKey.fromPublicOnly` requires?
@@ -6013,7 +5990,7 @@ fn apply_signatures_to_tx(
 ) -> bool {
     use super::release_tx::{
         extract_redeem_script, input_signed_by, legacy_sighash_all, segwit_sighash_all,
-        sig_insertion_index, update_script_with_signature, verify_der_signature,
+        sig_insertion_index, signature_to_insert, update_script_with_signature,
         witness_input_signed_by, witness_sig_insertion_index, witness_update_with_signature,
     };
 
@@ -6043,12 +6020,16 @@ fn apply_signatures_to_tx(
         redeems.push(redeem);
     }
 
-    // getTransactionSignatures: any malformed or non-verifying signature
-    // aborts without applying anything.
+    // getTransactionSignatures: a signature bitcoinj cannot read, that does
+    // not verify, or whose s is in the upper half of the order aborts
+    // without applying anything; each is applied as bitcoinj writes it
+    // (`signature_to_insert`).
+    let mut encodings = Vec::with_capacity(n);
     for (sig, sighash) in sigs.iter().zip(&sighashes) {
-        if !verify_der_signature(sig, sighash, fed_key) {
+        let Some(encoded) = signature_to_insert(sig, sighash, fed_key) else {
             return false;
-        }
+        };
+        encodings.push(encoded);
     }
 
     // sign(): stop at the first input already signed by this federator.
@@ -6073,8 +6054,7 @@ fn apply_signatures_to_tx(
         if !super::release_tx::spending_redeem_keys(&redeems[i]).contains(fed_key) {
             return signed;
         }
-        let mut encoded = sigs[i].clone();
-        encoded.push(0x01); // SIGHASH_ALL
+        let encoded = encodings[i].clone();
         if is_witness[i] {
             let pushes: Vec<Vec<u8>> = tx.input[i].witness.iter().map(|p| p.to_vec()).collect();
             let index =
@@ -6981,8 +6961,64 @@ mod tests {
         sig.extend_from_slice(&[0x03, 0x20]);
         sig.extend_from_slice(&[0x22u8; 32]);
         assert!(!is_der_signature(&sig), "second element must be INTEGER");
-        // zero-length integer
-        assert!(!is_der_signature(&[0x30, 0x04, 0x02, 0x00, 0x02, 0x00]), "empty integer");
+        // an integer whose first byte only repeats the sign of the next
+        assert!(!is_der_signature(&[
+            0x30, 0x07, 0x02, 0x02, 0x00, 0x7f, 0x02, 0x01, 0x01
+        ]));
+        assert!(!is_der_signature(&[
+            0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x02, 0xff, 0x80
+        ]));
+        // an indefinite length, and a length of five bytes
+        assert!(!is_der_signature(&[
+            0x30, 0x80, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x00, 0x00
+        ]));
+        assert!(!is_der_signature(&[
+            0x30, 0x0b, 0x02, 0x85, 0, 0, 0, 0, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        // a length in four bytes, past what a Java int holds
+        assert!(!is_der_signature(&[
+            0x30, 0x84, 0x80, 0, 0, 0, 0x02, 0x01, 0x01
+        ]));
+        // a high tag number that is not the sequence's, or the integer's
+        assert!(!is_der_signature(&[
+            0x3f, 0x11, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        assert!(!is_der_signature(&[
+            0x30, 0x07, 0x1f, 0x03, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        // the integer's high tag cut off by the sequence's end
+        assert!(!is_der_signature(&[
+            0x30, 0x04, 0x02, 0x01, 0x01, 0x1f, 0x02, 0x01, 0x01
+        ]));
+    }
+
+    /// What Bouncy Castle 1.58's `ASN1InputStream` reads and bitcoinj's
+    /// `decodeFromDER` takes, though it is not DER.
+    #[test]
+    fn der_signature_accepts_what_bouncy_castle_reads() {
+        // integers with no bytes, read as 0
+        assert!(is_der_signature(&[0x30, 0x04, 0x02, 0x00, 0x02, 0x00]));
+        // lengths in the long form
+        assert!(is_der_signature(&[
+            0x30, 0x81, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        assert!(is_der_signature(&[
+            0x30, 0x0a, 0x02, 0x84, 0, 0, 0, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        // the high-tag-number forms of the sequence's and the integer's tags
+        assert!(is_der_signature(&[
+            0x3f, 0x10, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        assert!(is_der_signature(&[
+            0x30, 0x07, 0x1f, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
+        // a negative encoding, and bytes after the sequence
+        assert!(is_der_signature(&[
+            0x30, 0x06, 0x02, 0x01, 0x81, 0x02, 0x01, 0x01
+        ]));
+        assert!(is_der_signature(&[
+            0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0xde, 0xad
+        ]));
     }
 
     /// A federation member's signature over the **wrong sighash** is not

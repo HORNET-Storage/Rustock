@@ -1006,6 +1006,13 @@ pub(super) struct Signing {
 impl Signing {
     /// At block `number` of mainnet.
     pub(super) fn mainnet_at(number: u64) -> Self {
+        Self::spending(number, 1)
+    }
+
+    /// At block `number` of mainnet, the peg-out spending `inputs` of the
+    /// federation's outputs, each input's scriptSig the federation's with no
+    /// signature yet.
+    pub(super) fn spending(number: u64, inputs: u8) -> Self {
         let mut members: Vec<([u8; 33], [u8; 32])> = (1..=3u8)
             .map(|i| {
                 let mut private = [0u8; 32];
@@ -1020,7 +1027,10 @@ impl Signing {
         store_federation(&mut bridge.ctx, NEW_FEDERATION, &publics, 1, 1000);
         let threshold = usize::from(redeem[0] - 0x50);
         let script_sig = [vec![0x00; threshold + 1], push(&redeem)].concat();
-        let unsigned = btc_transaction(vec![input(1, script_sig)], &[(BTC, user(1))]);
+        let spent = (1..=inputs)
+            .map(|tag| input(tag, script_sig.clone()))
+            .collect();
+        let unsigned = btc_transaction(spent, &[(BTC, user(1))]);
         put_named(
             &mut bridge.ctx,
             "rskTxsWaitingFS",
@@ -1043,19 +1053,84 @@ impl Signing {
         public_key(&self.privates[member])
     }
 
+    /// What the peg-out's input `index` is signed over: its SIGHASH_ALL
+    /// hash over the redeem script.
+    pub(super) fn sighash(&self, index: usize) -> [u8; 32] {
+        use bitcoin::hashes::Hash;
+        bitcoin::sighash::SighashCache::new(&self.unsigned)
+            .legacy_signature_hash(index, bitcoin::Script::from_bytes(&self.redeem), 1)
+            .expect("a sighash")
+            .to_byte_array()
+    }
+
+    /// The DER signature of the peg-out's input `index` by the private key
+    /// `private`.
+    pub(super) fn signature_by(&self, private: &[u8; 32], index: usize) -> Vec<u8> {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+        let key = k256::ecdsa::SigningKey::from_slice(private).expect("a key");
+        let signature: k256::ecdsa::Signature =
+            key.sign_prehash(&self.sighash(index)).expect("a signature");
+        signature.to_der().as_bytes().to_vec()
+    }
+
+    /// A member's DER signature of the peg-out's input `index`.
+    pub(super) fn signature_of(&self, member: usize, index: usize) -> Vec<u8> {
+        self.signature_by(&self.privates[member], index)
+    }
+
     /// A member's DER signature of the peg-out's input, SIGHASH_ALL over
     /// the redeem script.
     pub(super) fn signature(&self, member: usize) -> Vec<u8> {
-        use bitcoin::hashes::Hash;
-        use k256::ecdsa::signature::hazmat::PrehashSigner;
-        let sighash = bitcoin::sighash::SighashCache::new(&self.unsigned)
-            .legacy_signature_hash(0, bitcoin::Script::from_bytes(&self.redeem), 1)
-            .expect("a sighash");
+        self.signature_of(member, 0)
+    }
+
+    /// Another of a member's signatures of input `index`: one that verifies
+    /// as [`Signing::signature_of`]'s does, made with another nonce.
+    pub(super) fn another_signature_of(&self, member: usize, index: usize) -> Vec<u8> {
+        use k256::ecdsa::signature::hazmat::RandomizedPrehashSigner;
+        use rand::SeedableRng;
         let key = k256::ecdsa::SigningKey::from_slice(&self.privates[member]).expect("a key");
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         let signature: k256::ecdsa::Signature = key
-            .sign_prehash(sighash.as_byte_array())
+            .sign_prehash_with_rng(&mut rng, &self.sighash(index))
             .expect("a signature");
         signature.to_der().as_bytes().to_vec()
+    }
+
+    /// `addSignature` with `key` and `signatures`, called by the member's
+    /// transaction.
+    pub(super) fn add_signatures_as(
+        &mut self,
+        member: usize,
+        key: &[u8],
+        signatures: &[Vec<u8>],
+    ) -> Result<PrecompileOutput, PrecompileError> {
+        use crate::abi::encode::{args, Arg};
+        self.bridge.caller =
+            crate::bridge::federation::rsk_address_from_public_key(&self.key(member))
+                .expect("an address");
+        let sent: Vec<&[u8]> = signatures.iter().map(Vec::as_slice).collect();
+        let data = [
+            crate::abi::selector("addSignature(bytes,bytes[],bytes)").to_vec(),
+            args(&[
+                Arg::Bytes(key),
+                Arg::BytesArray(&sent),
+                Arg::Bytes(&RELEASE_HASH),
+            ]),
+        ]
+        .concat();
+        self.bridge.execute(&data)
+    }
+
+    /// `addSignature` with the member's key and `signatures`, called by the
+    /// member's transaction.
+    pub(super) fn add_signatures(
+        &mut self,
+        member: usize,
+        signatures: &[Vec<u8>],
+    ) -> Result<PrecompileOutput, PrecompileError> {
+        let key = self.key(member);
+        self.add_signatures_as(member, &key, signatures)
     }
 
     /// `addSignature` with `signature`, called by the member's transaction.
@@ -1064,20 +1139,7 @@ impl Signing {
         member: usize,
         signature: &[u8],
     ) -> Result<PrecompileOutput, PrecompileError> {
-        use crate::abi::encode::{args, Arg};
-        let key = self.key(member);
-        self.bridge.caller =
-            crate::bridge::federation::rsk_address_from_public_key(&key).expect("an address");
-        let data = [
-            crate::abi::selector("addSignature(bytes,bytes[],bytes)").to_vec(),
-            args(&[
-                Arg::Bytes(&key),
-                Arg::BytesArray(&[signature]),
-                Arg::Bytes(&RELEASE_HASH),
-            ]),
-        ]
-        .concat();
-        self.bridge.execute(&data)
+        self.add_signatures(member, &[signature.to_vec()])
     }
 
     /// The member's own signature, as [`Signing::add_signature`] sends it.
@@ -1087,20 +1149,25 @@ impl Signing {
             .expect("addSignature runs");
     }
 
-    /// The peg-out with the signatures of `members`, as bitcoinj fills them
-    /// in: in the redeem script's order, before the slots still empty.
+    /// The peg-out with the signatures of `members` in each input, as
+    /// bitcoinj fills them in: in the redeem script's order, before the slots
+    /// still empty.
     pub(super) fn signed_by(&self, members: &[usize]) -> bitcoin::Transaction {
         let threshold = usize::from(self.redeem[0] - 0x50);
         let mut sorted = members.to_vec();
         sorted.sort();
-        let mut script_sig = vec![0x00];
-        for &member in &sorted {
-            script_sig.extend(push(&[self.signature(member), vec![0x01]].concat()));
-        }
-        script_sig.extend(vec![0x00; threshold - sorted.len()]);
-        script_sig.extend(push(&self.redeem));
         let mut tx = self.unsigned.clone();
-        tx.input[0].script_sig = bitcoin::ScriptBuf::from_bytes(script_sig);
+        for index in 0..tx.input.len() {
+            let mut script_sig = vec![0x00];
+            for &member in &sorted {
+                script_sig.extend(push(
+                    &[self.signature_of(member, index), vec![0x01]].concat(),
+                ));
+            }
+            script_sig.extend(vec![0x00; threshold - sorted.len()]);
+            script_sig.extend(push(&self.redeem));
+            tx.input[index].script_sig = bitcoin::ScriptBuf::from_bytes(script_sig);
+        }
         tx
     }
 }
