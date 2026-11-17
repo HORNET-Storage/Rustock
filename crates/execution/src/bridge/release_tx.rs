@@ -266,14 +266,52 @@ pub fn complete_pegout_tx<'r, F>(
 where
     F: Fn(&BridgeUtxo) -> &'r [u8],
 {
+    build_pegout_tx(
+        available_utxos,
+        outputs,
+        change_script,
+        redeem_for,
+        fee_per_kb,
+        version,
+        is_segwit,
+    )
+    .map(Result::ok)
+}
+
+/// Why bitcoinj's `Wallet.completeTx` refused a build, as far as rskj's
+/// `ReleaseTransactionBuilder.Response` tells the Bridge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildRefusal {
+    /// `EXCEED_MAX_TRANSACTION_SIZE`: the transaction is over bitcoinj's
+    /// 100,000 bytes (`Wallet.ExceededMaxTransactionSize`).
+    ExceededMaxTransactionSize,
+    /// Any other: a dusty output, too little money, an output the fee leaves
+    /// below dust, an input bitcoinj cannot spend.
+    Other,
+}
+
+/// [`complete_pegout_tx`], with why a build is refused.
+pub fn build_pegout_tx<'r, F>(
+    available_utxos: &[BridgeUtxo],
+    outputs: &[PegoutOutput],
+    change_script: &ScriptBuf,
+    redeem_for: F,
+    fee_per_kb: u64,
+    version: i32,
+    is_segwit: bool,
+) -> Result<Result<BuiltPegout, BuildRefusal>, UncountableSignatures>
+where
+    F: Fn(&BridgeUtxo) -> &'r [u8],
+{
+    let refused = Ok(Err(BuildRefusal::Other));
     if outputs.is_empty() {
-        return Ok(None);
+        return refused;
     }
 
     // completeTx: dusty sends are rejected up front (DustySendRequested).
     for output in outputs {
         if output.amount_satoshis < min_non_dust_value(&output.script) {
-            return Ok(None);
+            return refused;
         }
     }
 
@@ -284,7 +322,7 @@ where
         available_utxos.iter().map(|u| (u, redeem_for(u))).collect();
     candidates.sort_by(|a, b| a.0.tx_hash.cmp(&b.0.tx_hash).then(a.0.vout.cmp(&b.0.vout)));
     if candidates.iter().any(|(_, r)| redeem_script_threshold(r) == 0) {
-        return Ok(None);
+        return refused;
     }
 
     let value: u64 = outputs.iter().map(|o| o.amount_satoshis).sum();
@@ -305,7 +343,7 @@ where
                 v -= (fee % n_outputs) as i128;
             }
             if v < min_non_dust_value(&output.script) as i128 {
-                return Ok(None);
+                return refused;
             }
             out_values.push(v as u64);
         }
@@ -322,7 +360,7 @@ where
             gathered += utxo.value_satoshis;
         }
         if gathered < value {
-            return Ok(None);
+            return refused;
         }
 
         let mut tx_outputs: Vec<TxOut> = outputs
@@ -343,7 +381,7 @@ where
                 let missing = min_change - change;
                 let first = tx_outputs[0].value.to_sat() as i128 - missing as i128;
                 if first < 0 || (first as u64) < min_non_dust_value(&outputs[0].script) {
-                    return Ok(None);
+                    return refused;
                 }
                 tx_outputs[0].value = Amount::from_sat(first as u64);
                 change = min_change;
@@ -401,10 +439,10 @@ where
                 selected.iter().map(|(_, redeem)| *redeem),
                 is_segwit,
             ) {
-                return Ok(None);
+                return Ok(Err(BuildRefusal::ExceededMaxTransactionSize));
             }
             let used_utxos = selected.into_iter().map(|(u, _)| u.clone()).collect();
-            return Ok(Some(BuiltPegout { tx, used_utxos }));
+            return Ok(Ok(BuiltPegout { tx, used_utxos }));
         }
         fee = fee_needed;
     }

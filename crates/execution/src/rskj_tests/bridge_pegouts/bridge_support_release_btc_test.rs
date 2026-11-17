@@ -1,7 +1,9 @@
 //! rskj's `BridgeSupportReleaseBtcTest`: here its tests of what RSKIP185
-//! changes in `releaseBtc`. rskj's tests run `BridgeSupport` under
-//! papyrus200 and under every rule; the ports run mainnet's Bridge at the
-//! block before iris300, which brings RSKIP185, and at iris300.
+//! changes in `releaseBtc`, and of the batches RSKIP271 builds in
+//! `updateCollections`. rskj's tests run `BridgeSupport` under papyrus200 and
+//! under every rule; the ports run mainnet's Bridge at the block before
+//! iris300, which brings RSKIP185, at iris300, and at hop400, which brings
+//! RSKIP271.
 
 use super::support::*;
 use alloy_primitives::{Address, U256};
@@ -175,5 +177,223 @@ fn from_rskip185_a_contracts_request_is_logged_and_not_refunded() {
     let logs = logs(&mut bridge.ctx);
     assert_eq!(logs.len(), 1);
     assert_eq!(topics(&logs[0]), [rejected, as_topic(CONTRACT)]);
-    assert_eq!(word(&logs[0].data.data, 1), U256::from(2), "CALLER_CONTRACT");
+    assert_eq!(
+        word(&logs[0].data.data, 1),
+        U256::from(2),
+        "CALLER_CONTRACT"
+    );
+}
+
+/// Where the Bridge burns what it holds and no one is owed.
+const BURN: Address = Address::repeat_byte(0xff);
+
+/// `count` UTXOs of `satoshis` each, paid to the federation
+/// [`Collections::active`] makes, each from a transaction of its own.
+fn many_utxos(count: u16, satoshis: u64) -> Vec<crate::bridge::storage::BridgeUtxo> {
+    let script = address_of(&active());
+    (1..=count)
+        .map(|i| {
+            let mut tx_hash = [0u8; 32];
+            tx_hash[..2].copy_from_slice(&i.to_be_bytes());
+            crate::bridge::storage::BridgeUtxo {
+                tx_hash,
+                vout: 0,
+                value_satoshis: satoshis,
+                height: 1,
+                script: script.clone(),
+                coinbase: false,
+            }
+        })
+        .collect()
+}
+
+/// Mainnet's Bridge at hop400, about to batch: the active federation holding
+/// `utxos`, the requests of `amounts` queued, the request `i` (from 1) for
+/// the user `i` with the hash `[i; 32]`, and the Bridge holding 100 BTC.
+fn batching(utxos: &[crate::bridge::storage::BridgeUtxo], amounts: &[u64]) -> Collections {
+    let entries: Vec<([u8; 20], u64, [u8; 32])> = amounts
+        .iter()
+        .zip(1u8..)
+        .map(|(&amount, i)| ([i; 20], amount, [i; 32]))
+        .collect();
+    batching_queue(utxos, &entries)
+}
+
+/// [`batching`], with the queue's `(destination, amount, hash)` entries.
+fn batching_queue(
+    utxos: &[crate::bridge::storage::BridgeUtxo],
+    entries: &[([u8; 20], u64, [u8; 32])],
+) -> Collections {
+    let mut collections = Collections::mainnet_at(MAINNET_HOP400);
+    collections.active(1, 0);
+    let number = collections.bridge.number();
+    crate::bridge::storage::store_federation_utxos(
+        &mut collections.bridge.ctx,
+        &collections.bridge.cfg,
+        number,
+        utxos,
+    );
+    put_named(
+        &mut collections.bridge.ctx,
+        "releaseRequestQueueWithTxHash",
+        &hashed_queue(entries),
+    );
+    collections
+        .bridge
+        .set_balance(crate::precompiles::BRIDGE_ADDR, wei(100 * BTC));
+    collections
+}
+
+/// The hashes of the requests still queued.
+fn still_queued(collections: &mut Collections) -> Vec<Option<[u8; 32]>> {
+    crate::bridge::peg::load_release_request_queue(&mut collections.bridge.ctx, true)
+        .iter()
+        .map(|request| request.rsk_tx_hash)
+        .collect()
+}
+
+/// rskj takes a batch's requests off the queue with `List.removeAll`, by
+/// `ReleaseRequestQueue.Entry.equals`: every request equal to one the batch
+/// pays goes, a request being equal to another of the same destination,
+/// amount and creation hash. Here the queue, too large for one batch, repeats
+/// its first request, whose copy goes with it though the halved batch pays
+/// one, and holds a request of the same destination and amount with another
+/// hash, which stays.
+#[test]
+fn from_rskip271_a_batch_takes_off_the_queue_every_request_equal_to_one_it_pays() {
+    let first = ([1; 20], 3 * BTC / 2, [1; 32]);
+    let second = ([2; 20], 3 * BTC / 2, [2; 32]);
+    let other_hash = ([1; 20], 3 * BTC / 2, [3; 32]);
+    let mut collections = batching_queue(
+        &many_utxos(700, BTC / 100),
+        &[first, second, first, other_hash],
+    );
+    collections.update();
+    assert_eq!(collections.waiting().len(), 1);
+    assert_eq!(still_queued(&mut collections), [Some([3; 32])]);
+}
+
+/// rskj's `processPegoutsInBatch_after_hop_divide_transaction_when_max_size_exceeded`:
+/// four requests of 1.5 BTC need 600 inputs of 0.01 BTC, over bitcoinj's
+/// 100,000 bytes, and the batch is halved: the first two, 300 inputs, are
+/// paid, the other two stay queued, and the next call pays them. rskj settles
+/// the first batch with all four's 6 BTC: `release_requested` logs it, and
+/// the federation having spent 3 BTC, `adjustBalancesIfChangeOutputWasDust`
+/// burns the other 3. `batch_pegout_created` lists the two paid.
+#[test]
+fn from_rskip271_a_batch_over_the_size_is_halved() {
+    let mut collections = batching(&many_utxos(700, BTC / 100), &[3 * BTC / 2; 4]);
+    let logs = collections.update();
+    assert_eq!(
+        still_queued(&mut collections),
+        [Some([3; 32]), Some([4; 32])]
+    );
+    let waiting = collections.waiting();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].input.len(), 300);
+    let paid: Vec<Vec<u8>> = waiting[0]
+        .output
+        .iter()
+        .map(|output| output.script_pubkey.to_bytes())
+        .collect();
+    assert_eq!(paid, [user(1), user(2)]);
+
+    let requested = event_topic("release_requested(bytes32,bytes32,uint256)");
+    let batch = event_topic("batch_pegout_created(bytes32,bytes)");
+    let log_of = |topic: [u8; 32]| {
+        logs.iter()
+            .find(|log| topics(log)[0] == topic)
+            .expect("logged")
+    };
+    assert_eq!(word(&log_of(requested).data.data, 0), U256::from(6 * BTC));
+    let hashes = &log_of(batch).data.data;
+    assert_eq!(word(hashes, 1), U256::from(64));
+    assert_eq!(&hashes[64..128], [[1u8; 32], [2u8; 32]].concat());
+    assert_eq!(collections.bridge.balance(BURN), wei(3 * BTC));
+
+    collections.update();
+    assert!(still_queued(&mut collections).is_empty());
+    assert_eq!(collections.waiting().len(), 2);
+}
+
+/// rskj's `processPegoutsInBatch_after_hop_when_max_size_exceeded_for_one_pegout`:
+/// one request of 7 BTC needs 700 inputs of 0.01 BTC, over the size, and
+/// cannot be halved: nothing is paid, and the request stays queued.
+#[test]
+fn from_rskip271_one_request_over_the_size_stays_queued() {
+    let mut collections = batching(&many_utxos(700, BTC / 100), &[7 * BTC]);
+    collections.update();
+    assert_eq!(still_queued(&mut collections), [Some([1; 32])]);
+    assert!(collections.waiting().is_empty());
+}
+
+/// rskj's `processPegoutsInBatch_after_hop_when_max_size_exceeded_for_two_pegout`:
+/// two requests of 7 BTC are over the size, and so is the first alone:
+/// nothing is paid, and both stay queued.
+#[test]
+fn from_rskip271_two_requests_each_over_the_size_stay_queued() {
+    let mut collections = batching(&many_utxos(1400, BTC / 100), &[7 * BTC, 7 * BTC]);
+    collections.update();
+    assert_eq!(
+        still_queued(&mut collections),
+        [Some([1; 32]), Some([2; 32])]
+    );
+    assert!(collections.waiting().is_empty());
+}
+
+/// A request queued before RSKIP146 has no creation hash, and when it is
+/// batched rskj's `logBatchPegoutCreated` cannot serialize it
+/// (`serializeRskTxHashes`): the call throws. No network reaches it, as every
+/// network queues requests with their hashes well before RSKIP271.
+#[test]
+fn from_rskip271_a_batched_request_with_no_hash_fails_the_call() {
+    let mut collections = batching(&many_utxos(10, BTC), &[BTC]);
+    put_named(
+        &mut collections.bridge.ctx,
+        "releaseRequestQueue",
+        &legacy_queue(&[([9; 20], BTC)]),
+    );
+    let bridge = &mut collections.bridge;
+    let tx = BridgeTxContext {
+        rsk_sender: bridge.caller,
+        ..bridge.tx.clone()
+    };
+    assert!(crate::bridge::peg::update_collections(
+        &mut bridge.ctx,
+        0,
+        &bridge.constants,
+        &bridge.cfg,
+        &tx
+    )
+    .is_err());
+}
+
+/// From RSKIP271 rskj reads the next peg-out height in every
+/// `updateCollections` (`getNextPegoutHeight`, 0 where the cell holds
+/// nothing) and in `getNextPegoutCreationBlockNumber`, and writes back what
+/// it read where it set nothing new: a request that cannot be paid leaves
+/// the height unset, and the cell holds 0, `RLP.encodeBigInteger(0)`.
+/// Before RSKIP271 the cell is neither read nor written.
+#[test]
+fn from_rskip271_the_next_pegout_height_read_is_written_back() {
+    for (number, expected) in [
+        (MAINNET_HOP400 - 1, None),
+        (MAINNET_HOP400, Some(vec![0x80])),
+    ] {
+        let mut collections = Collections::mainnet_at(number);
+        collections.active(1, 0);
+        collections.requests(1);
+        collections.update();
+        assert_eq!(
+            named(&mut collections.bridge.ctx, "nextPegoutHeight"),
+            expected,
+            "at {number}"
+        );
+    }
+
+    let mut bridge = Bridge::mainnet_at(MAINNET_HOP400);
+    bridge
+        .execute(&crate::abi::selector("getNextPegoutCreationBlockNumber()"))
+        .expect("the getter answers");
+    assert_eq!(named(&mut bridge.ctx, "nextPegoutHeight"), Some(vec![0x80]));
 }

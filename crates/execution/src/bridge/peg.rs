@@ -65,6 +65,14 @@ pub struct ReleaseRequest {
     pub rsk_tx_hash: Option<[u8; 32]>,
 }
 
+/// rskj `ReleaseRequestQueue.Entry.equals`: the same destination, amount and
+/// creation hash, no hash being equal to no hash.
+fn same_release_request(a: &ReleaseRequest, b: &ReleaseRequest) -> bool {
+    a.btc_dest_hash160 == b.btc_dest_hash160
+        && a.amount_satoshis == b.amount_satoshis
+        && a.rsk_tx_hash == b.rsk_tx_hash
+}
+
 // ---------------------------------------------------------------------------
 // registerBtcTransaction
 // ---------------------------------------------------------------------------
@@ -3176,23 +3184,23 @@ pub fn update_collections<CTX: crate::RskContextTr>(
     // -----------------------------------------------------------------------
     // Step 1: Process peg-out requests (rskj processPegoutRequests)
     // -----------------------------------------------------------------------
-    let should_process_requests = if use_rskip271 {
-        // RSKIP271: batching — only process when nextPegoutHeight ≤ current block
-        let next_height =
-            super::storage::bridge_load_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY).to::<u64>();
-        block_number >= next_height
-    } else {
-        true // Pre-RSKIP271: process every block
-    };
+    // RSKIP271: rskj's `processPegoutsInBatch` first reads the next peg-out
+    // height (`BridgeStorageProvider.getNextPegoutHeight`, 0 where the cell
+    // holds nothing), and `saveNextPegoutHeight` writes back what it read
+    // unless a new height was set.
+    let read_next_height = use_rskip271
+        .then(|| super::storage::bridge_load_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY).to::<u64>());
+    // RSKIP271: batching -- only process when nextPegoutHeight <= current
+    // block. Pre-RSKIP271: process every block.
+    let should_process_requests =
+        read_next_height.is_none_or(|next_height| block_number >= next_height);
+    let mut next_height_set = false;
 
     if should_process_requests {
         // rskj `getReleaseRequestQueue` concatenates the legacy queue with the
-        // with-txhash one; it does not pick whichever is populated. Reading
-        // only one was correct on mainnet by circumstance -- the legacy queue
-        // was drained before RSKIP146 activated at iris300 (#3,614,800) and
-        // every request since carries a tx hash -- but it is not correct by
-        // construction, and an entry that ever landed in the legacy queue
-        // afterwards would have been silently stranded there forever.
+        // with-txhash one, from RSKIP146 (papyrus200, mainnet #2,392,700); it
+        // does not pick whichever is populated, so a request queued before
+        // RSKIP146 and still waiting is read with those queued since.
         let pending = load_release_request_queue(ctx, use_tx_hash);
 
         // RSKIP271: rskj processPegoutsInBatch sets nextPegoutHeight whenever
@@ -3362,34 +3370,49 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                     kept.extend(to_retry);
                     save_release_request_queue(ctx, &kept, use_tx_hash);
                 } else {
-                    // RSKIP271+ (processPegoutsInBatch): one batched BTC tx
-                    // for the whole queue, keyed by this updateCollections
-                    // call's tx hash.
-                    let outputs: Vec<super::release_tx::PegoutOutput> = pending
-                        .iter()
-                        .map(|r| super::release_tx::PegoutOutput {
-                            script: p2pkh_output_script(&r.btc_dest_hash160),
-                            amount_satoshis: r.amount_satoshis,
-                        })
-                        .collect();
-                    if let Some(built) = super::release_tx::complete_pegout_tx(
-                        &available,
-                        &outputs,
-                        &change_script,
-                        redeem_for,
-                        fee_per_kb,
-                        tx_version,
-                        is_segwit,
-                    )? {
-                        let total: u64 = pending.iter().map(|r| r.amount_satoshis).sum();
-                        // rskj logBatchPegoutCreated needs the batch BTC tx hash
-                        // and the per-request creation RSK tx hashes; capture
-                        // them before `settle` consumes `built`.
-                        let batch_btc_tx_hash = btc_txid_event_bytes(&built.tx);
-                        let batch_rsk_tx_hashes: Vec<[u8; 32]> = pending
+                    // RSKIP271+ (processPegoutsInBatch): one batched BTC tx,
+                    // keyed by this updateCollections call's tx hash. While
+                    // bitcoinj finds the transaction over its size and there
+                    // is more than one request, rskj halves the batch, keeping
+                    // the first half of the queue (`subList(0, size / 2)`).
+                    let build = |batch: &[ReleaseRequest]| {
+                        let outputs: Vec<super::release_tx::PegoutOutput> = batch
                             .iter()
-                            .map(|r| r.rsk_tx_hash.unwrap_or(tx_ctx.rsk_tx_hash))
+                            .map(|r| super::release_tx::PegoutOutput {
+                                script: p2pkh_output_script(&r.btc_dest_hash160),
+                                amount_satoshis: r.amount_satoshis,
+                            })
                             .collect();
+                        super::release_tx::build_pegout_tx(
+                            &available,
+                            &outputs,
+                            &change_script,
+                            redeem_for,
+                            fee_per_kb,
+                            tx_version,
+                            is_segwit,
+                        )
+                    };
+                    let mut batched: &[ReleaseRequest] = &pending;
+                    let mut result = build(batched)?;
+                    while batched.len() > 1
+                        && matches!(
+                            result,
+                            Err(super::release_tx::BuildRefusal::ExceededMaxTransactionSize)
+                        )
+                    {
+                        batched = &batched[..batched.len() / 2];
+                        result = build(batched)?;
+                    }
+                    if let Ok(built) = result {
+                        // rskj settles the batch with what the whole queue asked
+                        // for (`totalPegoutValue`), batched or not: the amount
+                        // `release_requested` logs, and what
+                        // `adjustBalancesIfChangeOutputWasDust` burns against.
+                        let total: u64 = pending.iter().map(|r| r.amount_satoshis).sum();
+                        // rskj logBatchPegoutCreated needs the batch BTC tx hash;
+                        // capture it before `settle` consumes `built`.
+                        let batch_btc_tx_hash = btc_txid_event_bytes(&built.tx);
                         // RSKIP379: index this pegout by the legacy sighash of
                         // its first input (BridgeSupport.savePegoutTxSigHash,
                         // inside settleReleaseRequest). Compute before `settle`
@@ -3416,20 +3439,36 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                         );
                         // rskj BridgeSupport.processPegoutsInBatch logs
                         // batch_pegout_created right after settleReleaseRequest
-                        // (which already logged release_requested), listing every
-                        // batched request's RSK creation tx hash.
+                        // (which already logged release_requested), listing each
+                        // batched request's RSK creation tx hash. A request
+                        // queued before RSKIP146 has none, and
+                        // `serializeRskTxHashes` throws on it: so does the call.
+                        let Some(batch_rsk_tx_hashes) = batched
+                            .iter()
+                            .map(|r| r.rsk_tx_hash)
+                            .collect::<Option<Vec<[u8; 32]>>>()
+                        else {
+                            return Err(PrecompileError::other(
+                                "updateCollections: a batched peg-out request has no creation hash",
+                            ));
+                        };
                         super::events::log_batch_pegout_created(
                             ctx,
                             &batch_btc_tx_hash,
                             &batch_rsk_tx_hashes,
                         );
                         created_any = true;
-                        // The whole queue was batched into one BTC tx, so it
-                        // is now empty (rskj removeEntries(pegoutEntries)).
-                        // rskj re-serializes the emptied queue, so the cell
-                        // holds RLP.encodeList([]) = [0xc0], NOT empty bytes.
-                        save_release_request_queue(ctx, &[], use_tx_hash);
-                        queue_emptied = true;
+                        // rskj `removeEntries` is `List.removeAll`: every queued
+                        // request equal to a batched one goes. The queue is
+                        // re-serialized, so an emptied cell holds
+                        // RLP.encodeList([]) = [0xc0], NOT empty bytes.
+                        let kept: Vec<ReleaseRequest> = pending
+                            .iter()
+                            .filter(|r| !batched.iter().any(|b| same_release_request(b, r)))
+                            .cloned()
+                            .collect();
+                        save_release_request_queue(ctx, &kept, use_tx_hash);
+                        queue_emptied = kept.is_empty();
                     }
                 }
 
@@ -3453,7 +3492,11 @@ pub fn update_collections<CTX: crate::RskContextTr>(
                 NEXT_PEGOUT_HEIGHT_KEY,
                 U256::from(next_height),
             );
+            next_height_set = true;
         }
+    }
+    if let (Some(read), false) = (read_next_height, next_height_set) {
+        super::storage::bridge_store_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY, U256::from(read));
     }
 
     // -----------------------------------------------------------------------
@@ -6116,11 +6159,17 @@ fn btc_satoshi_to_rbtc_wei(satoshis: u64) -> U256 {
 // ---------------------------------------------------------------------------
 
 /// `getNextPegoutCreationBlockNumber()` → int256
+///
+/// The method exists from RSKIP271, where rskj's
+/// `BridgeStorageProvider.getNextPegoutHeight` reads the cell, 0 where it
+/// holds nothing, and the Bridge's `teardown` writes back what was read
+/// (`saveNextPegoutHeight`).
 pub fn get_next_pegout_creation_block_number<CTX: crate::RskContextTr>(
     ctx: &mut CTX,
     gas_cost: u64,
 ) -> Result<PrecompileOutput, PrecompileError> {
     let val = super::storage::bridge_load_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY);
+    super::storage::bridge_store_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY, val);
     let mut output = [0u8; 32];
     let bytes = val.to_be_bytes::<32>();
     output.copy_from_slice(&bytes);
