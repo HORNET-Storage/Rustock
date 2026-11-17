@@ -13,5 +13,6 @@ mod peg_utils_all_utxos_to_fed_are_above_minimum_pegin_value_test;
 mod peg_utils_get_transaction_type_test;
 mod peg_utils_legacy_get_transaction_type_test;
 mod pegouts_waiting_for_confirmations_test;
+mod poc_sighash_test;
 mod release_transaction_builder_test;
 mod support;

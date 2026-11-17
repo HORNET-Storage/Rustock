@@ -5807,6 +5807,25 @@ fn build_erp_redeem_script(
     script
 }
 
+/// rskj `FederationFactory.buildP2shErpFederation`'s redeem script: a P2SH
+/// ERP federation of `members`, with the emergency keys `emergency` after
+/// `delay` blocks, each threshold a majority.
+#[cfg(test)]
+pub(crate) fn p2sh_erp_redeem_script(
+    members: &[[u8; 33]],
+    emergency: &[[u8; 33]],
+    delay: i64,
+) -> Vec<u8> {
+    build_erp_redeem_script(
+        members,
+        members.len() / 2 + 1,
+        emergency,
+        emergency.len() / 2 + 1,
+        delay,
+        ErpScript::P2sh,
+    )
+}
+
 /// rskj `PendingFederation.buildFederation` redeem-script selection: a
 /// committed federation is a standard multisig (pre-RSKIP201), a non-standard
 /// ERP federation (RSKIP201 active, RSKIP353 not), a P2SH-ERP federation
