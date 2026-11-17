@@ -347,7 +347,6 @@ fn before_rskip375_a_confirmed_pegout_takes_the_place_of_one_under_its_key() {
 /// (`BridgeSupport.checkIfEntryExistsInPegoutsWaitingForSignatures`), and
 /// `updateCollections` throws: both sets stay as they were.
 #[test]
-#[ignore = "rskj, from RSKIP375, refuses to keep a confirmed peg-out under a key the set waiting for signatures already has, and updateCollections fails; rustock keeps it there in place of the one there"]
 fn from_rskip375_a_confirmed_pegout_under_a_key_already_kept_fails_the_update() {
     let config = regtest_one_confirmation();
     let cfg = up_to(Fingerroot500, RSK_REGTEST_CHAIN_ID);
@@ -368,7 +367,6 @@ fn from_rskip375_a_confirmed_pegout_under_a_key_already_kept_fails_the_update() 
 /// `updateCollections` and both sets stay as they were, until the first,
 /// signed, leaves the set, when the second takes its key.
 #[test]
-#[ignore = "rskj, from RSKIP375, refuses to keep a confirmed peg-out under a key the set waiting for signatures already has, and updateCollections fails; rustock keeps it there in place of the one there"]
 fn from_rskip375_a_second_pegout_of_one_creation_waits_until_the_first_is_signed() {
     let config = regtest_one_confirmation();
     let cfg = up_to(Fingerroot500, RSK_REGTEST_CHAIN_ID);
@@ -391,6 +389,28 @@ fn from_rskip375_a_second_pegout_of_one_creation_waits_until_the_first_is_signed
     let kept = BTreeMap::from([(CREATION, bitcoin::consensus::serialize(&second))]);
     assert_eq!(waiting_for_signatures(&mut ctx), kept);
     assert!(waiting_pegouts(&mut ctx).is_empty());
+}
+
+/// From RSKIP375 rskj keys a confirmed peg-out by its creation hash, and a
+/// peg-out of none, made before RSKIP146, is looked up under null in its
+/// `TreeMap`, which throws: `updateCollections` fails, and both sets stay as
+/// they were. Before RSKIP375 such a peg-out is kept under the update
+/// transaction. No network reaches it: a peg-out waits for its confirmations
+/// some thousands of blocks, and RSKIP146 came long before RSKIP375.
+#[test]
+fn from_rskip375_a_confirmed_pegout_of_no_creation_hash_fails_the_update() {
+    assert_eq!(kept_under(Hop400, None), RSK_TX_HASH);
+
+    let config = regtest_one_confirmation();
+    let cfg = up_to(Fingerroot500, RSK_REGTEST_CHAIN_ID);
+    let pegout = pegout(0x91);
+    let mut ctx = confirming(&cfg, 2, (&pegout, 1, None), &BTreeMap::new());
+    assert!(
+        !update(&mut ctx, &config, &cfg).0,
+        "updateCollections throws"
+    );
+    assert!(waiting_for_signatures(&mut ctx).is_empty());
+    assert_eq!(waiting_pegouts(&mut ctx), [pegout]);
 }
 
 /// `getNextPegoutCreationBlockNumber_after_RSKIP271_activation`: the height

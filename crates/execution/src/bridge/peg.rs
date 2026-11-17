@@ -3539,9 +3539,16 @@ pub fn update_collections<CTX: crate::RskContextTr>(
             // - RSKIP375+: the pegout creation RSK tx hash
             // - RSKIP146..RSKIP176: creation hash, falling back to this tx
             // - otherwise (incl. pre-RSKIP146): this updateCollections tx hash
-            #[allow(clippy::if_same_then_else)] // distinct rskj rules that coincide today
-            let rsk_hash = if hardfork_cfg.has_rskip375(block_number) {
-                entry.rsk_tx_hash.unwrap_or(tx_ctx.rsk_tx_hash)
+            let rskip375 = hardfork_cfg.has_rskip375(block_number);
+            let rsk_hash = if rskip375 {
+                // A peg-out of no creation hash, made before RSKIP146, is
+                // looked up in rskj's `TreeMap` under null, which throws.
+                let Some(creation) = entry.rsk_tx_hash else {
+                    return Err(PrecompileError::other(
+                        "updateCollections: a confirmed peg-out has no creation hash",
+                    ));
+                };
+                creation
             } else if use_tx_hash && !hardfork_cfg.has_rskip176(block_number) {
                 entry.rsk_tx_hash.unwrap_or(tx_ctx.rsk_tx_hash)
             } else {
@@ -3551,6 +3558,14 @@ pub fn update_collections<CTX: crate::RskContextTr>(
             let wfs_key = bridge_storage_key(PEGOUTS_WAITING_FOR_SIGNATURES_KEY);
             let wfs_data = bridge_load_bytes(ctx, wfs_key);
             let mut wfs = deserialize_rsk_txs_waiting_for_signatures(&wfs_data);
+            // rskj `checkIfEntryExistsInPegoutsWaitingForSignatures`: from
+            // RSKIP375 a key the set already holds is not taken over; the call
+            // throws, and both sets stay as they were.
+            if rskip375 && wfs.contains_key(&rsk_hash) {
+                return Err(PrecompileError::other(
+                    "updateCollections: a peg-out already waits for signatures under this key",
+                ));
+            }
             wfs.insert(rsk_hash, entry.btc_tx_raw);
             let updated_wfs = serialize_rsk_txs_waiting_for_signatures(&wfs);
             bridge_store_bytes(ctx, wfs_key, &updated_wfs);
