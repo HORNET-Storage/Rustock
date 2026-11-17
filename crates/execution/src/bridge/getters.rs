@@ -917,13 +917,22 @@ pub fn get_state_for_debugging<CTX: crate::RskContextTr>(
             PEGOUTS_WAITING_FOR_SIGNATURES_KEY,
         )),
     );
-    let queue = super::peg::load_release_request_queue(ctx, papyrus);
+    // rskj's serializers each take their half of a collection: with the
+    // hashes from RSKIP146 the entries that carry one (`getEntriesWithHash`,
+    // `getEntriesWithHashOrdered`), before it the entries that carry none.
+    let queue: Vec<_> = super::peg::load_release_request_queue(ctx, papyrus)
+        .into_iter()
+        .filter(|entry| entry.rsk_tx_hash.is_some() == papyrus)
+        .collect();
     let queue_bytes = if papyrus {
         super::peg::serialize_release_queue_with_hash(&queue)
     } else {
         super::peg::serialize_release_queue_legacy(&queue)
     };
-    let confirmations = super::peg::load_pegout_confirmation_set(ctx, papyrus);
+    let confirmations: Vec<_> = super::peg::load_pegout_confirmation_set(ctx, papyrus)
+        .into_iter()
+        .filter(|entry| entry.rsk_tx_hash.is_some() == papyrus)
+        .collect();
     let confirmations_bytes =
         super::peg::serialize_pegouts_waiting_for_confirmations(&confirmations, papyrus);
     let next_pegout = bridge_load_u256(ctx, NEXT_PEGOUT_HEIGHT_KEY).to::<u64>();
@@ -1623,6 +1632,53 @@ mod tests {
                 "field {i} should carry a serialized collection"
             );
         }
+    }
+
+    /// From RSKIP146 `BridgeState.getEncoded` serializes the release-request
+    /// queue and the peg-outs waiting for confirmations with their hashes,
+    /// and rskj's serializers take only the entries that carry one: a request
+    /// or a peg-out from before RSKIP146 is left out, not written with a zero
+    /// hash.
+    #[test]
+    fn state_for_debugging_leaves_out_what_carries_no_hash() {
+        use crate::bridge::peg::{
+            serialize_pegouts_waiting_for_confirmations, serialize_release_queue_legacy,
+            serialize_release_queue_with_hash, store_pegout_confirmation_set,
+            PegoutWaitingForConfirmations, ReleaseRequest,
+        };
+        use crate::bridge::storage::{bridge_storage_key, bridge_store_bytes};
+        let mut ctx = ctx_at(6_500_000);
+        let request = |tag: u8, hash: Option<[u8; 32]>| ReleaseRequest {
+            btc_dest_hash160: [tag; 20],
+            amount_satoshis: 1_000_000,
+            rsk_tx_hash: hash,
+        };
+        bridge_store_bytes(
+            &mut ctx,
+            bridge_storage_key("releaseRequestQueue"),
+            &serialize_release_queue_legacy(&[request(1, None)]),
+        );
+        let hashed = request(2, Some([0x22; 32]));
+        bridge_store_bytes(
+            &mut ctx,
+            bridge_storage_key("releaseRequestQueueWithTxHash"),
+            &serialize_release_queue_with_hash(std::slice::from_ref(&hashed)),
+        );
+        let pegout = |tag: u8, hash: Option<[u8; 32]>| PegoutWaitingForConfirmations {
+            btc_tx_raw: vec![tag; 10],
+            rsk_block_height: 5,
+            rsk_tx_hash: hash,
+        };
+        let confirming = pegout(4, Some([0x44; 32]));
+        store_pegout_confirmation_set(&mut ctx, &[pegout(3, None), confirming.clone()], true);
+
+        let out = get_state_for_debugging(&mut ctx, 0, &mainnet(), &hardforks()).unwrap();
+        let fields = crate::bridge::serialization::rlp_decode_list(&as_bytes(&out)).unwrap();
+        assert_eq!(fields[3], serialize_release_queue_with_hash(&[hashed]));
+        assert_eq!(
+            fields[4],
+            serialize_pegouts_waiting_for_confirmations(&[confirming], true)
+        );
     }
 
     // ---- BTC tx index ----
