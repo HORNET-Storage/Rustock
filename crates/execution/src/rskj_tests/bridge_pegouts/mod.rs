@@ -5,6 +5,7 @@ mod bridge_event_logger_impl_test;
 mod bridge_event_logger_legacy_impl_test;
 mod bridge_storage_provider_test;
 mod bridge_support_add_signature_test;
+mod bridge_support_get_estimated_fees_test;
 mod bridge_support_pegout_transaction_created_event_test;
 mod bridge_support_process_funds_migration_test;
 mod bridge_support_register_btc_transaction_test;

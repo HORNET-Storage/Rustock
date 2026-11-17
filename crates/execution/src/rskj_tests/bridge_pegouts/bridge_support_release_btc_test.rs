@@ -1,9 +1,11 @@
 //! rskj's `BridgeSupportReleaseBtcTest`: here its tests of what RSKIP185
-//! changes in `releaseBtc`, and of the batches RSKIP271 builds in
-//! `updateCollections`. rskj's tests run `BridgeSupport` under papyrus200 and
-//! under every rule; the ports run mainnet's Bridge at the block before
-//! iris300, which brings RSKIP185, at iris300, and at hop400, which brings
-//! RSKIP271.
+//! changes in `releaseBtc`, of what RSKIP427 changes in a refund and in the
+//! amount a turned-down request is logged with, and of the batches RSKIP271
+//! builds in `updateCollections`. rskj's tests run `BridgeSupport` under
+//! papyrus200, arrowhead631 and every rule; the ports run mainnet's Bridge
+//! at the block before iris300, which brings RSKIP185, at iris300, at
+//! hop400, which brings RSKIP271, and at the block before lovell700, which
+//! brings RSKIP427, and at lovell700.
 
 use super::support::*;
 use alloy_primitives::{Address, U256};
@@ -182,6 +184,111 @@ fn from_rskip185_a_contracts_request_is_logged_and_not_refunded() {
         U256::from(2),
         "CALLER_CONTRACT"
     );
+}
+
+/// The block before RSKIP427 and the block that brings it.
+const AROUND_RSKIP427: [(u64, bool); 2] =
+    [(MAINNET_LOVELL700 - 1, false), (MAINNET_LOVELL700, true)];
+
+/// What rskj's tests add to a request's satoshis: a satoshi less one wei.
+fn under_a_satoshi() -> U256 {
+    U256::from(WEI_PER_SATOSHI - 1)
+}
+
+/// `releaseBtc` of `value` wei asked for by `caller`, from the transaction
+/// itself, or with `from_a_contract` from a contract's code; the value
+/// already at the Bridge.
+fn release_wei(
+    bridge: &mut Bridge,
+    caller: Address,
+    from_a_contract: bool,
+    value: U256,
+) -> Result<PrecompileOutput, PrecompileError> {
+    let bridge_address = crate::precompiles::BRIDGE_ADDR;
+    let held = bridge.balance(bridge_address);
+    bridge.set_balance(bridge_address, held + value);
+    let tx = BridgeTxContext {
+        rsk_sender: caller,
+        ..bridge.tx.clone()
+    };
+    crate::bridge::peg::release_btc(
+        &mut bridge.ctx,
+        0,
+        &bridge.constants,
+        &bridge.cfg,
+        &tx,
+        caller,
+        if from_a_contract { 2 } else { 1 },
+        value,
+    )
+}
+
+/// A request of `satoshis` and a satoshi less one wei, turned down for
+/// `reason`, with the fee per kilobyte `fee_per_kb`: from the sender it is
+/// refunded, from a contract it is not. Before RSKIP427 the refund and the
+/// amount `release_request_rejected` logs are its whole satoshis; from it
+/// the wei it sent.
+fn turned_down_around_rskip427(
+    satoshis: u64,
+    fee_per_kb: &[u8],
+    from_a_contract: bool,
+    reason: u64,
+) {
+    let rejected = event_topic("release_request_rejected(address,uint256,int256)");
+    let bridge_address = crate::precompiles::BRIDGE_ADDR;
+    let value = wei(satoshis) + under_a_satoshi();
+    let caller = if from_a_contract { CONTRACT } else { STRANGER };
+    for (number, rskip427) in AROUND_RSKIP427 {
+        let mut bridge = Bridge::mainnet_at(number);
+        put_named(&mut bridge.ctx, "feePerKb", &rlp_encode_element(fee_per_kb));
+        release_wei(&mut bridge, caller, from_a_contract, value).expect("releaseBtc answers");
+        assert_eq!(queued(&mut bridge), 0, "{number}");
+        let refunded = match (from_a_contract, rskip427) {
+            (true, _) => U256::ZERO,
+            (false, true) => value,
+            (false, false) => wei(satoshis),
+        };
+        assert_eq!(bridge.balance(caller), refunded, "{number}");
+        assert_eq!(bridge.balance(bridge_address), value - refunded, "{number}");
+        let logs = logs(&mut bridge.ctx);
+        assert_eq!(logs.len(), 1, "{number}");
+        assert_eq!(topics(&logs[0]), [rejected, as_topic(caller)], "{number}");
+        let amount = if rskip427 {
+            value
+        } else {
+            U256::from(satoshis)
+        };
+        assert_eq!(word(&logs[0].data.data, 0), amount, "{number}");
+        assert_eq!(word(&logs[0].data.data, 1), U256::from(reason), "{number}");
+    }
+}
+
+/// rskj's `low_amount_release_request_rejected_before_lovell` and
+/// `low_amount_release_request_rejected_after_lovell`: a satoshi below the
+/// minimum, LOW_AMOUNT. The fee per kilobyte is 5,000 satoshis, which
+/// leaves the minimum the larger bound.
+#[test]
+fn a_request_below_the_minimum_is_refunded_its_satoshis_before_rskip427_and_its_wei_from_it() {
+    let minimum = BridgeConstants::mainnet().minimum_pegout_tx_value;
+    turned_down_around_rskip427(minimum - 1, &[0x13, 0x88], false, 1);
+}
+
+/// rskj's `contract_caller_release_request_rejected_before_lovell` and
+/// `contract_caller_release_request_rejected_after_lovell`: the minimum,
+/// from a contract, CALLER_CONTRACT, nothing refunded.
+#[test]
+fn a_contracts_request_is_logged_in_satoshis_before_rskip427_and_in_wei_from_it() {
+    let minimum = BridgeConstants::mainnet().minimum_pegout_tx_value;
+    turned_down_around_rskip427(minimum, &[0x13, 0x88], true, 2);
+}
+
+/// rskj's `fee_above_value_release_request_rejected_before_lovell` and
+/// `fee_above_value_release_request_rejected_after_lovell`: a fee per
+/// kilobyte of a bitcoin, which puts the fee a peg-out must cover above a
+/// bitcoin, and a request of a bitcoin, FEE_ABOVE_VALUE.
+#[test]
+fn a_request_below_its_fee_is_refunded_its_satoshis_before_rskip427_and_its_wei_from_it() {
+    turned_down_around_rskip427(BTC, &[0x05, 0xf5, 0xe1, 0x00], false, 3);
 }
 
 /// Where the Bridge burns what it holds and no one is owed.
