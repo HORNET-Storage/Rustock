@@ -4981,9 +4981,9 @@ pub(crate) fn genesis_federation_keys(config: &BridgeConstants) -> Vec<[u8; 33]>
 /// negative encoding is tolerated rather than rejected. Bouncy Castle reads
 /// a length's long form as well as its short one, and refuses an integer
 /// whose first byte only repeats the sign of the next
-/// (`release_tx::der_signature_integers`).
+/// (`der_signature::der_signature_integers`).
 fn is_der_signature(sig: &[u8]) -> bool {
-    super::release_tx::der_signature_integers(sig).is_some()
+    super::der_signature::der_signature_integers(sig).is_some()
 }
 
 /// Does `key` parse the way rskj's `BtcECKey.fromPublicOnly` requires?

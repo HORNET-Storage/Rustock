@@ -17,6 +17,7 @@ pub mod btc_chain;
 pub mod btc_rules;
 pub mod btc_store;
 pub mod constants;
+mod der_signature;
 pub mod events;
 pub mod federation;
 pub mod getters;
