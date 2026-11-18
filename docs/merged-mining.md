@@ -37,6 +37,20 @@ extra_data = ""                    # at most 32 bytes
 refresh_secs = 60
 # gas_limit_target = 6800000      # rskj targetgaslimit; 7,500,000 on a regtest
 force_gas_limit = true             # rskj forcegaslimit
+min_gas_price = 0                  # rskj miner.minGasPrice
+
+[mining.stable_gas_price]          # rskj miner.stableGasPrice; no flag, as in rskj
+enabled = false
+# refresh_rate = "6 hours"
+# min_stable_gas_price = 4265280000000
+
+[mining.stable_gas_price.source]
+# method = "HTTP_GET"              # or ETH_CALL
+
+[mining.stable_gas_price.source.params]
+# url = "https://domain.info/ticker"
+# json_path = "/USD/buy"
+# timeout = "2 seconds"
 ```
 
 `--mining-extra-data` is capped at 32 bytes by the header rules, and the node
@@ -250,11 +264,22 @@ executed by exactly the code that will later re-execute it on the way in.
   (`--mining-force-gas-limit false`) the step follows the gas the parent used
   instead: up when it used more than two thirds of its gas limit, down
   otherwise, never past the target.
-- **`minimum_gas_price`** — one step toward an optional target, bounded by 1% of
-  the parent's, or one wei when 1% rounds to nothing. rskj
-  `MinimumGasPriceCalculator` (RSKIP-09). The target is
-  `--mining-min-gas-price`, rskj's `miner.minGasPrice`; without one a block
-  keeps its parent's.
+- **`minimum_gas_price`** — one step toward the miner's minimum gas price,
+  bounded by 1% of the parent's, or one wei when 1% rounds to nothing. rskj
+  `MinimumGasPriceCalculator` (RSKIP-09). The price is rskj's
+  `miner.minGasPrice`, `--mining-min-gas-price`, 0 unless set as in rskj; or,
+  with rskj's `miner.stableGasPrice` on (the config file's
+  `[mining.stable_gas_price]`), one held stable in a currency:
+  `min_stable_gas_price` over the price of a bitcoin, which a web API answers
+  as JSON (`HTTP_GET`, read as rskj's Jackson reads it) or a contract answers
+  to an `eth_call` on this node (`ETH_CALL`). A fetch runs on a thread of its
+  own and its price is kept for `refresh_rate`; a bitcoin priced outside
+  `min_valid_price` to `max_valid_price` is no price, and the fixed price
+  stands in until one is had. Two limits rskj doesn't have: a web answer
+  past 1 MiB is no price, and a redirect to a proxy the server names (305)
+  isn't followed. rskj `StableMinGasPriceProvider` and its two kinds;
+  `crates/cli/src/stable_gas_price.rs` and
+  `crates/execution/src/mining/min_gas_price.rs`.
 
 ### The REMASC transaction
 

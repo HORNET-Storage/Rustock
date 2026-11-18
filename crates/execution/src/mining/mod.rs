@@ -23,11 +23,16 @@ pub mod partition;
 pub mod workload;
 pub mod fork_detection;
 pub mod merkle;
+pub mod min_gas_price;
 pub mod server;
 pub mod uncles;
 pub mod template;
 pub mod timed;
 
+pub use min_gas_price::{
+    BtcExchangeRateSource, FixedMinGasPriceProvider, MinGasPriceProvider, MinGasPriceProviderType,
+    StableMinGasPriceProvider,
+};
 pub use server::{
     ChainAccess, CommitOutcome, ImportResult, MinerServer, MinerWork, RebuildPolicy,
     StoreChainAccess, SubmissionRateLimiter, SubmitError, SubmittedBlockInfo, SyncGate,

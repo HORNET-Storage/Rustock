@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use crate::hardfork::RskHardforkConfig;
 use crate::mining::fork_detection;
+use crate::mining::min_gas_price::{FixedMinGasPriceProvider, MinGasPriceProvider};
 use crate::processor::{BlockProcessor, ProcessError, compute_ommers_hash};
 
 /// Knobs an operator sets for the blocks this node builds. None of them are
@@ -36,9 +37,10 @@ pub struct MiningConfig {
     /// used. Off, a block's gas limit follows the gas its parent used, up to
     /// the target (`GasLimitCalculator`).
     pub force_gas_limit: bool,
-    /// Minimum gas price to steer towards, one step per block. `None`
-    /// inherits the parent's.
-    pub min_gas_price_target: Option<U256>,
+    /// Where the minimum gas price a block steers toward comes from, rskj's
+    /// `MinGasPriceProvider`: `miner.minGasPrice`, or `miner.stableGasPrice`
+    /// over it.
+    pub min_gas_price: Arc<dyn MinGasPriceProvider>,
     /// How many templates to keep for submissions that arrive late.
     pub work_cache_size: usize,
 }
@@ -57,7 +59,8 @@ impl Default for MiningConfig {
             extra_data: Bytes::new(),
             gas_limit_target: GAS_LIMIT_TARGET,
             force_gas_limit: true,
-            min_gas_price_target: None,
+            // rskj's `miner.minGasPrice`, 0 in its `reference.conf`.
+            min_gas_price: Arc::new(FixedMinGasPriceProvider::new(0)),
             // rskj MinerServerImpl.CACHE_SIZE.
             work_cache_size: 20,
         }
@@ -237,9 +240,11 @@ impl BlockTemplateBuilder {
             self.mining_config.force_gas_limit,
             self.chain_config.gas_limit_bound_divisor,
         );
+        // rskj `MinimumGasPriceCalculator.calculate`: a step from the parent's
+        // toward the provider's price, taken as it stands now.
         let minimum_gas_price = next_minimum_gas_price(
             &parent.minimum_gas_price_value(),
-            self.mining_config.min_gas_price_target,
+            self.mining_config.min_gas_price.min_gas_price_as_coin(),
         );
 
         // Past 256 bits the filter holds transactions to U256::MAX, which no
@@ -922,13 +927,10 @@ pub(super) fn next_gas_limit(
 ///
 /// rskj `MinimumGasPriceCalculator` (RSKIP-09) with `BlockGasPriceRange`: a
 /// child may move the minimum gas price by at most 1% of the parent's, or by
-/// one wei when 1% rounds to nothing. The parent's own value is always in
-/// range, so `None` -- inherit -- is always valid. rskj's miner takes the
-/// parent's price whole, a `Coin`, as the rule reads it: of any size.
-pub fn next_minimum_gas_price(parent_price: &BigUint, target: Option<U256>) -> BigUint {
-    let Some(target) = target else {
-        return parent_price.clone();
-    };
+/// one wei when 1% rounds to nothing; a target inside that band is taken,
+/// and one outside it the nearer edge. rskj's miner takes the parent's price
+/// whole, a `Coin`, as the rule reads it: of any size.
+pub fn next_minimum_gas_price(parent_price: &BigUint, target: U256) -> BigUint {
     let (lower, upper) = PrevMinGasPriceRule::range(parent_price);
     BigUint::from_bytes_be(&target.to_be_bytes::<32>()).clamp(lower, upper)
 }

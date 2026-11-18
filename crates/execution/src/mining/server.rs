@@ -1022,9 +1022,11 @@ impl MinerServer {
         // against its parent, the body's, the uncles' and fork detection.
         // RSKIP179 among them: a solution found in a Bitcoin block timestamped
         // five minutes or more from the template is one every peer rejects.
-        (rustock_core::validation::BitcoinTimestampRule { config: self.chain_config.clone() })
-            .validate(&block.header)
-            .map_err(SubmitError::SelfCheck)?;
+        (rustock_core::validation::BitcoinTimestampRule {
+            config: self.chain_config.clone(),
+        })
+        .validate(&block.header)
+        .map_err(SubmitError::SelfCheck)?;
         rustock_core::validation::HeaderVerifier::default_rsk(self.chain_config.clone())
             .verify(&block.header, Some(&parent))
             .map_err(SubmitError::SelfCheck)?;

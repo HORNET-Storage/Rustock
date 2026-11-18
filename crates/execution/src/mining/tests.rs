@@ -1076,7 +1076,7 @@ fn rebuilds_on_every_batch_when_there_is_no_candidate_to_compare_against() {
 #[test]
 fn increase_mgp() {
     assert_eq!(
-        next_minimum_gas_price(&BigUint::from(1000u32), Some(U256::from(2000))),
+        next_minimum_gas_price(&BigUint::from(1000u32), U256::from(2000)),
         BigUint::from(1010u32)
     );
 }
@@ -1085,7 +1085,7 @@ fn increase_mgp() {
 #[test]
 fn decrease_mgp() {
     assert_eq!(
-        next_minimum_gas_price(&BigUint::from(1000u32), Some(U256::from(900))),
+        next_minimum_gas_price(&BigUint::from(1000u32), U256::from(900)),
         BigUint::from(990u32)
     );
 }
@@ -1094,7 +1094,7 @@ fn decrease_mgp() {
 #[test]
 fn mgp_on_range() {
     assert_eq!(
-        next_minimum_gas_price(&BigUint::from(1000u32), Some(U256::from(995))),
+        next_minimum_gas_price(&BigUint::from(1000u32), U256::from(995)),
         BigUint::from(995u32)
     );
 }
@@ -1103,7 +1103,7 @@ fn mgp_on_range() {
 #[test]
 fn previous_mgp_equals_target() {
     assert_eq!(
-        next_minimum_gas_price(&BigUint::from(1000u32), Some(U256::from(1000))),
+        next_minimum_gas_price(&BigUint::from(1000u32), U256::from(1000)),
         BigUint::from(1000u32)
     );
 }
@@ -1112,7 +1112,7 @@ fn previous_mgp_equals_target() {
 #[test]
 fn previous_value_is_zero() {
     assert_eq!(
-        next_minimum_gas_price(&BigUint::ZERO, Some(U256::from(1000))),
+        next_minimum_gas_price(&BigUint::ZERO, U256::from(1000)),
         BigUint::from(1u32)
     );
 }
@@ -1121,18 +1121,23 @@ fn previous_value_is_zero() {
 #[test]
 fn previous_value_is_small_target_is_zero() {
     assert_eq!(
-        next_minimum_gas_price(&BigUint::from(1u32), Some(U256::ZERO)),
+        next_minimum_gas_price(&BigUint::from(1u32), U256::ZERO),
         BigUint::ZERO
     );
 }
 
-/// rskj `cantGetMGPtoBeNegative`: a negative target has no counterpart in
-/// an unsigned type; what is checked is that nothing steps below zero.
+/// rskj `cantGetMGPtoBeNegative`: a target below zero, which a provider's
+/// price can be, reads as zero (`as_coin`), and nothing steps below zero.
 #[test]
 fn cant_get_mgp_to_be_negative() {
+    use super::min_gas_price::as_coin;
     assert_eq!(
-        next_minimum_gas_price(&BigUint::ZERO, Some(U256::ZERO)),
+        next_minimum_gas_price(&BigUint::ZERO, as_coin(-100)),
         BigUint::ZERO
+    );
+    assert_eq!(
+        next_minimum_gas_price(&BigUint::from(1000u32), as_coin(-100)),
+        BigUint::from(990u32)
     );
 }
 
@@ -1200,8 +1205,14 @@ fn valid_by_consensus(new_gas: u64, parent_gas: u64) -> bool {
         parent.set_gas_limit(&BigUint::from(parent_gas));
         let mut header = header_at(2, parent.hash(), B256::ZERO);
         header.set_gas_limit(&BigUint::from(new_gas));
-        let rule = BlockParentGasLimitRule { config: test_chain_config() };
-        assert_eq!(rule.validate_with_parent(&header, &parent), Ok(()), "{new_gas} on {parent_gas}");
+        let rule = BlockParentGasLimitRule {
+            config: test_chain_config(),
+        };
+        assert_eq!(
+            rule.validate_with_parent(&header, &parent),
+            Ok(()),
+            "{new_gas} on {parent_gas}"
+        );
     }
     within
 }
@@ -1220,7 +1231,10 @@ fn next_block_gas_limit_is_decreased_by_a_factor() {
 #[test]
 fn next_block_gas_limit_is_not_decreased_lower_than_min_gas_limit() {
     let min = RSKJ_MIN_GAS_LIMIT;
-    assert_eq!(calculate_block_gas_limit(min, 0, min, RSKJ_TEST_TARGET, false), min);
+    assert_eq!(
+        calculate_block_gas_limit(min, 0, min, RSKJ_TEST_TARGET, false),
+        min
+    );
 }
 
 /// rskj `NextBlockGasLimitIsIncreasedBasedOnGasUsed`: 3,500,000 less a
@@ -1242,7 +1256,10 @@ fn next_block_gas_limit_is_increased_based_on_full_gas_used() {
 #[test]
 fn next_block_gas_limit_is_not_increased_more_than_target_gas_limit() {
     let target = RSKJ_TEST_TARGET;
-    assert_eq!(calculate_block_gas_limit(target, target, 0, target, false), target);
+    assert_eq!(
+        calculate_block_gas_limit(target, target, 0, target, false),
+        target
+    );
 }
 
 /// rskj `NextBlockGasLimitRemainsTheSame`.
@@ -1400,12 +1417,11 @@ fn the_minimum_gas_price_steps_one_percent_at_any_size() {
     // 1% of 100 * 2^294 + 12,345 is 2^294 + 123.
     let parent = two.pow(294) * 100u32 + 12_345u32;
     let lower = two.pow(294) * 99u32 + 12_222u32;
-    assert_eq!(next_minimum_gas_price(&parent, Some(U256::ZERO)), lower);
-    assert_eq!(next_minimum_gas_price(&parent, Some(U256::MAX)), lower);
-    assert_eq!(next_minimum_gas_price(&parent, None), parent);
+    assert_eq!(next_minimum_gas_price(&parent, U256::ZERO), lower);
+    assert_eq!(next_minimum_gas_price(&parent, U256::MAX), lower);
     // Below 2^256 every target is a U256, so none steps past it.
     let top = two.pow(256) - 1u8;
-    assert_eq!(next_minimum_gas_price(&(&top - 1u8), Some(U256::MAX)), top);
+    assert_eq!(next_minimum_gas_price(&(&top - 1u8), U256::MAX), top);
 }
 
 /// The template's filter holds transactions to the minimum, and past 256
@@ -1425,21 +1441,64 @@ fn past_256_bits_the_filter_holds_transactions_to_u256_max() {
     assert_eq!(u256_or_max(&BigUint::from(1_000u32)), U256::from(1_000));
 }
 
-/// On a parent whose minimum gas price is past 256 bits, a template keeps the
-/// parent's value, as rskj's miner writes it, which the parent rule takes.
+/// On a parent whose minimum gas price is past 256 bits, a template steps 1%
+/// down from the parent's value, toward rskj's default price of 0, as rskj's
+/// miner writes it, which the parent rule takes.
 #[test]
-fn a_template_on_a_minimum_gas_price_past_256_bits_keeps_its_value() {
+fn a_template_on_a_minimum_gas_price_past_256_bits_steps_from_its_value() {
     use rustock_core::validation::{ParentHeaderValidator, PrevMinGasPriceRule};
     let mut fx = fixture(20);
     let value = BigUint::from(2u8).pow(300);
     fx.parent.set_minimum_gas_price(&value);
     fx.store.put_header(&fx.parent).unwrap();
     let header = fx.build_on(&fx.parent).unwrap().block.header;
-    assert_eq!(header.minimum_gas_price_value(), value);
+    assert_eq!(header.minimum_gas_price_value(), &value - &value / 100u32);
     assert_eq!(header.minimum_gas_price, U256::MAX);
     assert_eq!(
         PrevMinGasPriceRule.validate_with_parent(&header, &fx.parent),
         Ok(())
+    );
+}
+
+/// rskj's `BlockToMineBuilder` asks its `MinGasPriceProvider` for the
+/// target as it builds: a price of 2,000 on a parent at 1,000 steps to
+/// 1,010, and the default, rskj's `miner.minGasPrice` of 0, to 990.
+#[test]
+fn a_template_steers_its_minimum_gas_price_toward_the_providers() {
+    let mut fx = fixture(20);
+    fx.parent.set_minimum_gas_price(&BigUint::from(1000u32));
+    fx.store.put_header(&fx.parent).unwrap();
+    let built = |min_gas_price: Arc<dyn MinGasPriceProvider>| {
+        let hardfork_cfg = RskHardforkConfig::all_active(33);
+        let processor = BlockProcessor::new(hardfork_cfg.clone(), fx.store.clone())
+            .with_chain_config(fx.chain_config.clone());
+        BlockTemplateBuilder::new(
+            Arc::new(processor),
+            fx.trie_store.clone(),
+            fx.chain_config.clone(),
+            hardfork_cfg,
+            MiningConfig {
+                min_gas_price,
+                ..Default::default()
+            },
+        )
+        .build(
+            std::slice::from_ref(&fx.parent),
+            Vec::new(),
+            &NoPendingTransactions,
+        )
+        .unwrap()
+        .block
+        .header
+        .minimum_gas_price
+    };
+    assert_eq!(
+        built(Arc::new(FixedMinGasPriceProvider::new(2000))),
+        U256::from(1010)
+    );
+    assert_eq!(
+        built(MiningConfig::default().min_gas_price),
+        U256::from(990)
     );
 }
 
@@ -2284,14 +2343,15 @@ mod partitioned_templates {
         fixture_with_forks(senders, RskHardforkConfig::all_active_parallel(33))
     }
 
-    /// The same fixture, for the RSKIP-252 tests next door. They need the
-    /// funded senders and the short chain; what they vary is the head's
-    /// minimum gas price, which they rewrite themselves.
+    /// The same fixture, for the tests next door: the funded senders and the
+    /// short chain, its blocks at a `minimum` gas price the miner's own
+    /// matches.
     #[allow(clippy::type_complexity)]
     pub(super) fn fixture_for_cap_test(
         senders: u8,
+        minimum: u64,
     ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
-        fixture_with_forks(senders, RskHardforkConfig::all_active_parallel(33))
+        fixture_with_forks_priced(senders, RskHardforkConfig::all_active_parallel(33), minimum)
     }
 
     #[allow(clippy::type_complexity)]
@@ -2303,8 +2363,8 @@ mod partitioned_templates {
     }
 
     /// `fixture_with_forks` on a chain whose blocks carry `minimum_gas_price`,
-    /// which the template inherits -- the RSKIP252 cap is 100 times it, and
-    /// there is no cap at zero.
+    /// the miner's own `miner.minGasPrice` too, so a template keeps it -- the
+    /// RSKIP252 cap is 100 times it, and there is no cap at zero.
     #[allow(clippy::type_complexity)]
     fn fixture_with_forks_priced(
         senders: u8,
@@ -2396,6 +2456,9 @@ mod partitioned_templates {
             hardfork_cfg,
             MiningConfig {
                 coinbase_address: address!("00000000000000000000000000000000c0117b45"),
+                min_gas_price: Arc::new(FixedMinGasPriceProvider::new(
+                    i64::try_from(minimum_gas_price).unwrap(),
+                )),
                 ..Default::default()
             },
         );
@@ -3093,27 +3156,14 @@ mod rskip252_cap {
         PendingTransaction { tx, sender, hash }
     }
 
-    /// The partitioning fixture leaves every header at a zero minimum gas
-    /// price, and `TxGasPriceCap` short-circuits on zero -- so a fixture that
-    /// did not set one would pass whatever the miner did. Rewrite the head
-    /// with `minimum`, keeping the store consistent with it.
+    /// The partitioning fixture on a chain at `minimum`, which the miner's own
+    /// price matches. `TxGasPriceCap` short-circuits on a zero minimum, so a
+    /// fixture that left it at zero would pass whatever the miner did.
     fn fixture_with_minimum(
         senders: u8,
         minimum: u64,
     ) -> (BlockTemplateBuilder, Header, Vec<SigningKey>, Arc<dyn TrieStore>, Arc<BlockStore>) {
-        let (builder, parent, keys, trie_store, store) =
-            super::partitioned_templates::fixture_for_cap_test(senders);
-        let mut head = parent.clone();
-        head.minimum_gas_price = U256::from(minimum);
-        head.cached_hash = None;
-        head.cached_hash_for_merged_mining = None;
-        let hash = head.hash();
-        store.put_header_with_hash(hash, &head).unwrap();
-        store.put_canonical_hash(head.number, hash).unwrap();
-        store.put_total_difficulty(hash, U256::from(head.number + 1)).unwrap();
-        store.set_head(hash).unwrap();
-        store.set_exec_head(hash, head.state_root).unwrap();
-        (builder, head, keys, trie_store, store)
+        super::partitioned_templates::fixture_for_cap_test(senders, minimum)
     }
 
     #[test]
@@ -3261,7 +3311,7 @@ mod mining_with_uncles {
     #[test]
     fn a_block_sealed_with_an_uncle_is_one_the_importer_accepts() {
         let (builder, parent, _keys, trie_store, store) =
-            super::partitioned_templates::fixture_for_cap_test(1);
+            super::partitioned_templates::fixture_for_cap_test(1, 0);
         let builder = builder_without_pow(builder, &store);
 
         let orphan = orphan_sibling_of_head(&store, &parent, 0xAA);
@@ -3317,7 +3367,7 @@ mod mining_with_uncles {
     #[test]
     fn the_importer_rejects_a_block_whose_uncle_is_inadmissible() {
         let (builder, parent, _keys, trie_store, store) =
-            super::partitioned_templates::fixture_for_cap_test(1);
+            super::partitioned_templates::fixture_for_cap_test(1, 0);
         let builder = builder_without_pow(builder, &store);
 
         // An ancestor, not a sibling. `select_uncles` would never offer it.
@@ -3347,7 +3397,7 @@ mod mining_with_uncles {
     #[test]
     fn the_header_commits_to_the_uncles_it_carries() {
         let (builder, parent, _keys, _trie_store, store) =
-            super::partitioned_templates::fixture_for_cap_test(1);
+            super::partitioned_templates::fixture_for_cap_test(1, 0);
         let builder = builder_without_pow(builder, &store);
         let _ = orphan_sibling_of_head(&store, &parent, 0xBB);
         let offered = select_uncles(&store, parent.number + 1, parent.hash());
@@ -4101,7 +4151,11 @@ mod own_block_rules {
                 Fault::Write => self.inner.header(hash),
             }
         }
-        fn select_uncles(&self, block_number: u64, parent_hash: B256) -> Result<Vec<Header>, String> {
+        fn select_uncles(
+            &self,
+            block_number: u64,
+            parent_hash: B256,
+        ) -> Result<Vec<Header>, String> {
             self.inner.select_uncles(block_number, parent_hash)
         }
         fn commit_mined_block(

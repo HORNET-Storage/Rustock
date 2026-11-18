@@ -21,9 +21,10 @@ consensus rules. Keep the table current: a port that adds a test flips its row t
 |---|---:|---:|---:|---:|
 | `co.rsk.validators` | 77 | 67 | 10 | 0 |
 | `co.rsk.mine` | 110 | 104 | 6 | 0 |
-| `co.rsk.mine.gas`, at the release | 22 | 0 | 6 | 16 |
+| `co.rsk.mine.gas`, at the release | 24 | 24 | 0 | 0 |
+| `co.rsk.config.mining`, at the release | 13 | 13 | 0 | 0 |
 | `co.rsk.net.handler.txvalidator and org.ethereum.facade` | 24 | 19 | 5 | 0 |
-| total | 233 | 190 | 27 | 16 |
+| total | 248 | 227 | 21 | 0 |
 
 Gaps where the code differs from rskj, in order of weight:
 
@@ -33,7 +34,7 @@ Gaps where the code differs from rskj, in order of weight:
 4. Pool admission lacked the 80x per-transaction price cap, the sublist gas limit under RSKIP144, the canonical-nonce check and the free-bridge exemption (`co.rsk.net.handler.txvalidator`). Fixed the same day; the sublist bound is tested at `gas_limit_is_bounded_by_the_larger_sublist_under_rskip144`.
 5. Miner behaviours rskj had and rustock did not: submission rate limit, duplicate submission answered OK, template rebuilt on new block and new transactions, the extraData format, the minimum gas price target, eviction of underpriced transactions. All six fixed the same day.
 6. A timed miner started again right after a stop ran a second thread beside the stopped one (`TimedMinerClientSimpleTest.testMultipleStartStopCycles`), and `evm_increaseTime` moved the clock back on a negative value, which rskj's `MinerClock` ignores (`MinerClockTest`). Both fixed, with the tests of their rows.
-7. rustock has no stable minimum gas price (rskj's `miner.stableGasPrice`, under `co.rsk.mine.gas` below): its miner's minimum gas price steps toward the configured one only.
+7. rustock had no stable minimum gas price (rskj's `miner.stableGasPrice`, under `co.rsk.mine.gas` below): its miner's minimum gas price stepped toward the configured one only. Fixed: the stable price, its web and contract sources and its settings, with every test of `co.rsk.mine.gas` and `co.rsk.config.mining` ported.
 
 ## rskj's release, area by area
 
@@ -259,32 +260,54 @@ Paths: rustock = `clients/rustock/crates/...`, rskj = `clients/rskj/rskj-core/sr
 
 ## co.rsk.mine.gas
 
-The table above was made at rskj `e507f45` and has no rows for this package; these are its tests at rskj's release VETIVER-9.0.4. rskj's miner takes its minimum gas price from a provider: a fixed one, the configured `miner.minGasPrice`, or, with `miner.stableGasPrice` on, one that reads a price from a web API or a contract call, keeps it a while, and falls back on the fixed price. rustock has the fixed one only: `--mining-min-gas-price`, which becomes `MiningConfig::min_gas_price_target`.
+The table above was made at rskj `e507f45` and has no rows for this package; these are its tests at rskj's release VETIVER-9.0.4. rskj's miner takes its minimum gas price from a provider: a fixed one, the configured `miner.minGasPrice`, or, with `miner.stableGasPrice` on, one that reads a price from a web API or a contract call, keeps it a while, and falls back on the fixed price. rustock has both: the providers in `crates/execution/src/mining/min_gas_price.rs`, and the web and contract sources, the factory and the settings in `crates/cli/src/stable_gas_price.rs`, which reads a web answer as rskj's Jackson reads it (`stable_gas_price/java.rs`).
 
 | rskj test | verdict | rustock test or reason | code check (gaps only) |
 |---|---|---|---|
-| FixedMinGasPriceProviderTest.testConstructorAndGetMinGasPrice | not applicable | no provider object: the configured price is the target (`crates/cli/src/main.rs`), which `increase_mgp` and `decrease_mgp` (mining/tests.rs) step toward | |
-| FixedMinGasPriceProviderTest.testGetType | not applicable | rustock has one kind of price | |
-| FixedMinGasPriceProviderTest.testGetMinGasPriceAsCoin | not applicable | a Java type's conversion | |
-| MinGasPriceProviderFactoryTest.createFixedMinGasPriceProvider | not applicable | no factory: the configured price is read where the miner is wired | |
-| MinGasPriceProviderFactoryTest.createWithNullConfig | not applicable | the same | |
-| MinGasPriceProviderFactoryTest.createWithDisabledConfigReturnFixed | not applicable | the same: without a stable price the fixed one is all there is | |
-| MinGasPriceProviderFactoryTest.createWebProviderMethod | gap | rustock has no stable minimum gas price | not implemented |
-| StableMinGasPriceProviderTest.testGetMinGasPrice | gap | rustock has no stable minimum gas price | not implemented |
-| StableMinGasPriceProviderTest.GetMinGasPriceUsesFallbackWhenReturnIsNull | gap | rustock has no stable minimum gas price | not implemented |
-| StableMinGasPriceProviderTest.whenRequestingTheValueTwiceCachedValueIsUsed | gap | rustock has no stable minimum gas price | not implemented |
-| StableMinGasPriceProviderTest.testGetMinGasPriceAsCoin | gap | rustock has no stable minimum gas price | not implemented |
-| StableMinGasPriceProviderTest.fallBackPriceIsReturnedWhenProvidedValueIsAboveMaxRange | gap | rustock has no stable minimum gas price | not implemented |
-| StableMinGasPriceProviderTest.fallBackPriceIsReturnedWhenProvidedValueIsBelowMinRange | gap | rustock has no stable minimum gas price | not implemented |
-| EthCallMinGasPriceProviderTest.constructorSetsFieldsToNullWhenConfigReturnsNull | gap | rustock has no stable minimum gas price | not implemented |
-| EthCallMinGasPriceProviderTest.getStableMinGasPrice_callsEthModulesCallMethod | gap | rustock has no stable minimum gas price | not implemented |
-| EthCallMinGasPriceProviderTest.getStableMinGasPrice_callsFallback_whenEthModuleIsNull | gap | rustock has no stable minimum gas price | not implemented |
-| EthCallMinGasPriceProviderTest.getType_returnsOnChain | gap | rustock has no stable minimum gas price | not implemented |
-| HttpGetMinGasPriceProviderTest.returnsMappedPriceFromWebClient | gap | rustock has no stable minimum gas price | not implemented |
-| HttpGetMinGasPriceProviderTest.whenRequestingTheValueTwiceCachedValueIsUsed | gap | rustock has no stable minimum gas price | not implemented |
-| HttpGetMinGasPriceProviderTest.whenEmptyResponseReturnsFallbackProvider | gap | rustock has no stable minimum gas price | not implemented |
-| HttpGetMinGasPriceProviderTest.whenErrorReturnsFallbackProvider | gap | rustock has no stable minimum gas price | not implemented |
-| HttpGetMinGasPriceProviderTest.whenPathIsWrongReturnsFallBack | gap | rustock has no stable minimum gas price | not implemented |
+| FixedMinGasPriceProviderTest.testConstructorAndGetMinGasPrice | covered | `test_constructor_and_get_min_gas_price` (`mining/min_gas_price.rs`) | |
+| FixedMinGasPriceProviderTest.testGetType | covered | `test_get_type` | |
+| FixedMinGasPriceProviderTest.testGetMinGasPriceAsCoin | covered | `test_get_min_gas_price_as_coin` | |
+| MinGasPriceProviderFactoryTest.createFixedMinGasPriceProvider | covered | `create_fixed_min_gas_price_provider` (`stable_gas_price.rs`) | |
+| MinGasPriceProviderFactoryTest.createWithNullConfig | covered | `create_with_null_config` | |
+| MinGasPriceProviderFactoryTest.createWithDisabledConfigReturnFixed | covered | `create_with_disabled_config_return_fixed` | |
+| MinGasPriceProviderFactoryTest.createWebProviderMethod | covered | `create_web_provider_method` | |
+| StableMinGasPriceProviderTest.testGetMinGasPrice | covered | `test_get_min_gas_price` (`mining/min_gas_price.rs`) | |
+| StableMinGasPriceProviderTest.GetMinGasPriceUsesFallbackWhenReturnIsNull | covered | `get_min_gas_price_uses_fallback_when_return_is_null` | |
+| StableMinGasPriceProviderTest.whenRequestingTheValueTwiceCachedValueIsUsed | covered | `when_requesting_the_value_twice_cached_value_is_used` | |
+| StableMinGasPriceProviderTest.testGetMinGasPriceAsCoin | covered | `test_get_min_gas_price_as_coin_of_a_stable_price` | |
+| StableMinGasPriceProviderTest.fallBackPriceIsReturnedWhenProvidedValueIsAboveMaxRange | covered | `fall_back_price_is_returned_when_provided_value_is_above_max_range` | |
+| StableMinGasPriceProviderTest.fallBackPriceIsReturnedWhenProvidedValueIsBelowMinRange | covered | `fall_back_price_is_returned_when_provided_value_is_below_min_range` | |
+| EthCallMinGasPriceProviderTest.constructorSetsFieldsCorrectly | covered | `constructor_sets_fields_correctly` (`stable_gas_price.rs`), for the data the settings can give; data that is absent is refused, as in the next row | |
+| EthCallMinGasPriceProviderTest.constructorSetsFieldsToNullWhenConfigReturnsNull | covered | `the_settings_refuse_an_eth_call_without_to_from_or_data`: the test's mocked settings give none, where rskj's own (`EthCallMinGasPriceSystemConfig`, by `getString`) refuse to start | |
+| EthCallMinGasPriceProviderTest.getStableMinGasPrice_callsEthModulesCallMethod | covered | `get_stable_min_gas_price_calls_eth_modules_call_method` | |
+| EthCallMinGasPriceProviderTest.getStableMinGasPrice_callsFallback_whenNoData | covered | `get_stable_min_gas_price_calls_fallback_when_no_data` | |
+| EthCallMinGasPriceProviderTest.getStableMinGasPrice_callsFallback_whenEthModuleIsNull | covered | `get_stable_min_gas_price_calls_fallback_when_eth_module_is_null` | |
+| EthCallMinGasPriceProviderTest.getType_returnsOnChain | covered | `get_type_returns_on_chain` | |
+| HttpGetMinGasPriceProviderTest.returnsMappedPriceFromWebClient | covered | `returns_mapped_price_from_web_client` | |
+| HttpGetMinGasPriceProviderTest.whenRequestingTheValueTwiceCachedValueIsUsed | covered | `when_requesting_the_value_twice_cached_value_is_used` | |
+| HttpGetMinGasPriceProviderTest.whenEmptyResponseReturnsFallbackProvider | covered | `when_empty_response_returns_fallback_provider` | |
+| HttpGetMinGasPriceProviderTest.whenErrorReturnsFallbackProvider | covered | `when_error_returns_fallback_provider` | |
+| HttpGetMinGasPriceProviderTest.whenPathIsWrongReturnsFallBack | covered | `when_path_is_wrong_returns_fall_back` | |
+
+## co.rsk.config.mining
+
+The settings of the stable minimum gas price, at rskj's release VETIVER-9.0.4. rustock's are the config file's `[mining.stable_gas_price]`, read as rskj reads `miner.stableGasPrice` (`StableGasPriceConfig` in `crates/cli/src/stable_gas_price.rs`): its keys in the file's snake case, its durations as HOCON writes them.
+
+| rskj test | verdict | rustock test or reason | code check (gaps only) |
+|---|---|---|---|
+| EthCallMinGasPriceSystemConfigTest.testAddress | covered | `test_address` | |
+| EthCallMinGasPriceSystemConfigTest.testFrom | covered | `test_from` | |
+| EthCallMinGasPriceSystemConfigTest.testData | covered | `test_data` | |
+| HttpGetStableMinGasSystemConfigTest.testGetUrl | covered | `test_get_url` | |
+| HttpGetStableMinGasSystemConfigTest.testRequestPath | covered | `test_request_path` | |
+| HttpGetStableMinGasSystemConfigTest.testGetTimeout | covered | `test_get_timeout` | |
+| StableMinGasPriceSystemConfigTest.testGetRefreshRate | covered | `test_get_refresh_rate` | |
+| StableMinGasPriceSystemConfigTest.testGetMinStableGasPrice | covered | `test_get_min_stable_gas_price` | |
+| StableMinGasPriceSystemConfigTest.testIsEnabled | covered | `test_is_enabled` | |
+| StableMinGasPriceSystemConfigTest.testGetMethod | covered | `test_get_method` | |
+| StableMinGasPriceSystemConfigTest.wrongMethodShouldThrowException | covered | `wrong_method_should_throw_exception` | |
+| StableMinGasPriceSystemConfigTest.missingPropertyShouldThrowException | covered | `missing_property_should_throw_exception` | |
+| StableMinGasPriceSystemConfigTest.testRanges | covered | `test_ranges` | |
 
 ## co.rsk.net.handler.txvalidator and org.ethereum.facade
 

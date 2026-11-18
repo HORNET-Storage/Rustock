@@ -333,13 +333,89 @@ pub struct MiningSection {
     pub coinbase: Option<String>,
     pub extra_data: Option<String>,
     pub refresh_secs: Option<u64>,
-    pub min_gas_price: Option<u64>,
+    pub min_gas_price: Option<i64>,
     pub gas_limit_target: Option<u64>,
     pub force_gas_limit: Option<bool>,
     pub submission_rate_limit_ms: Option<u64>,
     pub update_work_on_new_transaction: Option<bool>,
     pub timed: Option<String>,
     pub flush_every: Option<u64>,
+    /// rskj `miner.stableGasPrice`, which has no flag: rskj sets it in its
+    /// configuration only.
+    pub stable_gas_price: Option<StableGasPriceSection>,
+}
+
+/// rskj `miner.stableGasPrice`: a minimum gas price held stable in a
+/// currency, its keys as rskj names them, in this file's snake case.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StableGasPriceSection {
+    pub enabled: Option<bool>,
+    pub refresh_rate: Option<DurationValue>,
+    pub min_stable_gas_price: Option<i64>,
+    pub min_valid_price: Option<i64>,
+    pub max_valid_price: Option<i64>,
+    pub source: Option<StableGasPriceSource>,
+}
+
+impl StableGasPriceSection {
+    /// Whether the section says only what rskj's defaults say: off, every
+    /// price a valid one, and no source, its tables empty if they are there.
+    /// A node with it runs as one without it.
+    pub fn is_default(&self) -> bool {
+        let Self {
+            enabled,
+            refresh_rate,
+            min_stable_gas_price,
+            min_valid_price,
+            max_valid_price,
+            source,
+        } = self;
+        *enabled != Some(true)
+            && refresh_rate.is_none()
+            && min_stable_gas_price.is_none()
+            && min_valid_price.is_none_or(|price| price == 0)
+            && max_valid_price.is_none_or(|price| price == i64::MAX)
+            && source.as_ref().is_none_or(|source| {
+                source.method.is_none()
+                    && source
+                        .params
+                        .as_ref()
+                        .is_none_or(|params| *params == StableGasPriceParams::default())
+            })
+    }
+}
+
+/// rskj `miner.stableGasPrice.source`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StableGasPriceSource {
+    /// `HTTP_GET`, `ETH_CALL` or `FIXED`, as rskj names them.
+    pub method: Option<String>,
+    pub params: Option<StableGasPriceParams>,
+}
+
+/// rskj `miner.stableGasPrice.source.params`: `url`, `json_path` and
+/// `timeout` for `HTTP_GET`; `from`, `to` and `data` for `ETH_CALL`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StableGasPriceParams {
+    pub url: Option<String>,
+    pub json_path: Option<String>,
+    pub timeout: Option<DurationValue>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub data: Option<String>,
+}
+
+/// A duration as rskj's HOCON writes one: a number of milliseconds, or a
+/// number and a unit (`"6 hours"`).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DurationValue {
+    Millis(i64),
+    FractionalMillis(f64),
+    Text(String),
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]

@@ -3,6 +3,7 @@ use clap::{CommandFactory, FromArgMatches, Parser};
 mod bootstrap_import;
 mod config_file;
 mod https;
+mod stable_gas_price;
 use rustock_core::config::ChainConfig;
 use rustock_core::validation::HeaderVerifier;
 use rustock_storage::BlockStore;
@@ -1052,9 +1053,22 @@ struct Args {
 
     /// Minimum gas price to steer mined blocks toward, in wei, as rskj's
     /// `miner.minGasPrice`: one RSKIP-09 step (1% of the parent's) per
-    /// block. Absent, each block inherits its parent's.
-    #[arg(long, value_name = "WEI")]
-    mining_min_gas_price: Option<u64>,
+    /// block, toward 0 unless set, rskj's default. With the config file's
+    /// `[mining.stable_gas_price]` on, the price that stands in until a
+    /// stable one is fetched. A price below zero steers as zero does, as in
+    /// rskj.
+    #[arg(
+        long,
+        value_name = "WEI",
+        default_value_t = 0,
+        allow_negative_numbers = true
+    )]
+    mining_min_gas_price: i64,
+
+    /// rskj's `miner.stableGasPrice`: the config file's
+    /// `[mining.stable_gas_price]`, which has no flag, as rskj has none.
+    #[arg(skip)]
+    mining_stable_gas_price: Option<config_file::StableGasPriceSection>,
 
     /// Gas limit to steer mined blocks toward, as rskj's `targetgaslimit`:
     /// one step, a 1024th of the parent's, per block. Absent, rskj's:
@@ -1697,7 +1711,7 @@ fn apply_file_config(
     apply(matches, "mining_extra_data", f.mining.extra_data.as_ref(), &mut a.mining_extra_data);
     apply(matches, "mining_refresh_secs", f.mining.refresh_secs.as_ref(),
         &mut a.mining_refresh_secs);
-    apply_opt(matches, "mining_min_gas_price", f.mining.min_gas_price.as_ref(), &mut a.mining_min_gas_price);
+    apply(matches, "mining_min_gas_price", f.mining.min_gas_price.as_ref(), &mut a.mining_min_gas_price);
     apply_opt(matches, "mining_gas_limit_target", f.mining.gas_limit_target.as_ref(),
         &mut a.mining_gas_limit_target);
     apply(matches, "mining_force_gas_limit", f.mining.force_gas_limit.as_ref(),
@@ -1708,6 +1722,11 @@ fn apply_file_config(
         f.mining.update_work_on_new_transaction.as_ref(), &mut a.mining_update_work_on_new_transaction);
     apply_opt(matches, "mine_timed", f.mining.timed.as_ref(), &mut a.mine_timed);
     apply(matches, "flush_every", f.mining.flush_every.as_ref(), &mut a.flush_every);
+    // rskj `miner.stableGasPrice`, which has no flag. A section that says
+    // only what rskj's defaults say is left out: the node runs the same.
+    if let Some(section) = f.mining.stable_gas_price.as_ref().filter(|s| !s.is_default()) {
+        a.mining_stable_gas_price = Some(section.clone());
+    }
 
     apply(matches, "account_tx_rate_limit", f.account_tx_rate_limit.enabled.as_ref(),
         &mut a.account_tx_rate_limit);
@@ -3569,6 +3588,12 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         }
     });
 
+    // rskj's `ETH_CALL` stable gas price runs a call on the node's own
+    // `EthModule`, which rskj has whether it serves RPC or not. The state a
+    // call runs on is built further down, once the miner is: the price's
+    // fetches, on a thread of their own, wait for it, as rskj's wait on its
+    // `getEthModule()`.
+    let node_calls: Arc<std::sync::OnceLock<rustock_rpc::server::RpcState>> = Arc::default();
     // The miner. It shares the store and trie store with sync but holds its
     // own block processor: `BlockProcessor` is a handle over those two, and
     // the sync service has taken ownership of the one built above.
@@ -3599,10 +3624,20 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             extra_data,
             // rskj `targetgaslimit` and `forcegaslimit`, through
             // `GasLimitCalculator`.
-            gas_limit_target: mining_gas_limit_target(config.chain_id, args.mining_gas_limit_target),
+            gas_limit_target: mining_gas_limit_target(
+                config.chain_id,
+                args.mining_gas_limit_target,
+            ),
             force_gas_limit: args.mining_force_gas_limit,
-            // rskj `miner.minGasPrice`, through `MinimumGasPriceCalculator`.
-            min_gas_price_target: args.mining_min_gas_price.map(alloy_primitives::U256::from),
+            // rskj `miner.minGasPrice`, through `MinimumGasPriceCalculator`;
+            // or with `miner.stableGasPrice` on, a price held stable in a
+            // currency, that one standing in until it is fetched.
+            min_gas_price: stable_gas_price::create(
+                args.mining_min_gas_price,
+                args.mining_stable_gas_price.as_ref(),
+                config.chain_id,
+                node_eth_call(node_calls.clone()),
+            )?,
             ..Default::default()
         };
         // The miner's processor is wired like the node's: the same rules
@@ -3797,7 +3832,11 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         None => None,
     };
 
-    if !args.no_rpc {
+    // The node's state for calls: for its RPC, and for a stable gas price
+    // from a contract, which rskj's node calls whether it serves RPC or not.
+    let calls_for_price =
+        args.mine && stable_gas_price::calls_this_node(args.mining_stable_gas_price.as_ref());
+    if !args.no_rpc || calls_for_price {
         let trie_store: Arc<dyn rustock_trie::TrieStore> = match &detached_for_readers {
             Some(t) => t.clone(),
             None => Arc::new(rustock_storage::RocksDbTrieStore::from_db(store.db().clone())),
@@ -3872,29 +3911,43 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             scoring: Some(scoring.clone()),
             events: events.clone(),
         };
-        // The WebSocket server shares the same `RpcState`, so every method
-        // available over HTTP works over the socket too -- plus
-        // `eth_subscribe`, which only means anything on a connection that
-        // stays open.
-        if args.ws {
-            let ws_host = args.rpc_host.clone();
-            let ws_port = args.ws_port;
-            let ws_state = rpc_state.clone();
+        // The price's calls run on the same state, without the miner the RPC
+        // reaches through it: the miner holds the price.
+        if calls_for_price {
+            let _ = node_calls.set(rustock_rpc::server::RpcState {
+                miner: None,
+                auto_miner: None,
+                ..rpc_state.clone()
+            });
+        }
+        if !args.no_rpc {
+            // The WebSocket server shares the same `RpcState`, so every method
+            // available over HTTP works over the socket too -- plus
+            // `eth_subscribe`, which only means anything on a connection that
+            // stays open.
+            if args.ws {
+                let ws_host = args.rpc_host.clone();
+                let ws_port = args.ws_port;
+                let ws_state = rpc_state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        rustock_rpc::ws::start_ws_server(&ws_host, ws_port, ws_state).await
+                    {
+                        tracing::error!("RPC WebSocket server error: {}", e);
+                    }
+                });
+            }
+
+            let rpc_host = args.rpc_host.clone();
+            let rpc_port = args.rpc_port;
             tokio::spawn(async move {
-                if let Err(e) = rustock_rpc::ws::start_ws_server(&ws_host, ws_port, ws_state).await
+                if let Err(e) =
+                    rustock_rpc::server::start_rpc_server(&rpc_host, rpc_port, rpc_state).await
                 {
-                    tracing::error!("RPC WebSocket server error: {}", e);
+                    tracing::error!("RPC server error: {}", e);
                 }
             });
         }
-
-        let rpc_host = args.rpc_host.clone();
-        let rpc_port = args.rpc_port;
-        tokio::spawn(async move {
-            if let Err(e) = rustock_rpc::server::start_rpc_server(&rpc_host, rpc_port, rpc_state).await {
-                tracing::error!("RPC server error: {}", e);
-            }
-        });
     }
 
     // Independent of the RPC server: metrics are useful on a node that
@@ -4150,6 +4203,22 @@ fn mining_gas_limit_target(chain_id: u8, set: Option<u64>) -> u64 {
         rustock_execution::mining::GAS_LIMIT_TARGET
     } else {
         rustock_execution::mining::REGTEST_GAS_LIMIT_TARGET
+    })
+}
+
+/// rskj `EthModule.call`, as its `EthCallMinGasPriceProvider` makes one: the
+/// node's own `eth_call`, run once the node's state is open to calls, and
+/// its answer, or its error.
+fn node_eth_call(
+    node: Arc<std::sync::OnceLock<rustock_rpc::server::RpcState>>,
+) -> stable_gas_price::EthCaller {
+    Arc::new(move |params: &serde_json::Value| {
+        let response = rustock_rpc::call::eth_call(serde_json::Value::from(1), params, node.wait());
+        match (response.result, response.error) {
+            (_, Some(error)) => anyhow::bail!("{} (code {})", error.message, error.code),
+            (Some(serde_json::Value::String(output)), None) => Ok(output),
+            (other, None) => anyhow::bail!("an answer that is no hex string: {other:?}"),
+        }
     })
 }
 
