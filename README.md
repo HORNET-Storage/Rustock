@@ -73,6 +73,9 @@ docker run --rm rustock rustock-cli --help
 
 The image has no entrypoint; the binary is `/usr/local/bin/rustock-cli`.
 
+To run a node under Docker Compose from a prebuilt binary, see
+[docs/docker.md](docs/docker.md).
+
 ### Running
 
 Start the full node on RSK Mainnet (default):
