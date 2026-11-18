@@ -40,3 +40,11 @@ pegout-alerts.toml
 # Built and installed node binaries (scripts/build-binary.sh)
 /dist/
 /bin/
+
+# The SPV wallet lives at /home/paseo/wallet, not here. An ignored directory
+# inside this tree is one `git clean -xdf` from deletion, with no history to
+# recover it -- being ignored is precisely what keeps it out of history.
+# Root-anchored, so a crate directory named client or server is unaffected.
+/wallet/
+/client/
+/server/

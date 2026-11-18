@@ -26,6 +26,43 @@ read it for correctness: `unsafe`, `transmute`, network calls, process
 spawns, environment reads, file writes, key handling, and any change to
 `Cargo.toml` or `Cargo.lock`. Then read it for what it claims to do.
 
+Screen by **reading the diff through the API** — `gh pr diff`, `gh pr view
+--json files`, `gh api .../contents/<path>?ref=refs/pull/N/head`. Never by
+checking the branch out. `cargo build` and `cargo test` execute the
+contributor's code as you, with your SSH keys, your `gh` token and write
+access to `/var/lib/rustock`, before you have read a line. The node in
+production runs hardened under systemd; this machine does not. Merging was
+never the dangerous step.
+
+### The three questions that decide whether reading is enough
+
+Answer these from the diff alone, before anything else:
+
+1. **Does `Cargo.lock` gain any `[[package]]` entry?** A new dependency
+   brings its own `build.rs` and proc macros, which you will not review.
+   Feature-only changes to an existing locked package add no new code.
+2. **Does it add or change `build.rs`, `.cargo/config.toml`,
+   `rust-toolchain.toml`, or a proc-macro dependency?** Each runs code at
+   build time. `.cargo/config.toml` is the quietest: a `runner`, `linker` or
+   `[alias]` there is arbitrary command execution, and it reads as
+   configuration rather than code. This repository has no `.cargo/config.toml`
+   at all, so one appearing in a pull request is a flag by itself.
+3. **Does it add any non-Rust executable** — shell script, `Dockerfile`,
+   `Makefile`, `justfile`, CI workflow, `package.json` with lifecycle
+   scripts? These do not run on `cargo build`, but they run when someone
+   follows the README.
+
+All three clean means reading the diff is the whole review, and no
+sandbox is needed. Any one of them dirty means the build belongs in a
+throwaway VM or container with no credentials, no SSH agent and no access to
+`/var/lib/rustock` — regardless of who the author appears to be.
+
+Remember that an editor is also an execution vector: rust-analyzer runs
+`build.rs` and expands proc macros when a project is opened.
+
+Report what a change does and what could not be ruled out. Never imply that
+an outside contribution has been cleared as safe.
+
 ## Consensus changes are checked against the chain, not reasoned about
 
 A consensus rule that is stricter than the chain it must accept is a fork.
