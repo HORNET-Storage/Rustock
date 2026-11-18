@@ -363,6 +363,8 @@
 # extra_data = ""                   # default — client string, cut to fit rskj's 32-byte [1, "<version>-<commit>", extra] field
 # refresh_secs = 60                 # default
 # min_gas_price = 0                 # default: unset — wei to steer the block minimum toward, 1% per block (rskj miner.minGasPrice)
+# gas_limit_target = 6800000        # default: unset — rskj targetgaslimit: 6,800,000, or 7,500,000 on a regtest; a 1024th a block toward it
+# force_gas_limit = true            # default — rskj forcegaslimit; false follows the gas the parent used, up to the target
 # submission_rate_limit_ms = 0      # default — refuse a second submission inside this window (rskj workSubmissionRateLimitInMills)
 # update_work_on_new_transaction = false  # default — rebuild when arrivals pay a tenth of the candidate's fees (rskj updateWorkOnNewTransaction)
 # timed = "10s"                     # default: unset — mine on rskj's regtest clock (timedMine): exponential delays with this median

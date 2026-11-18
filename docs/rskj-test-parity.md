@@ -20,10 +20,10 @@ consensus rules. Keep the table current: a port that adds a test flips its row t
 | package | tests | covered | not applicable | gap |
 |---|---:|---:|---:|---:|
 | `co.rsk.validators` | 77 | 67 | 10 | 0 |
-| `co.rsk.mine` | 110 | 100 | 6 | 4 |
+| `co.rsk.mine` | 110 | 104 | 6 | 0 |
 | `co.rsk.mine.gas`, at the release | 22 | 0 | 6 | 16 |
 | `co.rsk.net.handler.txvalidator and org.ethereum.facade` | 24 | 19 | 5 | 0 |
-| total | 233 | 186 | 27 | 20 |
+| total | 233 | 190 | 27 | 16 |
 
 Gaps where the code differs from rskj, in order of weight:
 
@@ -157,17 +157,17 @@ Paths: rustock = `clients/rustock`, `tests.rs` = `crates/execution/src/mining/te
 | ForkDataDetectionCalculatorTest.calculateWithDivisibleBy64height | covered | `fork_detection_data_commits_to_a_bitcoin_header_every_64_blocks` (tests.rs). rskj's test names the block 446 below the best for the last byte, where its calculator reads 447 (`bestBlockHeight - cpvStartHeight + i * 64`); it passes because its chain gives #64 and #65 one Bitcoin header. Here each block has its own, and rustock reads 447, as rskj's code does | |
 | ForkDataDetectionCalculatorTest.calculateWithUnclesOnPreviousBlocks | covered | `fork_detection_data_commits_to_height_and_uncles` (tests.rs): sums only the last 32 blocks' `uncle_count` | |
 | ForkDataDetectionCalculatorTest.calculateWithMaxUnclesOnPreviousBlocks | covered | `fork_detection_uncle_count_saturates` (tests.rs): byte 7 saturates at 255 | |
-| GasLimitCalculatorTest.NextBlockGasLimitIsDecreasedByAFactor | gap | no test for `next_gas_limit` with a target | differs: this is rskj's `forceTarget=false` path (gas-used driven: `-deltaMax + usedGas*3/2/1024`). rustock `next_gas_limit` (template.rs:715-731) only implements the forced-target step (`target` clamped to parent +/- parent/1024) or inherit (`None`). rskj's default is `forcegaslimit=true` (RskSystemProperties.java:416-418), so the gas-used path is a non-default mode rustock lacks. |
-| GasLimitCalculatorTest.NextBlockGasLimitIsNotDecreasedLowerThanMinGasLimit | covered | `a_gas_limit_target_under_the_minimum_is_the_minimum` (crates/execution/src/mining/tests.rs) | |
-| GasLimitCalculatorTest.NextBlockGasLimitIsIncreasedBasedOnGasUsed | gap | no test | differs: gas-used path (forceTarget=false) not implemented, template.rs:715-731. |
-| GasLimitCalculatorTest.NextBlockGasLimitIsIncreasedBasedOnFullGasUsed | gap | no test | differs: same, template.rs:715-731. |
-| GasLimitCalculatorTest.NextBlockGasLimitIsNotIncreasedMoreThanTargetGasLimit | gap | no test | differs: gas-used path not implemented; the forced path does cap at target (template.rs:727 `target.min(parent + delta)`). |
-| GasLimitCalculatorTest.NextBlockGasLimitRemainsTheSame | covered | `a_template_inherits_gas_limit_and_minimum_gas_price` (tests.rs) (parent == target case == inherit) | |
-| GasLimitCalculatorTest.NextBlockGasLimitIsIncreasedByMaximumValue | covered | `the_gas_limit_steps_a_1024th_at_any_size` (crates/execution/src/mining/tests.rs) | |
-| GasLimitCalculatorTest.NextBlockGasLimitIsIncreasedToTarget | covered | `the_gas_limit_steps_a_1024th_at_any_size` (crates/execution/src/mining/tests.rs) | |
-| GasLimitCalculatorTest.NextBlockGasLimitIsDecreasedToTarget | covered | `a_target_within_a_step_below_is_reached_in_one_block` (tests.rs) | |
-| GasLimitCalculatorTest.NextBlockGasLimitIsDecreasedToMinimum | covered | `a_gas_limit_target_under_the_minimum_is_the_minimum` (crates/execution/src/mining/tests.rs) | |
-| GasLimitCalculatorTest.NextBlockGasLimitIsDecreasedByMaximumValue | covered | `the_gas_limit_steps_a_1024th_at_any_size` (crates/execution/src/mining/tests.rs) | |
+| GasLimitCalculatorTest.NextBlockGasLimitIsDecreasedByAFactor | covered | `next_block_gas_limit_is_decreased_by_a_factor` (mining/tests.rs), ported with the rest of the class at rskj's release: `forcegaslimit` off, the gas-used path, which rustock's miner now has (`--mining-force-gas-limit false`) | |
+| GasLimitCalculatorTest.NextBlockGasLimitIsNotDecreasedLowerThanMinGasLimit | covered | `next_block_gas_limit_is_not_decreased_lower_than_min_gas_limit` (mining/tests.rs) | |
+| GasLimitCalculatorTest.NextBlockGasLimitIsIncreasedBasedOnGasUsed | covered | `next_block_gas_limit_is_increased_based_on_gas_used` (mining/tests.rs) | |
+| GasLimitCalculatorTest.NextBlockGasLimitIsIncreasedBasedOnFullGasUsed | covered | `next_block_gas_limit_is_increased_based_on_full_gas_used` (mining/tests.rs) | |
+| GasLimitCalculatorTest.NextBlockGasLimitIsNotIncreasedMoreThanTargetGasLimit | covered | `next_block_gas_limit_is_not_increased_more_than_target_gas_limit` (mining/tests.rs) | |
+| GasLimitCalculatorTest.NextBlockGasLimitRemainsTheSame | covered | `next_block_gas_limit_remains_the_same` (mining/tests.rs); through the template on rskj's default target, `a_template_on_rskjs_defaults_keeps_a_parent_already_there` | |
+| GasLimitCalculatorTest.NextBlockGasLimitIsIncreasedByMaximumValue | covered | `next_block_gas_limit_is_increased_by_maximum_value` (mining/tests.rs); at any size, `the_gas_limit_steps_a_1024th_at_any_size` | |
+| GasLimitCalculatorTest.NextBlockGasLimitIsIncreasedToTarget | covered | `next_block_gas_limit_is_increased_to_target` (mining/tests.rs) | |
+| GasLimitCalculatorTest.NextBlockGasLimitIsDecreasedToTarget | covered | `next_block_gas_limit_is_decreased_to_target` (mining/tests.rs) | |
+| GasLimitCalculatorTest.NextBlockGasLimitIsDecreasedToMinimum | covered | `next_block_gas_limit_is_decreased_to_minimum` (mining/tests.rs); through the template, `a_gas_limit_target_under_the_minimum_is_the_minimum` | |
+| GasLimitCalculatorTest.NextBlockGasLimitIsDecreasedByMaximumValue | covered | `next_block_gas_limit_is_decreased_by_maximum_value` (mining/tests.rs). The test's `validByConsensus` reads ethereumj's `ParentGasLimitRule`, a 1024th of the parent's either way; the rule a block is held to, rskj's `BlockParentGasLimitRule`, is a gas wider below where the 1024th leaves a remainder. The port checks the miner's gas limit against both | |
 | MainNetMinerTest.submitBitcoinBlockProofOfWorkNotGoodEnough | covered | `a_solution_that_misses_the_target_is_refused`, `with_pow_validation_an_unsolved_block_is_refused` (tests.rs): `SelfCheck` error, nothing imported | |
 | MainNetMinerTest.submitBitcoinBlockInvalidBlockDoesntEliminateCache | covered | `a_refused_solution_leaves_its_work_answerable` (tests.rs): the refusal, and the solution after it, which rskj's test leaves commented out (its difficulty is too high to solve) | |
 | MinerClockTest.timestampForChildIsParentTimestampIfRegtest | not applicable | rskj regtest "fixed clock" (child = parent + adjustment, no wall clock); rustock has no fixed-clock mode: `timestamp_for_child` (template.rs:702-709) always uses wall clock (+ `evm_increaseTime` offset) with `max(parent+1)`. Non-consensus, dev-only semantics. | |

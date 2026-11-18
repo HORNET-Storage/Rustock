@@ -35,6 +35,8 @@ enabled = false                    # serve the mnr_* namespace
 # coinbase = "0x…"                 # REQUIRED when enabled
 extra_data = ""                    # at most 32 bytes
 refresh_secs = 60
+# gas_limit_target = 6800000      # rskj targetgaslimit; 7,500,000 on a regtest
+force_gas_limit = true             # rskj forcegaslimit
 ```
 
 `--mining-extra-data` is capped at 32 bytes by the header rules, and the node
@@ -240,15 +242,19 @@ executed by exactly the code that will later re-execute it on the way in.
 - **`difficulty`** — `DifficultyRule::difficulty_for_child(parent, number,
   timestamp, uncle_count)`, shared with validation deliberately: two copies of a
   consensus calculation will drift.
-- **`gas_limit`** — one step toward an optional target, bounded by
-  `parent / 1024`; `None` inherits the parent's, which is always valid. rskj
-  `GasLimitCalculator`.
+- **`gas_limit`** — rskj `GasLimitCalculator`: one step toward the target,
+  bounded by `parent / 1024`. The target is rskj's `targetgaslimit`,
+  6,800,000 unless set and 7,500,000 on a regtest, as rskj's `regtest.conf`
+  sets it (`--mining-gas-limit-target`); a target under the chain's minimum
+  gas limit is the minimum. With rskj's `forcegaslimit` off
+  (`--mining-force-gas-limit false`) the step follows the gas the parent used
+  instead: up when it used more than two thirds of its gas limit, down
+  otherwise, never past the target.
 - **`minimum_gas_price`** — one step toward an optional target, bounded by 1% of
   the parent's, or one wei when 1% rounds to nothing. rskj
-  `MinimumGasPriceCalculator` (RSKIP-09).
-
-Neither target is exposed on the command line, so a running node inherits both
-from the parent and they never drift.
+  `MinimumGasPriceCalculator` (RSKIP-09). The target is
+  `--mining-min-gas-price`, rskj's `miner.minGasPrice`; without one a block
+  keeps its parent's.
 
 ### The REMASC transaction
 

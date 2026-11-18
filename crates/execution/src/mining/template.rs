@@ -29,9 +29,13 @@ pub struct MiningConfig {
     pub coinbase_address: Address,
     /// `extra_data`, capped at 32 bytes by the header rules.
     pub extra_data: Bytes,
-    /// Gas limit to steer towards, one step per block. `None` inherits the
-    /// parent's, which is always valid and never drifts.
-    pub gas_limit_target: Option<U256>,
+    /// rskj `targetgaslimit`: the gas limit to steer towards, one step per
+    /// block. A target under the chain's minimum gas limit is the minimum.
+    pub gas_limit_target: u64,
+    /// rskj `forcegaslimit`: steer towards the target whatever the parent
+    /// used. Off, a block's gas limit follows the gas its parent used, up to
+    /// the target (`GasLimitCalculator`).
+    pub force_gas_limit: bool,
     /// Minimum gas price to steer towards, one step per block. `None`
     /// inherits the parent's.
     pub min_gas_price_target: Option<U256>,
@@ -39,12 +43,20 @@ pub struct MiningConfig {
     pub work_cache_size: usize,
 }
 
+/// rskj's `targetgaslimit` where its configuration sets none
+/// (`RskSystemProperties.getTargetGasLimit`).
+pub const GAS_LIMIT_TARGET: u64 = 6_800_000;
+
+/// rskj's `targetgaslimit` on its regtest, which `regtest.conf` sets.
+pub const REGTEST_GAS_LIMIT_TARGET: u64 = 7_500_000;
+
 impl Default for MiningConfig {
     fn default() -> Self {
         Self {
             coinbase_address: Address::ZERO,
             extra_data: Bytes::new(),
-            gas_limit_target: None,
+            gas_limit_target: GAS_LIMIT_TARGET,
+            force_gas_limit: true,
             min_gas_price_target: None,
             // rskj MinerServerImpl.CACHE_SIZE.
             work_cache_size: 20,
@@ -216,15 +228,13 @@ impl BlockTemplateBuilder {
         let timestamp = timestamp_for_child(parent.timestamp);
         let difficulty = DifficultyRule { config: self.chain_config.clone() }
             .difficulty_for_child(parent, number, timestamp, ommers.len() as u64);
-        // rskj `GasLimitCalculator`: a target under the chain's minimum gas
-        // limit is the minimum, which a block may not go below.
-        let gas_limit_target = self
-            .mining_config
-            .gas_limit_target
-            .map(|target| target.max(U256::from(self.chain_config.min_gas_limit)));
+        // rskj `BlockToMineBuilder`, through `GasLimitCalculator`, with the
+        // chain's minimum gas limit and the miner's `GasLimitConfig`.
         let gas_limit = next_gas_limit(
             parent,
-            gas_limit_target,
+            self.chain_config.min_gas_limit,
+            self.mining_config.gas_limit_target,
+            self.mining_config.force_gas_limit,
             self.chain_config.gas_limit_bound_divisor,
         );
         let minimum_gas_price = next_minimum_gas_price(
@@ -863,25 +873,49 @@ fn timestamp_for_child(parent_timestamp: u64) -> u64 {
     now.max(parent_timestamp + 1)
 }
 
-/// One step towards `target`, bounded by what the parent allows: a
-/// `divisor`th of its gas limit, which this reads whole, as the parent rule
-/// does, and of any size.
+/// rskj `GasLimitCalculator.calculateBlockGasLimit`: the gas limit of a block
+/// on `parent`, which this reads whole, as the parent rule does, and of any
+/// size. A step is a `divisor`th of the parent's gas limit, the most the
+/// parent rule lets a block move it.
 ///
-/// The consensus rule is only that a child's gas limit stays within
-/// `parent / divisor` of the parent's, so inheriting it unchanged -- which is
-/// what `None` does -- is always valid. rskj `GasLimitCalculator`.
-pub(super) fn next_gas_limit(parent: &Header, target: Option<U256>, divisor: u64) -> BigUint {
+/// Forced, the gas limit steps towards `target` whatever the parent used. Not
+/// forced, it falls a step and rises by the parent's gas used times 3/2 over
+/// the divisor: up when the parent used more than two thirds of its gas
+/// limit, down otherwise; never under the minimum or over the target, and
+/// kept at the parent's where that would take it more than a step away.
+pub(super) fn next_gas_limit(
+    parent: &Header,
+    min_gas_limit: u64,
+    target: u64,
+    force_target: bool,
+    divisor: u64,
+) -> BigUint {
     let parent_limit = parent.gas_limit_value();
-    let Some(target) = target else {
-        return parent_limit;
-    };
-    let target = BigUint::from_bytes_be(&target.to_be_bytes::<32>());
-    let delta = &parent_limit / divisor;
-    if target > parent_limit {
-        target.min(parent_limit + delta)
-    } else {
-        target.max(parent_limit - delta)
+    let delta_max = &parent_limit / divisor;
+    let min_gas_limit = BigUint::from(min_gas_limit);
+    // rskj takes a target under the minimum as the minimum.
+    let target = BigUint::from(target).max(min_gas_limit.clone());
+    let lowest = &parent_limit - &delta_max;
+    let highest = &parent_limit + &delta_max;
+    if force_target {
+        return if target < parent_limit {
+            target.max(lowest)
+        } else {
+            target.min(highest)
+        };
     }
+    let contribution = BigUint::from(parent.gas_used) * 3u8 / 2u8 / divisor;
+    let mut next = &lowest + contribution;
+    if next < min_gas_limit {
+        next = min_gas_limit;
+    }
+    if next > target {
+        next = target;
+    }
+    if next < lowest || next > highest {
+        next = parent_limit;
+    }
+    next
 }
 
 /// One step towards `target`, bounded by what the parent allows.

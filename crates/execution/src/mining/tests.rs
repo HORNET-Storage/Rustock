@@ -725,13 +725,16 @@ fn umm_root_appears_once_rskip_umm_is_active() {
     assert!(fx.build().unwrap().block.header.umm_root.is_none());
 }
 
-/// Inheriting the parent's gas limit and minimum gas price is always valid --
-/// both rules are bounds around the parent's value, and the parent's own value
-/// is in range. This is what the builder does when no target is configured.
+/// rskj's miner aims for a gas limit of 6,800,000 unless set, forced: on a
+/// parent already there, as on this chain, a template keeps it; and it keeps
+/// the parent's minimum gas price where its target is too. rskj
+/// `GasLimitCalculatorTest.NextBlockGasLimitRemainsTheSame`, through the
+/// template.
 #[test]
-fn a_template_inherits_gas_limit_and_minimum_gas_price() {
+fn a_template_on_rskjs_defaults_keeps_a_parent_already_there() {
     let fx = fixture(20);
     let header = fx.build().unwrap().block.header;
+    assert_eq!(fx.parent.gas_limit, U256::from(GAS_LIMIT_TARGET));
     assert_eq!(header.gas_limit, fx.parent.gas_limit);
     assert_eq!(header.minimum_gas_price, fx.parent.minimum_gas_price);
 }
@@ -1133,59 +1136,207 @@ fn cant_get_mgp_to_be_negative() {
     );
 }
 
-/// rskj `GasLimitCalculator`: one step towards the target, at most a 1024th
-/// of the parent's gas limit, read whole: past 256 bits, where the typed
-/// field holds `U256::MAX`, the step is as exact, and with no target the
-/// parent's value is kept.
+/// rskj `GasLimitCalculator`, forced: one step towards the target, at most a
+/// 1024th of the parent's gas limit, read whole: past 256 bits, where the
+/// typed field holds `U256::MAX`, the step is as exact.
 #[test]
 fn the_gas_limit_steps_a_1024th_at_any_size() {
     use super::template::next_gas_limit;
-    let step_by = |gas_limit: &BigUint, target: Option<U256>, divisor: u64| {
+    let step_by = |gas_limit: &BigUint, target: u64, divisor: u64| {
         let mut parent = header_at(1, B256::ZERO, B256::ZERO);
         parent.set_gas_limit(gas_limit);
-        next_gas_limit(&parent, target, divisor)
+        next_gas_limit(&parent, 0, target, true, divisor)
     };
-    let step = |gas_limit: &BigUint, target: Option<U256>| step_by(gas_limit, target, 1024);
+    let step = |gas_limit: &BigUint, target: u64| step_by(gas_limit, target, 1024);
     let start = BigUint::from(1_024_000u32);
-    assert_eq!(step(&start, Some(U256::MAX)), BigUint::from(1_025_000u32));
-    assert_eq!(step(&start, Some(U256::ZERO)), BigUint::from(1_023_000u32));
-    assert_eq!(
-        step(&start, Some(U256::from(1_024_500))),
-        BigUint::from(1_024_500u32)
-    );
-    assert_eq!(step(&start, None), start);
+    assert_eq!(step(&start, u64::MAX), BigUint::from(1_025_000u32));
+    assert_eq!(step(&start, 0), BigUint::from(1_023_000u32));
+    assert_eq!(step(&start, 1_024_500), BigUint::from(1_024_500u32));
+    assert_eq!(step(&start, 1_024_000), start);
     // The chain's own divisor: a 2048th steps half as far.
-    assert_eq!(
-        step_by(&start, Some(U256::MAX), 2048),
-        BigUint::from(1_024_500u32)
-    );
+    assert_eq!(step_by(&start, u64::MAX, 2048), BigUint::from(1_024_500u32));
 
     let two = BigUint::from(2u8);
     let past = two.pow(300);
-    assert_eq!(step(&past, Some(U256::MAX)), &past - two.pow(290));
-    assert_eq!(step(&past, None), past);
-    // A target no further than the top of 256 bits is as far as it goes.
-    let top = two.pow(256) - 1u8;
-    assert_eq!(step(&(&top - 1u8), Some(U256::MAX)), top);
+    assert_eq!(step(&past, u64::MAX), &past - two.pow(290));
 }
 
-/// rskj `GasLimitCalculatorTest.NextBlockGasLimitIsDecreasedToTarget`: a
-/// target less than a step below the parent's gas limit is reached in one
-/// block, whatever gas the parent used.
-#[test]
-fn a_target_within_a_step_below_is_reached_in_one_block() {
+// ── rskj GasLimitCalculatorTest ───────────────────────────────────────
+
+/// The minimum gas limit rskj's test reads, `Constants.regtest()`'s.
+const RSKJ_MIN_GAS_LIMIT: u64 = 3_000_000;
+/// The target it reads, `TestSystemProperties.getTargetGasLimit()`: rskj's
+/// regtest's, from `regtest.conf`.
+const RSKJ_TEST_TARGET: u64 = REGTEST_GAS_LIMIT_TARGET;
+
+/// `GasLimitCalculator.calculateBlockGasLimit(parentGasLimit, parentGasUsed,
+/// minGasLimit, targetGasLimit, forceTarget)`.
+fn calculate_block_gas_limit(
+    parent_gas_limit: u64,
+    parent_gas_used: u64,
+    min_gas_limit: u64,
+    target: u64,
+    force_target: bool,
+) -> u64 {
     use super::template::next_gas_limit;
-    let target = 3_000_001u32;
-    for gas_used in [u64::from(target) + 1, 0] {
+    let mut parent = header_at(1, B256::ZERO, B256::ZERO);
+    parent.set_gas_limit(&BigUint::from(parent_gas_limit));
+    parent.gas_used = parent_gas_used;
+    let next = next_gas_limit(&parent, min_gas_limit, target, force_target, 1024);
+    u64::try_from(next).unwrap()
+}
+
+/// `validByConsensus`, which reads ethereumj's `ParentGasLimitRule(1024)`: a
+/// gas limit within a 1024th of the parent's, either way. The rule a block is
+/// held to, rskj's `BlockParentGasLimitRule`, bounds it below by `parent *
+/// 1023 / 1024`, a gas lower where the 1024th leaves a remainder; whatever
+/// the first takes, the second must take too, and this checks that as well.
+fn valid_by_consensus(new_gas: u64, parent_gas: u64) -> bool {
+    use rustock_core::validation::{BlockParentGasLimitRule, ParentHeaderValidator};
+    let delta = parent_gas / 1024;
+    let within = parent_gas - delta <= new_gas && new_gas <= parent_gas + delta;
+    if within {
         let mut parent = header_at(1, B256::ZERO, B256::ZERO);
-        parent.set_gas_limit(&BigUint::from(target + 1));
-        parent.gas_used = gas_used;
-        assert_eq!(
-            next_gas_limit(&parent, Some(U256::from(target)), 1024),
-            BigUint::from(target),
-            "the parent used {gas_used}"
-        );
+        parent.set_gas_limit(&BigUint::from(parent_gas));
+        let mut header = header_at(2, parent.hash(), B256::ZERO);
+        header.set_gas_limit(&BigUint::from(new_gas));
+        let rule = BlockParentGasLimitRule { config: test_chain_config() };
+        assert_eq!(rule.validate_with_parent(&header, &parent), Ok(()), "{new_gas} on {parent_gas}");
     }
+    within
+}
+
+/// rskj `NextBlockGasLimitIsDecreasedByAFactor`: not forced, a parent that
+/// used nothing steps down a 1024th.
+#[test]
+fn next_block_gas_limit_is_decreased_by_a_factor() {
+    let parent = RSKJ_MIN_GAS_LIMIT + 21_000;
+    let new = calculate_block_gas_limit(parent, 0, RSKJ_MIN_GAS_LIMIT, RSKJ_TEST_TARGET, false);
+    assert!(new < parent);
+    assert_eq!(new, parent - parent / 1024);
+}
+
+/// rskj `NextBlockGasLimitIsNotDecreasedLowerThanMinGasLimit`.
+#[test]
+fn next_block_gas_limit_is_not_decreased_lower_than_min_gas_limit() {
+    let min = RSKJ_MIN_GAS_LIMIT;
+    assert_eq!(calculate_block_gas_limit(min, 0, min, RSKJ_TEST_TARGET, false), min);
+}
+
+/// rskj `NextBlockGasLimitIsIncreasedBasedOnGasUsed`: 3,500,000 less a
+/// 1024th, plus 3,000,000 times 3/2 over 1024.
+#[test]
+fn next_block_gas_limit_is_increased_based_on_gas_used() {
+    let new = calculate_block_gas_limit(3_500_000, 3_000_000, 0, RSKJ_TEST_TARGET, false);
+    assert_eq!(new, 3_500_977);
+}
+
+/// rskj `NextBlockGasLimitIsIncreasedBasedOnFullGasUsed`.
+#[test]
+fn next_block_gas_limit_is_increased_based_on_full_gas_used() {
+    let new = calculate_block_gas_limit(3_500_000, 3_500_000, 0, RSKJ_TEST_TARGET, false);
+    assert_eq!(new, 3_501_709);
+}
+
+/// rskj `NextBlockGasLimitIsNotIncreasedMoreThanTargetGasLimit`.
+#[test]
+fn next_block_gas_limit_is_not_increased_more_than_target_gas_limit() {
+    let target = RSKJ_TEST_TARGET;
+    assert_eq!(calculate_block_gas_limit(target, target, 0, target, false), target);
+}
+
+/// rskj `NextBlockGasLimitRemainsTheSame`.
+#[test]
+fn next_block_gas_limit_remains_the_same() {
+    let target = RSKJ_TEST_TARGET;
+    let new = calculate_block_gas_limit(target, 0, target, target, true);
+    assert_eq!(new, target);
+    assert!(valid_by_consensus(new, target));
+}
+
+/// rskj `NextBlockGasLimitIsIncreasedByMaximumValue`.
+#[test]
+fn next_block_gas_limit_is_increased_by_maximum_value() {
+    let min = RSKJ_MIN_GAS_LIMIT;
+    let new = calculate_block_gas_limit(min, 0, min, RSKJ_TEST_TARGET, true);
+    let new2 = calculate_block_gas_limit(min, min, min, RSKJ_TEST_TARGET, true);
+    assert_eq!(new, new2);
+    assert_eq!(new, min + min / 1024);
+    assert!(valid_by_consensus(new, min));
+    assert!(valid_by_consensus(new2, min));
+    assert!(!valid_by_consensus(new + 1, min));
+}
+
+/// rskj `NextBlockGasLimitIsIncreasedToTarget`.
+#[test]
+fn next_block_gas_limit_is_increased_to_target() {
+    let min = RSKJ_MIN_GAS_LIMIT;
+    let target = min + 1;
+    let new = calculate_block_gas_limit(min, 0, min, target, true);
+    let new2 = calculate_block_gas_limit(min, min, min, target, true);
+    assert_eq!(new, target);
+    assert_eq!(new, new2);
+    assert!(valid_by_consensus(new, min));
+    assert!(valid_by_consensus(new2, min));
+}
+
+/// rskj `NextBlockGasLimitIsDecreasedToTarget`: a target less than a step
+/// below the parent's gas limit is reached in one block, whatever gas the
+/// parent used.
+#[test]
+fn next_block_gas_limit_is_decreased_to_target() {
+    let min = RSKJ_MIN_GAS_LIMIT;
+    let target = min + 1;
+    let used = target + 1;
+    let new = calculate_block_gas_limit(used, used, min, target, true);
+    let new2 = calculate_block_gas_limit(used, 0, min, target, true);
+    assert_eq!(new, target);
+    assert_eq!(new, new2);
+    assert!(valid_by_consensus(new, used));
+    assert!(valid_by_consensus(new2, used));
+}
+
+/// rskj `NextBlockGasLimitIsDecreasedToMinimum`: a target under the minimum
+/// is the minimum.
+#[test]
+fn next_block_gas_limit_is_decreased_to_minimum() {
+    let min = RSKJ_MIN_GAS_LIMIT;
+    let target = min - 1;
+    let used = min + 1;
+    let new = calculate_block_gas_limit(used, used, min, target, true);
+    let new2 = calculate_block_gas_limit(used, 0, min, target, true);
+    assert_eq!(new, min);
+    assert_eq!(new, new2);
+    assert!(valid_by_consensus(new, used));
+    assert!(valid_by_consensus(new2, used));
+}
+
+/// rskj `NextBlockGasLimitIsDecreasedByMaximumValue`.
+#[test]
+fn next_block_gas_limit_is_decreased_by_maximum_value() {
+    let min = RSKJ_MIN_GAS_LIMIT;
+    let target = RSKJ_TEST_TARGET;
+    let used = target * 2;
+    let new = calculate_block_gas_limit(used, 0, min, target, true);
+    let new2 = calculate_block_gas_limit(used, used, min, target, true);
+    assert_eq!(new, new2);
+    assert_eq!(new, used - used / 1024);
+    assert!(valid_by_consensus(new, used));
+    assert!(valid_by_consensus(new2, used));
+    assert!(!valid_by_consensus(new - 1, used));
+}
+
+/// Not forced, on a parent past 256 bits: the target, a u64, is under any
+/// gas limit there, and rskj keeps the parent's rather than drop more than
+/// a step.
+#[test]
+fn not_forced_a_gas_limit_past_256_bits_is_kept() {
+    use super::template::next_gas_limit;
+    let past = BigUint::from(2u8).pow(300);
+    let mut parent = header_at(1, B256::ZERO, B256::ZERO);
+    parent.set_gas_limit(&past);
+    parent.gas_used = u64::MAX;
+    assert_eq!(next_gas_limit(&parent, 0, u64::MAX, false, 1024), past);
 }
 
 /// rskj `GasLimitCalculator` takes a target under the chain's minimum gas
@@ -1208,7 +1359,7 @@ fn a_gas_limit_target_under_the_minimum_is_the_minimum() {
         chain_config,
         hardfork_cfg,
         MiningConfig {
-            gas_limit_target: Some(U256::from(1)),
+            gas_limit_target: 1,
             ..Default::default()
         },
     );
@@ -1219,19 +1370,20 @@ fn a_gas_limit_target_under_the_minimum_is_the_minimum() {
     assert_eq!(template.block.header.gas_limit, U256::from(6_799_000));
 }
 
-/// On a parent whose gas limit is past 256 bits, a template keeps the
-/// parent's value, as rskj's miner writes it, which the parent rule takes.
-/// The `U256::MAX` the typed field holds is no gas limit the chain allows
-/// there.
+/// On a parent whose gas limit is past 256 bits, a template steps a 1024th
+/// down from the parent's value towards rskj's target, as rskj's miner
+/// writes it, which the parent rule takes. The `U256::MAX` the typed field
+/// holds is no gas limit the chain allows there.
 #[test]
-fn a_template_on_a_gas_limit_past_256_bits_keeps_its_value() {
+fn a_template_on_a_gas_limit_past_256_bits_steps_from_its_value() {
     use rustock_core::validation::{BlockParentGasLimitRule, ParentHeaderValidator};
     let mut fx = fixture(20);
-    let value = BigUint::from(2u8).pow(300);
+    let two = BigUint::from(2u8);
+    let value = two.pow(300);
     fx.parent.set_gas_limit(&value);
     fx.store.put_header(&fx.parent).unwrap();
     let header = fx.build_on(&fx.parent).unwrap().block.header;
-    assert_eq!(header.gas_limit_value(), value);
+    assert_eq!(header.gas_limit_value(), &value - two.pow(290));
     assert_eq!(header.gas_limit, U256::MAX);
     let rule = BlockParentGasLimitRule {
         config: fx.chain_config.clone(),

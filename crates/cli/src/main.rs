@@ -1056,6 +1056,21 @@ struct Args {
     #[arg(long, value_name = "WEI")]
     mining_min_gas_price: Option<u64>,
 
+    /// Gas limit to steer mined blocks toward, as rskj's `targetgaslimit`:
+    /// one step, a 1024th of the parent's, per block. Absent, rskj's:
+    /// 7,500,000 on a regtest, as its `regtest.conf` sets it, and 6,800,000
+    /// on mainnet and testnet. A target under the chain's minimum gas limit
+    /// is the minimum.
+    #[arg(long, value_name = "GAS")]
+    mining_gas_limit_target: Option<u64>,
+
+    /// Steer the gas limit toward the target whatever the parent block used,
+    /// as rskj's `forcegaslimit`, on by default. `false` follows the gas the
+    /// parent used instead: up when it used more than two thirds of its gas
+    /// limit, down otherwise, never past the target.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    mining_force_gas_limit: bool,
+
     /// Refuse a merged-mining submission within this many milliseconds of
     /// the previous one, as rskj's `miner.server.workSubmissionRateLimitInMills`.
     /// Zero, the default, disables it.
@@ -1683,6 +1698,10 @@ fn apply_file_config(
     apply(matches, "mining_refresh_secs", f.mining.refresh_secs.as_ref(),
         &mut a.mining_refresh_secs);
     apply_opt(matches, "mining_min_gas_price", f.mining.min_gas_price.as_ref(), &mut a.mining_min_gas_price);
+    apply_opt(matches, "mining_gas_limit_target", f.mining.gas_limit_target.as_ref(),
+        &mut a.mining_gas_limit_target);
+    apply(matches, "mining_force_gas_limit", f.mining.force_gas_limit.as_ref(),
+        &mut a.mining_force_gas_limit);
     apply(matches, "mining_submission_rate_limit_ms", f.mining.submission_rate_limit_ms.as_ref(),
         &mut a.mining_submission_rate_limit_ms);
     apply(matches, "mining_update_work_on_new_transaction",
@@ -3578,6 +3597,10 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
         let mining_config = rustock_execution::MiningConfig {
             coinbase_address,
             extra_data,
+            // rskj `targetgaslimit` and `forcegaslimit`, through
+            // `GasLimitCalculator`.
+            gas_limit_target: mining_gas_limit_target(config.chain_id, args.mining_gas_limit_target),
+            force_gas_limit: args.mining_force_gas_limit,
             // rskj `miner.minGasPrice`, through `MinimumGasPriceCalculator`.
             min_gas_price_target: args.mining_min_gas_price.map(alloy_primitives::U256::from),
             ..Default::default()
@@ -4117,6 +4140,17 @@ fn run_export_blocks(
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// The gas limit a miner steers toward: `--mining-gas-limit-target`, or
+/// rskj's `targetgaslimit` where none is set, 6,800,000, and on a regtest
+/// 7,500,000, which rskj's `regtest.conf` sets.
+fn mining_gas_limit_target(chain_id: u8, set: Option<u64>) -> u64 {
+    set.unwrap_or(if matches!(chain_id, 30 | 31) {
+        rustock_execution::mining::GAS_LIMIT_TARGET
+    } else {
+        rustock_execution::mining::REGTEST_GAS_LIMIT_TARGET
+    })
 }
 
 /// Apply the regtest chain options (`--genesis`, `--skip-pow-validation`,
@@ -5720,6 +5754,23 @@ mod genesis_tests {
         let mut argv = vec!["rustock-cli", "--network-id", "33"];
         argv.extend_from_slice(extra);
         Args::parse_from(argv)
+    }
+
+    /// rskj's miner aims for its `targetgaslimit`: 6,800,000 where its
+    /// configuration sets none, as on mainnet and testnet, and 7,500,000 on
+    /// its regtest, whose `regtest.conf` sets it. A target set is the target,
+    /// and the force switch is on unless set off, as rskj's `forcegaslimit`.
+    #[test]
+    fn a_miner_aims_for_rskjs_gas_limit_target() {
+        assert_eq!(mining_gas_limit_target(30, None), 6_800_000);
+        assert_eq!(mining_gas_limit_target(31, None), 6_800_000);
+        assert_eq!(mining_gas_limit_target(33, None), 7_500_000);
+        assert_eq!(mining_gas_limit_target(33, Some(9_000_000)), 9_000_000);
+
+        assert!(regtest_args(&[]).mining_force_gas_limit);
+        let off = regtest_args(&["--mining-force-gas-limit", "false", "--mining-gas-limit-target", "8000000"]);
+        assert!(!off.mining_force_gas_limit);
+        assert_eq!(off.mining_gas_limit_target, Some(8_000_000));
     }
 
     /// The lab's rskj regtest genesis (`tests/fixtures/rskj-regtest-genesis.json`,
