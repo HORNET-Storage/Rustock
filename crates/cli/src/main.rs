@@ -2452,7 +2452,8 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
     // against a blank trie -- no error, no missing file, just a node that cannot
     // execute anything and looks like it needs a resync. That is worth stopping
     // for; the operator can always choose a backend, but they cannot recover
-    // state that was quietly declared absent.
+    // state that was quietly declared absent. A new database, whose trie is
+    // empty until block 0's state is built below, starts (`trie_is_missing`).
     {
         let has_chain = store.exec_head()?.is_some() || store.head()?.is_some();
         let detached_dir_populated = std::path::Path::new(&trie_dir)
@@ -2460,7 +2461,7 @@ async fn run(local_offset: Option<time::UtcOffset>) -> Result<()> {
             .map(|mut d| d.next().is_some())
             .unwrap_or(false);
 
-        if !backend.is_detached() && has_chain && store.trie_cf_is_empty() {
+        if trie_is_missing(&store, &backend)? {
             anyhow::bail!(
                 "This database has no trie in it, but --trie-backend is \"{}\".\n\
                  \n\
@@ -4539,6 +4540,20 @@ fn rewrite_old_genesis(
     }
 }
 
+/// Whether the node would start against a trie that isn't there: blocks ran
+/// here, so the trie holds the state they left, and the trie it would read,
+/// the main database's own, is empty (see `examples/detach_trie.rs`). A new
+/// database holds block 0's header (`setup_genesis`) and no trie until block
+/// 0's state is built (`load_or_build_state`), and a node that has run no
+/// block builds that state again whatever its trie holds, so neither is
+/// refused.
+fn trie_is_missing(
+    store: &BlockStore,
+    backend: &rustock_storage::epoch_store::TrieBackend,
+) -> Result<bool> {
+    Ok(!backend.is_detached() && store.exec_head()?.is_some() && store.trie_cf_is_empty())
+}
+
 /// A block processor that holds a block to what every node holds it to: the
 /// chain's own constants, for the header rules an uncle meets, and fork
 /// detection on, as rskj runs `ForkDetectionDataRule` on every block it
@@ -6217,6 +6232,38 @@ mod genesis_tests {
         let config = Arc::new(ChainConfig::regtest());
         let (ladder, _) = hardfork_config(&config).unwrap();
         assert!(rule_keeping_processor(&ladder, &store, &config).validates_fork_detection());
+    }
+
+    /// A new database holds block 0's header and no trie until block 0's
+    /// state is built, after the check: it starts on the default backend, on
+    /// every network. One whose blocks ran and whose own trie is empty is
+    /// refused, as upstream's check refuses it, and one whose trie is there
+    /// isn't.
+    #[test]
+    fn a_new_database_starts_and_one_whose_trie_is_gone_does_not() {
+        use rustock_storage::epoch_store::TrieBackend;
+        for config in [
+            ChainConfig::mainnet(),
+            ChainConfig::testnet(),
+            ChainConfig::regtest(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = BlockStore::open(dir.path())
+                .unwrap()
+                .with_activations(config.activation_heights.clone());
+            let hash = setup_genesis(&store, &config).unwrap();
+            assert!(store.trie_cf_is_empty());
+            assert!(!trie_is_missing(&store, &TrieBackend::Single).unwrap());
+
+            store
+                .set_exec_head(hash, alloy_primitives::B256::repeat_byte(1))
+                .unwrap();
+            assert!(trie_is_missing(&store, &TrieBackend::Single).unwrap());
+            assert!(!trie_is_missing(&store, &TrieBackend::External).unwrap());
+
+            rustock_storage::RocksDbTrieStore::from_db(store.db().clone()).put(b"node", b"bytes");
+            assert!(!trie_is_missing(&store, &TrieBackend::Single).unwrap());
+        }
     }
 }
 
