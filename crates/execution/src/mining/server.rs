@@ -62,8 +62,12 @@ pub enum ImportResult {
     ImportedBest,
     ImportedNotBest,
     Exist,
-    /// rskj `BlockChainImpl.internalTryToConnect`: a block that passes its
-    /// proof of work and that a rule then refuses. Nothing is stored.
+    /// rskj `BlockChainImpl.internalTryToConnect`: the store holds no parent
+    /// for the block. Nothing is stored.
+    NoParent,
+    /// rskj `BlockChainImpl.tryToConnect`: a block that passes its proof of
+    /// work and that a rule then refuses, or whose connecting fails in any
+    /// other way, a failing store included. Nothing is stored.
     InvalidBlock,
 }
 
@@ -73,6 +77,7 @@ impl ImportResult {
             ImportResult::ImportedBest => "IMPORTED_BEST",
             ImportResult::ImportedNotBest => "IMPORTED_NOT_BEST",
             ImportResult::Exist => "EXIST",
+            ImportResult::NoParent => "NO_PARENT",
             ImportResult::InvalidBlock => "INVALID_BLOCK",
         }
     }
@@ -113,13 +118,13 @@ pub enum SubmitError {
 }
 
 /// How a submission answers a solved block whose proof of work holds and
-/// that a rule then refuses.
+/// that a rule then refuses, or that the node fails to connect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refused {
     /// As rskj answers a miner: OK, with `INVALID_BLOCK`
-    /// (`MinerServerImpl.processSolution`).
+    /// (`MinerServerImpl.processSolution`, `BlockChainImpl.tryToConnect`).
     Answered,
-    /// As the node's own miner reads it: the rule's error.
+    /// As the node's own miner reads it: the error.
     Failed,
 }
 
@@ -939,16 +944,60 @@ impl MinerServer {
         block.header.bitcoin_merged_mining_merkle_proof = Some(Bytes::from(merkle_proof));
         debug_assert_eq!(hash_before, block.header.hash_for_merged_mining());
 
+        // rskj `processSolution` holds the solution to the proof of work before
+        // it connects anything (`isValid`, `ProofOfWorkRule`), and answers
+        // ERROR when it fails: the same rule every peer will run, so failing it
+        // means the node built something it would itself reject.
+        MergedMiningRule { config: self.chain_config.clone() }
+            .validate(&block.header)
+            .map_err(SubmitError::SelfCheck)?;
+
+        // Then `ethereum.addNewMinedBlock`, whose `blockchain.tryToConnect`
+        // the miner is answered OK with: what it made of the block. A block a
+        // rule refuses is `INVALID_BLOCK` there, and is not stored; so is one
+        // whose connecting fails in any other way, the node's own store
+        // included, as `BlockChainImpl.tryToConnect` catches every `Throwable`
+        // and answers `INVALID_BLOCK`. The node's own miner reads the error.
+        let completed_hash = block.hash();
+        let number = block.header.number;
+        match self.connect_mined(&block, &template, &mut laps, &mut t) {
+            Err(error) if refused == Refused::Answered => {
+                warn!(target: "rustock::mining", "Mined block #{number} {completed_hash} is invalid: {error}");
+                Ok(SubmittedBlockInfo {
+                    block_imported_result: ImportResult::InvalidBlock,
+                    block_hash: completed_hash,
+                    block_included_height: number,
+                })
+            }
+            connected => connected,
+        }
+    }
+
+    /// rskj `BlockChainImpl.internalTryToConnect` for a solved block of this
+    /// node's work, in its order: a block already stored, the parent, the
+    /// rules, the run, the store. A rule that refuses the block and a store
+    /// that fails to read or write are both errors here; the caller answers
+    /// what rskj answers for them.
+    fn connect_mined(
+        &self,
+        block: &Block,
+        template: &BlockTemplate,
+        laps: &mut Laps,
+        t: &mut ConnectTimings,
+    ) -> Result<SubmittedBlockInfo, SubmitError> {
+        let completed_hash = block.hash();
+        let number = block.header.number;
+        let answer = |result| SubmittedBlockInfo {
+            block_imported_result: result,
+            block_hash: completed_hash,
+            block_included_height: number,
+        };
+
         // The same solution submitted twice: rskj's `addNewMinedBlock`
         // answers `EXIST` and the submission is `OK`. Checked before the
         // parent, which the first submission moved.
-        let completed_hash = block.hash();
         if self.chain.has_block(completed_hash).map_err(SubmitError::Storage)? {
-            return Ok(SubmittedBlockInfo {
-                block_imported_result: ImportResult::Exist,
-                block_hash: completed_hash,
-                block_included_height: block.header.number,
-            });
+            return Ok(answer(ImportResult::Exist));
         }
 
         // The work's parent may no longer be the executed head: the chain moved
@@ -960,65 +1009,29 @@ impl MinerServer {
         let beside = head != Some(template.parent_hash());
         t.preamble = laps.lap();
 
-        // rskj connects a solution whose proof of work holds through
-        // `blockchain.tryToConnect` and answers OK with what that made of the
-        // block (`MinerServerImpl.processSolution`): one a rule refuses is
-        // `INVALID_BLOCK` (`BlockChainImpl.internalTryToConnect`), and is not
-        // stored. The node's own miner reads the rule's error instead.
-        let number = block.header.number;
-        let refuse = move |error: SubmitError| {
-            if refused == Refused::Failed {
-                return Err(error);
-            }
-            warn!(target: "rustock::mining", "Mined block #{number} {completed_hash} is invalid: {error}");
-            Ok(SubmittedBlockInfo {
-                block_imported_result: ImportResult::InvalidBlock,
-                block_hash: completed_hash,
-                block_included_height: number,
-            })
-        };
-
-        // The same rule every peer will run. Failing here means the node built
-        // something it would itself reject, which is worth catching before it
-        // is stored and announced rather than after. rskj answers ERROR here
-        // (`processSolution`'s `ProofOfWorkRule`).
-        MergedMiningRule { config: self.chain_config.clone() }
-            .validate(&block.header)
-            .map_err(SubmitError::SelfCheck)?;
-        // RSKIP179: a solution found in a Bitcoin block timestamped five
-        // minutes or more from the template is one every peer rejects.
-        if let Err(e) = (rustock_core::validation::BitcoinTimestampRule {
-            config: self.chain_config.clone(),
-        })
-        .validate(&block.header)
-        {
-            return refuse(SubmitError::SelfCheck(e));
-        }
-        // rskj connects a mined block through `blockchain.tryToConnect`, which
-        // holds it to every rule a peer's block is held to before running it
-        // (`BlockValidatorImpl`): the header's own and against its parent, the
-        // body's, the uncles' and fork detection. A block that fails one is
-        // `INVALID_BLOCK` there, and is not stored here either, to be made a
-        // best block that every other node refuses.
-        let parent = self
+        // A parent the store doesn't hold is `NO_PARENT`, before any rule.
+        let Some(parent) = self
             .chain
             .header(template.parent_hash())
             .map_err(SubmitError::Storage)?
-            .ok_or_else(|| {
-                SubmitError::Storage(format!(
-                    "the parent {} of this work is not stored",
-                    template.parent_hash()
-                ))
-            })?;
-        if let Err(e) =
-            rustock_core::validation::HeaderVerifier::default_rsk(self.chain_config.clone())
-                .verify(&block.header, Some(&parent))
-        {
-            return refuse(SubmitError::SelfCheck(e));
-        }
-        if let Err(e) = self.builder.processor().validate_block(&block) {
-            return refuse(SubmitError::SelfCheck(e));
-        }
+        else {
+            return Ok(answer(ImportResult::NoParent));
+        };
+        // rskj then holds a mined block to every rule a peer's block is held
+        // to before running it (`BlockValidatorImpl`): the header's own and
+        // against its parent, the body's, the uncles' and fork detection.
+        // RSKIP179 among them: a solution found in a Bitcoin block timestamped
+        // five minutes or more from the template is one every peer rejects.
+        (rustock_core::validation::BitcoinTimestampRule { config: self.chain_config.clone() })
+            .validate(&block.header)
+            .map_err(SubmitError::SelfCheck)?;
+        rustock_core::validation::HeaderVerifier::default_rsk(self.chain_config.clone())
+            .verify(&block.header, Some(&parent))
+            .map_err(SubmitError::SelfCheck)?;
+        self.builder
+            .processor()
+            .validate_block(block)
+            .map_err(SubmitError::SelfCheck)?;
         t.initial_validation = laps.lap();
 
         let state_root = self
@@ -1035,23 +1048,13 @@ impl MinerServer {
         let trie_store = self.builder.trie_store();
         let mut process = crate::ProcessTimings::default();
         let executed = if beside {
-            processor.process_beside(&block, &state_root, trie_store)
+            processor.process_beside(block, &state_root, trie_store)
         } else if laps.enabled() {
-            processor.process_block_timed(&block, &state_root, trie_store, &mut process)
+            processor.process_block_timed(block, &state_root, trie_store, &mut process)
         } else {
-            processor.process_block(&block, &state_root, trie_store)
-        };
-        let executed = match executed {
-            Ok(executed) => executed,
-            // A store that fails to read is the node's fault, not the block's.
-            Err(
-                e @ (crate::processor::ProcessError::Storage(_)
-                | crate::processor::ProcessError::Execution(
-                    crate::executor::ExecutionError::Database(_),
-                )),
-            ) => return Err(SubmitError::Execution(e.to_string())),
-            Err(e) => return refuse(SubmitError::Execution(e.to_string())),
-        };
+            processor.process_block(block, &state_root, trie_store)
+        }
+        .map_err(|e| SubmitError::Execution(e.to_string()))?;
         laps.lap();
         t.initial_validation += process.pre_validation;
         t.execute = process.execute;
@@ -1060,25 +1063,21 @@ impl MinerServer {
         if beside {
             let outcome = self
                 .chain
-                .commit_mined_block_beside(&block, executed.unlogged_peg_events, &mut laps)
+                .commit_mined_block_beside(block, executed.unlogged_peg_events, laps)
                 .map_err(SubmitError::Storage)?;
             // The head hasn't moved by this. If the block takes it, the sync
             // service's switch moves it and tells the miner of its new best
             // block, which builds new work then.
-            return Ok(SubmittedBlockInfo {
-                block_imported_result: outcome.result,
-                block_hash: completed_hash,
-                block_included_height: number,
-            });
+            return Ok(answer(outcome.result));
         }
         processor
-            .commit_receipts(&block, &executed)
+            .commit_receipts(block, &executed)
             .map_err(|e| SubmitError::Execution(e.to_string()))?;
         t.save_receipts = laps.lap();
 
         let outcome = self
             .chain
-            .commit_mined_block(&block, executed.state_root_hash, &mut laps)
+            .commit_mined_block(block, executed.state_root_hash, laps)
             .map_err(SubmitError::Storage)?;
         t.switch_chain = outcome.switch_chain;
         t.on_best_block = outcome.on_best_block;
@@ -1087,7 +1086,7 @@ impl MinerServer {
         if let (Some(sink), ImportResult::ImportedBest) = (&self.breakdown, outcome.result) {
             sink(&t.breakdown_line(
                 block.header.number,
-                block.hash(),
+                completed_hash,
                 block.transactions.len(),
                 block.header.gas_used,
             ));
@@ -1098,11 +1097,7 @@ impl MinerServer {
             warn!(target: "rustock::mining", "Could not rebuild work after a submission: {e}");
         }
 
-        Ok(SubmittedBlockInfo {
-            block_imported_result: outcome.result,
-            block_hash: block.hash(),
-            block_included_height: block.header.number,
-        })
+        Ok(answer(outcome.result))
     }
 
     /// The cached template a solution answers. Templates are not removed:

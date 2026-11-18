@@ -3917,4 +3917,129 @@ mod own_block_rules {
         );
         assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
     }
+
+    /// What goes wrong in a store, for [`FaultyChain`].
+    #[derive(Clone, Copy)]
+    enum Fault {
+        /// Every read answers; writing a mined block fails.
+        Write,
+        /// The store holds no header for the work's parent.
+        NoParent,
+    }
+
+    /// The node's store, with a `Fault`.
+    struct FaultyChain {
+        inner: StoreChainAccess,
+        fault: Fault,
+    }
+
+    impl ChainAccess for FaultyChain {
+        fn mainchain(&self, limit: usize) -> Result<Vec<Header>, String> {
+            self.inner.mainchain(limit)
+        }
+        fn executed_head(&self) -> Result<Option<B256>, String> {
+            self.inner.executed_head()
+        }
+        fn has_block(&self, hash: B256) -> Result<bool, String> {
+            self.inner.has_block(hash)
+        }
+        fn header(&self, hash: B256) -> Result<Option<Header>, String> {
+            match self.fault {
+                Fault::NoParent => Ok(None),
+                Fault::Write => self.inner.header(hash),
+            }
+        }
+        fn select_uncles(&self, block_number: u64, parent_hash: B256) -> Result<Vec<Header>, String> {
+            self.inner.select_uncles(block_number, parent_hash)
+        }
+        fn commit_mined_block(
+            &self,
+            block: &rustock_core::Block,
+            state_root: B256,
+            laps: &mut crate::breakdown::Laps,
+        ) -> Result<CommitOutcome, String> {
+            match self.fault {
+                Fault::Write => Err("the disk is full".into()),
+                Fault::NoParent => self.inner.commit_mined_block(block, state_root, laps),
+            }
+        }
+        fn commit_mined_block_beside(
+            &self,
+            block: &rustock_core::Block,
+            unlogged: Vec<crate::silent::SilentRecord>,
+            laps: &mut crate::breakdown::Laps,
+        ) -> Result<CommitOutcome, String> {
+            match self.fault {
+                Fault::Write => Err("the disk is full".into()),
+                Fault::NoParent => self.inner.commit_mined_block_beside(block, unlogged, laps),
+            }
+        }
+    }
+
+    /// A miner on the fixture's chain whose store has `fault`.
+    fn faulty_miner(fx: &MiningFixture, fault: Fault) -> MinerServer {
+        let hardfork_cfg = RskHardforkConfig::all_active(33);
+        let builder = BlockTemplateBuilder::new(
+            Arc::new(
+                BlockProcessor::new(hardfork_cfg.clone(), fx.store.clone())
+                    .with_chain_config(fx.chain_config.clone()),
+            ),
+            fx.trie_store.clone(),
+            fx.chain_config.clone(),
+            hardfork_cfg,
+            MiningConfig {
+                coinbase_address: address!("00000000000000000000000000000000c0117b45"),
+                ..Default::default()
+            },
+        );
+        let inner = StoreChainAccess::new(fx.store.clone(), fx.trie_store.clone(), None);
+        MinerServer::new(
+            builder,
+            Arc::new(FaultyChain { inner, fault }),
+            Arc::new(NoPendingTransactions),
+            fx.chain_config.clone(),
+        )
+    }
+
+    /// rskj `BlockChainImpl.tryToConnect` answers `INVALID_BLOCK` for
+    /// whatever goes wrong as it connects a block, a store that fails
+    /// included, and the pool is answered OK with it
+    /// (`MinerServerImpl.processSolution`). The node's own miner reads the
+    /// store's error.
+    #[test]
+    fn a_mined_block_the_store_fails_to_take_is_answered_invalid() {
+        let fx = fixture(20);
+        let miner = faulty_miner(&fx, Fault::Write);
+        let work = miner.get_work().unwrap();
+        let raw = bitcoin::consensus::serialize(&solve(&work));
+
+        let info = miner.submit_bitcoin_block(&raw).unwrap();
+        assert_eq!(info.block_imported_result, ImportResult::InvalidBlock);
+        assert_eq!(info.block_included_height, fx.parent.number + 1);
+        assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+
+        let err = miner
+            .submit_bitcoin_block_as(&raw, crate::mining::server::Refused::Failed)
+            .unwrap_err();
+        assert!(
+            matches!(err, SubmitError::Storage(ref e) if e == "the disk is full"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// rskj `BlockChainImpl.internalTryToConnect` answers `NO_PARENT` for a
+    /// block whose parent its store doesn't hold, before any rule, and
+    /// stores nothing.
+    #[test]
+    fn a_mined_block_whose_parent_the_store_lacks_is_answered_no_parent() {
+        let fx = fixture(20);
+        let miner = faulty_miner(&fx, Fault::NoParent);
+        let work = miner.get_work().unwrap();
+        let raw = bitcoin::consensus::serialize(&solve(&work));
+
+        let info = miner.submit_bitcoin_block(&raw).unwrap();
+        assert_eq!(info.block_imported_result, ImportResult::NoParent);
+        assert_eq!(info.block_imported_result.as_str(), "NO_PARENT");
+        assert_eq!(fx.store.head().unwrap(), Some(fx.parent.hash()));
+    }
 }
