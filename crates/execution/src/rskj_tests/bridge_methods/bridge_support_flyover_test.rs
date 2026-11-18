@@ -1122,3 +1122,135 @@ fn from_rskip305_a_refund_over_the_cap_is_logged_and_its_values_stored() {
         assert_eq!(stored_outpoint_values(&mut flyover, &refund), Some(varint));
     }
 }
+
+/// rskj's `FederationFormatVersion.P2SH_ERP_FEDERATION`.
+const P2SH_ERP: u64 = 3000;
+/// rskj's `FederationFormatVersion.P2SH_P2WSH_ERP_FEDERATION`.
+const P2SH_P2WSH_ERP: u64 = 4000;
+
+/// The keys of the seeds `prefix` and 01 up to `count`, sorted, as rskj's
+/// `P2shErpFederationBuilder` and `P2shP2wshErpFederationBuilder` take them.
+fn seeded_keys(prefix: &str, count: usize) -> Vec<[u8; 33]> {
+    let mut keys: Vec<[u8; 33]> = (1..=count)
+        .map(|n| key_from_seed(&format!("{prefix}{n:02}")))
+        .collect();
+    keys.sort();
+    keys
+}
+
+impl Flyover {
+    /// `keys` as a federation of `format` made at block 1, in `slot`, as
+    /// rskj's federation builders make one.
+    fn store_as(&mut self, slot: Slot, keys: &[[u8; 33]], format: u64) {
+        let (key, format_key) = slot;
+        let members: Vec<StoredMember> = keys.iter().copied().map(StoredMember::from_btc).collect();
+        bridge_store_bytes_named(&mut self.bridge.ctx, format_key, &rlp_encode_u64(format));
+        let stored = serialize_federation_multikey(&members, 100_000_000_000, 1);
+        bridge_store_bytes_named(&mut self.bridge.ctx, key, &stored);
+    }
+
+    /// The Flyover redeem script of the federation of `keys` and `format`.
+    fn redeem_of(&self, keys: &[[u8; 33]], format: u64) -> Vec<u8> {
+        let federation = crate::bridge::peg::federation_redeem_for_format_pub(
+            keys,
+            format,
+            &self.bridge.constants,
+            &self.bridge.cfg,
+            self.bridge.number(),
+        );
+        [&[0x20][..], &self.derivation_hash(), &[0x75], &federation].concat()
+    }
+
+    /// The output script of that federation's Flyover address: the P2SH of
+    /// its Flyover redeem script, or of that script's P2WSH program where the
+    /// federation is P2SH-P2WSH.
+    fn pays_to(&self, keys: &[[u8; 33]], format: u64) -> Vec<u8> {
+        let redeem = self.redeem_of(keys, format);
+        p2sh_script(&crate::bridge::peg::federation_output_hash160(
+            &redeem, format,
+        ))
+    }
+}
+
+/// rskj's `FlyoverPeginThatSurpassesLockingCap` with both federations paid:
+/// on mainnet with every upgrade, at the block at which the new federation,
+/// made at block 1, is active and the old one retiring, a payment of a
+/// satoshi over the initial cap to each one's Flyover address, refunded to
+/// the LP. The refund, and the active and the retiring federation's Flyover
+/// redeem scripts.
+fn over_the_cap_to_both(
+    active: (&[[u8; 33]], u64),
+    retiring: (&[[u8; 33]], u64),
+) -> (bitcoin::Transaction, Vec<u8>, Vec<u8>) {
+    let block = 1 + Net::Mainnet.constants().federation_activation_age;
+    let mut flyover = Flyover::new(Net::Mainnet, Vetiver900, block);
+    flyover.store_as(NEW, active.0, active.1);
+    flyover.store_as(OLD, retiring.0, retiring.1);
+    let amount = flyover.bridge.constants.initial_locking_cap + 1;
+    let tx = btc_tx(
+        &[
+            (amount, flyover.pays_to(active.0, active.1)),
+            (amount, flyover.pays_to(retiring.0, retiring.1)),
+        ],
+        None,
+    );
+    let constants = &flyover.bridge.constants;
+    let height = constants.btc_height_when_pegout_tx_index_activates
+        + constants.pegout_tx_index_grace_period_in_btc_blocks;
+    flyover.chain(height, txid(&tx));
+    let raw = bitcoin::consensus::serialize(&tx);
+    let answer = flyover.register(&raw, i64::from(height), &one_leaf_tree(&txid(&tx)), true);
+    assert_eq!(int_of(&answer), REFUNDED_LP);
+    let mut refund = flyover.waiting_for_confirmations();
+    assert_eq!(refund.len(), 1);
+    (
+        refund.remove(0),
+        flyover.redeem_of(active.0, active.1),
+        flyover.redeem_of(retiring.0, retiring.1),
+    )
+}
+
+/// What the last element of `input`'s script pushes, where rskj's
+/// `assertScriptSigHasExpectedInputRedeemData` finds the redeem script.
+fn last_push_of_script_sig(input: &bitcoin::TxIn) -> Vec<u8> {
+    match input.script_sig.instructions().last() {
+        Some(Ok(bitcoin::script::Instruction::PushBytes(bytes))) => bytes.as_bytes().to_vec(),
+        other => panic!("the script ends with {other:?}"),
+    }
+}
+
+/// rskj's `registerFlyoverBtcTransaction_fundsThatSurpassLockingCapSentToP2shErpActiveAndP2shErpRetiringFeds_shouldSetRedeemDataInInputsScriptSig`:
+/// with both federations P2SH-ERP, the refund spends what each was paid, the
+/// active federation's first, each input's script ending with its own
+/// federation's Flyover redeem script.
+#[test]
+fn a_refund_from_two_p2sh_erp_federations_spends_each_with_its_own_flyover_script() {
+    let (refund, active, retiring) = over_the_cap_to_both(
+        (&seeded_keys("newMember", 9), P2SH_ERP),
+        (&seeded_keys("member", 9), P2SH_ERP),
+    );
+    assert_eq!(refund.input.len(), 2);
+    assert_eq!(last_push_of_script_sig(&refund.input[0]), active);
+    assert_eq!(last_push_of_script_sig(&refund.input[1]), retiring);
+}
+
+/// rskj's `registerFlyoverBtcTransaction_fundsThatSurpassLockingCapSentToP2shP2wshErpActiveAndP2shErpRetiringFeds_shouldSetFixedScriptSig_shouldSetRedeemDataInInputsWitness`:
+/// the refund is built in the active federation's format, so with a
+/// P2SH-P2WSH one both inputs, the retiring P2SH-ERP federation's too, carry
+/// their Flyover redeem script last in the witness and, as their script, a
+/// push of its P2WSH program alone.
+#[test]
+fn a_refund_built_for_a_p2sh_p2wsh_federation_carries_both_redeem_scripts_in_witnesses() {
+    use sha2::Digest;
+    let (refund, active, retiring) = over_the_cap_to_both(
+        (&seeded_keys("member", 20), P2SH_P2WSH_ERP),
+        (&seeded_keys("member", 9), P2SH_ERP),
+    );
+    assert_eq!(refund.input.len(), 2);
+    for (input, redeem) in refund.input.iter().zip([active, retiring]) {
+        assert_eq!(input.witness.last(), Some(&redeem[..]));
+        let program = [&[0x00, 0x20][..], &sha2::Sha256::digest(&redeem)].concat();
+        let script = [&[program.len() as u8][..], &program].concat();
+        assert_eq!(input.script_sig.as_bytes(), &script[..]);
+    }
+}

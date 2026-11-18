@@ -214,7 +214,7 @@ The other 21 match:
 
 Every RSKIP that rsk.zone lists as activated, 70 of them, was read side by side in rskj's release `VETIVER-9.0.4` and in rustock: the code of each in both clients, with rskj's own tests of it as the checklist. So was each statement rsk.zone makes about what a node does: merge mining, the PowPeg, REMASC, the EVM and its precompiles, the state tree, the chain IDs. Where rustock did otherwise than rskj it now does as rskj does, and each fix comes with a test that fails without it. 51 of the 70 matched rskj as they were; 19 had differences, all fixed. rskj then confirmed the fixes on its own regtest: for each fix a regtest can reach, a case builds blocks on rskj's release, the final build imports them with every state root checked against its header and agrees, and a build from before the fix parts from rskj where the fix says it would. The rest say why no regtest reaches them.
 
-rskj's tests of these rules, 1,239 of them, each have a verdict in `docs/rskj-tests/`: 924 ported, 206 held by a test rustock had, 94 that cannot arise in rustock, and 13 whose port found rustock doing otherwise, now fixed ([`docs/rskj-test-parity.md`](../rskj-test-parity.md) has the summary).
+rskj's tests of these rules, 1,239 of them, each have a verdict in `docs/rskj-tests/`: 925 ported, 206 held by a test rustock had, 94 that cannot arise in rustock, and 13 whose port found rustock doing otherwise, now fixed; one more is in rskj's `master` and not in the release ([`docs/rskj-test-parity.md`](../rskj-test-parity.md) has the summary).
 
 ### Before any upgrade (from block 0)
 

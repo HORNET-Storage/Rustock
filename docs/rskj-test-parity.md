@@ -44,11 +44,11 @@ Since this table, rustock was checked against the tests of rskj's release VETIVE
 |---|---:|---:|---:|---:|---:|---|
 | [The VM, the precompiled contracts and REMASC](rskj-tests/vm.md) | 218 | 170 | 44 | 4 | 0 |  |
 | [Headers, block rules, a block's run, the miner and the pool](rskj-tests/blocks.md) | 245 | 107 | 100 | 36 | 1 | 1 not in the release |
-| [The Bridge's methods, and Flyover's](rskj-tests/bridge-methods.md) | 294 | 253 | 24 | 12 | 4 | 1 not ported |
+| [The Bridge's methods, and Flyover's](rskj-tests/bridge-methods.md) | 294 | 254 | 24 | 12 | 4 |  |
 | [The federation, its scripts and the Bridge's utilities](rskj-tests/bridge-federation.md) | 151 | 113 | 16 | 18 | 4 |  |
 | [Peg-ins and the federations' stored state](rskj-tests/bridge-pegins.md) | 150 | 128 | 10 | 10 | 2 |  |
 | [The Bridge's storage, peg-outs, signatures and events](rskj-tests/bridge-pegouts.md) | 181 | 153 | 12 | 14 | 2 |  |
-| total | 1,239 | 924 | 206 | 94 | 13 | 2 |
+| total | 1,239 | 925 | 206 | 94 | 13 | 1 |
 
 ## co.rsk.validators
 
