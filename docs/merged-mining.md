@@ -342,21 +342,25 @@ surfaced (§10).
 
 ### The submit path
 
-All three RPC forms converge on `complete_and_import`:
+All three RPC forms converge on `complete_and_import`, which follows rskj's
+`MinerServerImpl.processSolution` and then `BlockChainImpl.tryToConnect`:
 
 1. **Match** — `extract_merged_mining_hash` finds the **last** `RSKBLOCK:` in the
    coinbase and reads the 32 bytes after it. rskj
    `MnrModuleImpl.extractBlockHashForMergedMining`.
-2. **See whether the parent still stands** — if the executed head has moved off
-   the template's parent, the block is connected beside the chain (step 6), as
-   rskj's `BlockChainImpl.internalTryToConnect` connects any block.
-3. **Compress the coinbase** — `compress_coinbase`, the same function the
+2. **Compress the coinbase** — `compress_coinbase`, the same function the
    verifier's format is defined by.
-4. **Fill the three fields**, with a `debug_assert` that the merged-mining hash
+3. **Fill the three fields**, with a `debug_assert` that the merged-mining hash
    did not move.
-5. **Self-check** — run `MergedMiningRule`, the same rule every peer will run.
-   Failing here means the node built something it would itself reject, worth
-   catching before it is stored and announced rather than after.
+4. **Check the proof of work** — `MergedMiningRule`, the same rule every peer
+   will run. Failing it is an error, as rskj answers `ERROR`: the node built
+   something it would itself reject.
+5. **Connect, in rskj's order** — a block already stored is `EXIST`; a parent
+   the store lacks is `NO_PARENT`; then every rule a peer's block meets: the
+   RSKIP179 link to the Bitcoin timestamp, the header against its parent, the
+   body, the uncles and fork detection. If the executed head has moved off the
+   template's parent, the block is connected beside the chain (step 6), as
+   rskj's `BlockChainImpl.internalTryToConnect` connects any block.
 6. **Execute and commit** — `process_and_commit` against the parent state root
    the template recorded, so the submission re-executes from the same point.
    Beside the chain it is `process_beside`, which keeps what the block keys by
@@ -367,6 +371,12 @@ All three RPC forms converge on `complete_and_import`:
 7. **Rebuild work** — the chain moved, so whatever is on offer is stale. Not
    for a block beside the chain: if it takes the head, the switch tells the
    miner of its new best block.
+
+A pool is answered OK with what the connect made of the block, as rskj answers
+it: one a rule refuses is `INVALID_BLOCK`, and so is one whose connecting fails
+in any other way, a store that fails included, since rskj's `tryToConnect`
+catches every exception. Nothing is stored for it. The node's own miner
+(`evm_mine`, the timed miner) reads the error instead.
 
 ### Importing: why not `put_block`
 
@@ -398,9 +408,10 @@ The `flush()` on the winning path matters too: the trie nodes the block wrote ar
 durable only once flushed, and announcing a head whose state cannot be reloaded
 after a restart would leave the node unable to build on its own block.
 
-Miners are told which of `IMPORTED_BEST`, `IMPORTED_NOT_BEST` or `EXIST`
-happened, so they can tell "my block won" from "my block was valid but somebody
-else's arrived first".
+Miners are told which of `IMPORTED_BEST`, `IMPORTED_NOT_BEST`, `EXIST`,
+`NO_PARENT` or `INVALID_BLOCK` happened, so they can tell "my block won" from
+"my block was valid but somebody else's arrived first", and from "my block is
+not on the chain".
 
 ### Error reporting
 
