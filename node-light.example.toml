@@ -50,7 +50,9 @@
 # data_dir = "./data"               # default — database and node key
 # network_id = 30                   # default — 30 mainnet, 31 testnet
 # secret_key = "…"                  # default: unset — hex node key; generated and stored if unset
-# external_ip = "203.0.113.1"       # default: unset — advertised address; 127.0.0.1 if unset
+# external_ip = "203.0.113.1"       # default: unset — advertised address; looked up with ip_check_url, else 127.0.0.1
+# https:// only. "off" disables the lookup, which runs on mainnet and testnet when external_ip is unset.
+# ip_check_url = "https://checkip.amazonaws.com"   # default
 # off | per-block | per-transaction | both. Per-transaction is strictly more
 # sensitive: block-level netting hides a creation when one transaction mints
 # and another destroys the same amount. "both" keeps per-block as a cross-check

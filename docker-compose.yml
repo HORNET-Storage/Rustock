@@ -1,0 +1,82 @@
+# Settings come from .env; each has a default here.
+services:
+  rustock:
+    image: rustock-runtime:local
+    build:
+      context: ./docker
+      dockerfile: runtime.Dockerfile
+    # Restart after a crash, not after a clean exit such as rsk_shutdown.
+    restart: on-failure
+
+    # The running node ignores SIGTERM; stop it with rsk_shutdown (docs/docker.md).
+    stop_grace_period: 30s
+
+    environment:
+      RUSTOCK_NETWORK_ID: ${RUSTOCK_NETWORK_ID:-30}
+      RUSTOCK_P2P_PORT: ${RUSTOCK_P2P_PORT:-5050}
+      RUSTOCK_DISCOVERY_PORT: ${RUSTOCK_DISCOVERY_PORT:-5051}
+      RUSTOCK_EXTERNAL_IP: ${RUSTOCK_EXTERNAL_IP:-}
+      RUSTOCK_LOG_LEVEL: ${RUSTOCK_LOG_LEVEL:-info}
+      RUSTOCK_LOG_TO_STDOUT: ${RUSTOCK_LOG_TO_STDOUT:-true}
+      RUSTOCK_EXTRA_ARGS: ${RUSTOCK_EXTRA_ARGS:-}
+
+    # json-file never rotates without limits.
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RUSTOCK_LOG_MAX_SIZE:-50m}
+        max-file: "${RUSTOCK_LOG_MAX_FILE:-10}"
+
+    # P2P and discovery ports are identical on host and container: the node
+    # advertises its own port to peers.
+    ports:
+      - "${RUSTOCK_P2P_PORT:-5050}:${RUSTOCK_P2P_PORT:-5050}/tcp"
+      - "${RUSTOCK_DISCOVERY_PORT:-5051}:${RUSTOCK_DISCOVERY_PORT:-5051}/udp"
+      - "${RUSTOCK_RPC_BIND:-127.0.0.1}:${RUSTOCK_RPC_PORT:-4444}:4444"
+      - "${RUSTOCK_METRICS_BIND:-127.0.0.1}:${RUSTOCK_METRICS_PORT:-9898}:9898"
+
+    volumes:
+      # A path starting with / or ./ is a host directory; a bare name is the
+      # named volume declared below.
+      - ${RUSTOCK_DATA_DIR:-rustock-data}:/var/lib/rustock
+      - ./docker/node.toml:/etc/rustock/node.toml:ro
+      # create_host_path: false fails instead of creating a directory when the
+      # binary is missing.
+      - type: bind
+        source: ${RUSTOCK_BINARY:-./bin/rustock-cli}
+        target: /usr/local/bin/rustock-cli
+        read_only: true
+        bind:
+          create_host_path: false
+
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9898"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+  # Offline maintenance: docker compose run --rm tools <tool> /var/lib/rustock ...
+  tools:
+    image: rustock-runtime:local
+    profiles: [tools]
+    restart: "no"
+    entrypoint: []
+    environment:
+      PATH: /opt/rustock-tools:/usr/local/bin:/usr/bin:/bin
+    volumes:
+      - ${RUSTOCK_DATA_DIR:-rustock-data}:/var/lib/rustock
+      - type: bind
+        source: ./bin/tools
+        target: /opt/rustock-tools
+        read_only: true
+        bind:
+          create_host_path: false
+
+volumes:
+  rustock-data:

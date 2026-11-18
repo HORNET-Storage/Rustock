@@ -73,6 +73,9 @@ docker run --rm rustock rustock-cli --help
 
 The image has no entrypoint; the binary is `/usr/local/bin/rustock-cli`.
 
+To run a node under Docker Compose from a prebuilt binary, see
+[docs/docker.md](docs/docker.md).
+
 ### Running
 
 Start the full node on RSK Mainnet (default):
@@ -96,7 +99,8 @@ Logs are written to `<data-dir>/rustock.log` by default (with daily rotation). U
 | `--rpc-port` | `4444` | JSON-RPC HTTP port |
 | `--rpc-host` | `127.0.0.1` | JSON-RPC bind address |
 | `--no-rpc` | `false` | Disable the JSON-RPC server |
-| `--external-ip` | none | External IP to advertise in discovery (e.g. `203.0.113.42`) |
+| `--external-ip` | looked up | IPv4 address to advertise in discovery (e.g. `203.0.113.42`). Unset on mainnet or testnet, the node asks `--ip-check-url` for its public IPv4 address; if that fails it advertises `127.0.0.1`. Forward the P2P TCP port and the discovery UDP port (P2P + 1) yourself: the lookup finds the outbound address, which behind NAT is not reachable inbound |
+| `--ip-check-url` | `https://checkip.amazonaws.com` | `https://` service that returns the caller's IPv4 address as text, requested once per start with certificate verification (5 s timeout). `off` disables the lookup |
 
 Commonly used beyond the basics:
 
